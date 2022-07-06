@@ -17,9 +17,9 @@ use tokenizers::Tokenizer;
 
 const PADDING_IDX: i64 = 2;
 const EPS: f64 = 1e-5;
-const N_HEAD: usize = 16;
-const HIDDEN_SIZE: usize = 1024;
-const N_LAYER: usize = 24;
+const N_HEAD: usize = 112;
+const HIDDEN_SIZE: usize = 14336;
+const N_LAYER: usize = 70;
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
@@ -48,6 +48,7 @@ struct Generation {
     #[serde(default)]
     parameters: Parameters,
 }
+
 #[derive(Error, Debug)]
 pub enum GenerationError {
     #[error("Queue is full")]
@@ -178,6 +179,7 @@ struct AppState {
 fn convert(view: TensorView, device: Device) -> Tensor {
     let kind = match view.get_dtype() {
         Dtype::F16 => kind::Kind::Half,
+        Dtype::BF16 => kind::Kind::BFloat16,
         _ => {
             todo!("Need to implement that");
         }
@@ -230,10 +232,9 @@ fn get_slopes(n: usize) -> Vec<f64> {
     }
 }
 
-fn build_alibi_tensor(max_seq_len: usize, n_head: usize) -> Tensor {
+fn build_alibi_tensor(max_seq_len: usize, n_head: usize, device: Device) -> Tensor {
     let slopes = get_slopes(n_head);
-    let device = Device::Cuda(0);
-    let kind = kind::Kind::Half;
+    let kind = kind::Kind::BFloat16;
     let slopes = Tensor::of_slice(&slopes)
         .unsqueeze(1)
         .unsqueeze(1)
@@ -256,15 +257,9 @@ struct LayerNorm {
 }
 
 impl LayerNorm {
-    fn new(name: &str, model: &SafeTensors<'_>) -> Self {
-        let weight = convert(
-            model.tensor(&format!("{name}.weight")).unwrap(),
-            Device::Cuda(0),
-        );
-        let bias = convert(
-            model.tensor(&format!("{name}.bias")).unwrap(),
-            Device::Cuda(0),
-        );
+    fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+        let bias = convert(model.tensor(&format!("{name}.bias")).unwrap(), device);
         Self { weight, bias }
     }
 
@@ -292,13 +287,23 @@ struct Linear {
 }
 
 impl Linear {
-    fn new(name: &str, model: &SafeTensors<'_>) -> Self {
+    fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let tname = format!("{name}.weight");
         let weight = convert(
-            model.tensor(&format!("{name}.weight")).unwrap(),
-            Device::Cuda(0),
+            model
+                .tensor(&tname)
+                .expect(&format!("Could not find {tname}")),
+            device,
         );
-        let name = format!("{name}.bias");
-        let bias = convert(model.tensor(&name).unwrap(), Device::Cuda(0));
+
+        let bias_name = format!("{name}.bias");
+        let bias = convert(
+            model
+                .tensor(&bias_name)
+                .expect(&format!("Could not find {bias_name}")),
+            device,
+        );
+
         Self { weight, bias }
     }
 
@@ -427,9 +432,9 @@ struct BloomAttention {
 }
 
 impl BloomAttention {
-    fn new(name: &str, model: &SafeTensors<'_>, layer_number: usize) -> Self {
-        let dense = Linear::new(&format!("{name}.dense"), model);
-        let query_key_value = Linear::new(&format!("{name}.query_key_value"), model);
+    fn new(name: &str, model: &SafeTensors<'_>, layer_number: usize, device: Device) -> Self {
+        let dense = Linear::new(&format!("{name}.dense"), model, device);
+        let query_key_value = Linear::new(&format!("{name}.query_key_value"), model, device);
         let head_dim = (HIDDEN_SIZE / N_HEAD) as i64;
         let num_attention_heads = N_HEAD as i64;
         let layer_number = std::cmp::max(1, layer_number);
@@ -499,16 +504,10 @@ impl BloomAttention {
         let alpha = 1.0 / self.norm_factor;
         let b = beta * sliced_alibi;
         let a = alpha * query_layer.transpose(1, 0);
-
-        debug(&format!("Query layer {layer_number}"), &query_layer);
-        debug(&format!("Value layer {layer_number}"), &value_layer);
-        // println!("Alpha {alpha}");
-        // println!("Beta {beta}");
-        // TODO Check why no alpha,beta in this operator.
+        let c = key_layer.transpose(1, 0).transpose(1, 2);
         let matmul_result = b
             .f_baddbmm(
-                &a,
-                &key_layer.transpose(1, 0).transpose(1, 2),
+                &a, &c,
                 // beta=beta,
                 // alpha=(1.0 / self.norm_factor),
             )
@@ -546,9 +545,9 @@ fn bloom_gelu(x: &Tensor) -> Tensor {
 }
 
 impl BloomMlp {
-    fn new(name: &str, model: &SafeTensors<'_>) -> Self {
-        let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model);
-        let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model);
+    fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model, device);
+        let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model, device);
         Self {
             dense_h_to_4h,
             dense_4h_to_h,
@@ -579,14 +578,18 @@ struct BloomBlock {
 }
 
 impl BloomBlock {
-    fn new(prefix: &str, model: &SafeTensors<'_>, layer_number: usize) -> Self {
+    fn new(prefix: &str, model: &SafeTensors<'_>, layer_number: usize, device: Device) -> Self {
         // attention
-        let input_layernorm = LayerNorm::new(&format!("{prefix}.input_layernorm"), model);
+        let input_layernorm = LayerNorm::new(&format!("{prefix}.input_layernorm"), model, device);
         let post_attention_layernorm =
-            LayerNorm::new(&format!("{prefix}.post_attention_layernorm"), model);
-        let self_attention =
-            BloomAttention::new(&format!("{prefix}.self_attention"), model, layer_number);
-        let mlp = BloomMlp::new(&format!("{prefix}.mlp"), model);
+            LayerNorm::new(&format!("{prefix}.post_attention_layernorm"), model, device);
+        let self_attention = BloomAttention::new(
+            &format!("{prefix}.self_attention"),
+            model,
+            layer_number,
+            device,
+        );
+        let mlp = BloomMlp::new(&format!("{prefix}.mlp"), model, device);
         Self {
             input_layernorm,
             self_attention,
@@ -636,11 +639,8 @@ struct Embedding {
 }
 
 impl Embedding {
-    fn new(name: &str, model: &SafeTensors<'_>) -> Self {
-        let weight = convert(
-            model.tensor(&format!("{name}.weight")).unwrap(),
-            Device::Cuda(0),
-        );
+    fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
         Self { weight }
     }
 
@@ -672,13 +672,13 @@ struct BloomModel {
 }
 
 impl BloomModel {
-    fn new(model: &SafeTensors<'_>) -> Self {
-        let word_embeddings = Embedding::new(&format!("word_embeddings"), model);
+    fn new(model: &SafeTensors<'_>, device: Device) -> Self {
+        let word_embeddings = Embedding::new(&format!("word_embeddings"), model, device);
         let word_embeddings_layernorm =
-            LayerNorm::new(&format!("word_embeddings_layernorm"), model);
-        let ln_f = LayerNorm::new(&format!("ln_f"), model);
+            LayerNorm::new(&format!("word_embeddings_layernorm"), model, device);
+        let ln_f = LayerNorm::new(&format!("ln_f"), model, device);
         let h = (0..24)
-            .map(|i| BloomBlock::new(&format!("h.{i}"), model, i))
+            .map(|i| BloomBlock::new(&format!("h.{i}"), model, i, device))
             .collect();
         Self {
             word_embeddings,
@@ -690,6 +690,7 @@ impl BloomModel {
 
     fn forward(&self, input_ids: &Tensor, past_key_values: &mut Past) -> Tensor {
         let n_head = N_HEAD;
+        let device = input_ids.device();
         let inputs_embeds = self.word_embeddings.forward(input_ids);
         let mut hidden_states = self.word_embeddings_layernorm.forward(&inputs_embeds);
 
@@ -702,7 +703,7 @@ impl BloomModel {
 
         let current_sequence_length =
             (hidden_states.size()[1] + past_key_values[0].0.size()[1]) as usize;
-        let alibi = build_alibi_tensor(current_sequence_length, n_head);
+        let alibi = build_alibi_tensor(current_sequence_length, n_head, device);
 
         debug("Alibi", &alibi);
 
@@ -726,11 +727,8 @@ struct InvertedEmbedding {
 }
 
 impl InvertedEmbedding {
-    fn new(name: &str, model: &SafeTensors<'_>) -> Self {
-        let weight = convert(
-            model.tensor(&format!("{name}.weight")).unwrap(),
-            Device::Cuda(0),
-        );
+    fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
         Self { weight }
     }
 
@@ -749,9 +747,9 @@ struct BloomForCausalLM {
 }
 
 impl BloomForCausalLM {
-    fn new(model: &SafeTensors<'_>) -> Self {
-        let transformer = BloomModel::new(model);
-        let lm_head = InvertedEmbedding::new("word_embeddings", model);
+    fn new(model: &SafeTensors<'_>, device: Device) -> Self {
+        let transformer = BloomModel::new(model, device);
+        let lm_head = InvertedEmbedding::new("word_embeddings", model, device);
         Self {
             transformer,
             lm_head,
@@ -765,6 +763,168 @@ impl BloomForCausalLM {
     }
 }
 
+type RChan1 = std::sync::mpsc::Receiver<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>;
+
+type RChan = std::sync::mpsc::Receiver<(
+    Tensor,
+    Past,
+    Tensor,
+    std::sync::mpsc::Sender<(Tensor, Past)>,
+)>;
+type SChan = std::sync::mpsc::SyncSender<(
+    Tensor,
+    Past,
+    Tensor,
+    std::sync::mpsc::Sender<(Tensor, Past)>,
+)>;
+
+fn thread1(rx: RChan1, s2: SChan, thread_number: usize) {
+    println!("Starting thread {thread_number}");
+    let start = std::time::Instant::now();
+    let device = Device::Cuda(thread_number);
+
+    let file = std::fs::File::open("./bloom-embedding.bin").unwrap();
+    // SAFETY: This is actually unsafe.
+    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+    let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
+
+    let file = std::fs::File::open("./bloom-h.1.bin").unwrap();
+    // SAFETY: This is actually unsafe.
+    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+    let model = SafeTensors::deserialize(&mmap).unwrap();
+
+    // println!("Embedding {:?}", embedding_model.names());
+    // println!("Layer {:?}", model.names());
+
+    let word_embeddings = Embedding::new(&format!("word_embeddings"), &embedding_model, device);
+    let word_embeddings_layernorm = LayerNorm::new(
+        &format!("word_embeddings_layernorm"),
+        &embedding_model,
+        device,
+    );
+
+    let layers: Vec<BloomBlock> = (0..5)
+        .map(|i| BloomBlock::new("h.0", &model, i, device))
+        .collect();
+    println!(
+        "{:?} : Loaded thread {thread_number} in {:?}",
+        std::time::Instant::now(),
+        start.elapsed()
+    );
+
+    loop {
+        let (input_ids, mut past_key_values, rq) = rx
+            .recv()
+            .expect("You probably want to handle this case, but I'm too lazy");
+
+        let inputs_embeds = word_embeddings.forward(&input_ids);
+        let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
+
+        let current_sequence_length =
+            (hidden_states.size()[1] + past_key_values[0].0.size()[1]) as usize;
+        let alibi = build_alibi_tensor(current_sequence_length, N_HEAD, device);
+
+        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
+            hidden_states = layer.forward(&hidden_states, layer_past, &alibi);
+        }
+        s2.send((hidden_states, past_key_values, alibi, rq))
+            .unwrap();
+    }
+}
+
+fn thread2(rx: RChan, s: SChan, thread_number: usize) {
+    println!("Starting thread {thread_number}");
+    let start = std::time::Instant::now();
+    let device = Device::Cuda(thread_number);
+
+    let file = std::fs::File::open("./bloom-h.1.bin").unwrap();
+    // SAFETY: This is actually unsafe.
+    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+    let model = SafeTensors::deserialize(&mmap).unwrap();
+
+    let layers: Vec<BloomBlock> = (0..7)
+        .map(|i| BloomBlock::new("h.0", &model, i + 5 + 7 * thread_number, device))
+        .collect();
+    println!(
+        "{:?} : Loaded thread {thread_number} in {:?}",
+        std::time::Instant::now(),
+        start.elapsed()
+    );
+
+    loop {
+        let (mut hidden_states, mut past_key_values, mut alibi, rq) = rx
+            .recv()
+            .expect("You probably want to handle this case, but I'm too lazy");
+        alibi = alibi.to_device(device);
+        hidden_states = hidden_states.to_device(device);
+        for (layer, layer_past) in layers
+            .iter()
+            .zip(past_key_values.iter_mut().skip(5 + 7 * (thread_number - 1)))
+        {
+            debug(&format!("past_key thread2"), &layer_past.0);
+            debug(&format!("past_values thread2"), &layer_past.1);
+            hidden_states = layer.forward(&hidden_states, layer_past, &alibi);
+        }
+        s.send((hidden_states, past_key_values, alibi, rq)).unwrap();
+    }
+}
+
+fn thread3(rx: RChan, thread_number: usize) {
+    println!("Starting thread {thread_number}");
+    let start = std::time::Instant::now();
+    let device = Device::Cuda(thread_number);
+
+    let file = std::fs::File::open("./bloom-embedding.bin").unwrap();
+    // SAFETY: This is actually unsafe.
+    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+    let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
+
+    let file = std::fs::File::open("./bloom-h.1.bin").unwrap();
+    // SAFETY: This is actually unsafe.
+    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+    let model = SafeTensors::deserialize(&mmap).unwrap();
+
+    let file = std::fs::File::open("./bloom-final.bin").unwrap();
+    // SAFETY: This is actually unsafe.
+    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+    let final_model = SafeTensors::deserialize(&mmap).unwrap();
+
+    let ln_f = LayerNorm::new(&format!("ln_f"), &final_model, device);
+    let lm_head = InvertedEmbedding::new(&format!("word_embeddings"), &embedding_model, device);
+
+    let layers: Vec<BloomBlock> = (0..2)
+        .map(|i| BloomBlock::new("h.0", &model, 5 + 7 * 9 + i, device))
+        .collect();
+
+    println!(
+        "{:?} : Loaded thread {thread_number} in {:?}",
+        std::time::Instant::now(),
+        start.elapsed()
+    );
+
+    loop {
+        let (mut hidden_states, mut past_key_values, mut alibi, rq) = rx
+            .recv()
+            .expect("You probably want to handle this case, but I'm too lazy");
+
+        hidden_states = hidden_states.to_device(device);
+        alibi = alibi.to_device(device);
+        for (layer, layer_past) in layers
+            .iter()
+            .zip(past_key_values.iter_mut().skip(5 + 7 * 9))
+        {
+            debug(&format!("past_key thread3"), &layer_past.0);
+            debug(&format!("past_values thread3"), &layer_past.1);
+            hidden_states = layer.forward(&hidden_states, layer_past, &alibi);
+        }
+        debug(&format!("last_hidden_states"), &hidden_states);
+        hidden_states = ln_f.forward(&hidden_states);
+        debug(&format!("After ln_f"), &hidden_states);
+        let logits = lm_head.forward(&hidden_states);
+        rq.send((logits, past_key_values)).unwrap();
+    }
+}
+
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -773,31 +933,104 @@ async fn main() -> std::io::Result<()> {
     let start = std::time::Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
     println!("Loaded tokenizer in {:?}", start.elapsed());
+    println!("Starting threads {:?}", std::time::Instant::now());
 
     let (tx, rx) =
         std::sync::mpsc::sync_channel::<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>(1);
 
+    let (s0, r0) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s1, r1) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s2, r2) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s3, r3) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s4, r4) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s5, r5) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s6, r6) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s7, r7) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s8, r8) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+    let (s9, r9) = std::sync::mpsc::sync_channel::<(
+        Tensor,
+        Past,
+        Tensor,
+        std::sync::mpsc::Sender<(Tensor, Past)>,
+    )>(1);
+
     std::thread::spawn(move || {
-        // println!("Start thread");
-        let file = std::fs::File::open("./out_bloom-350m.bin").unwrap();
-        // SAFETY: This is actually unsafe.
-        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
-        let weights = SafeTensors::deserialize(&mmap).unwrap();
-
-        let names = weights.names();
-        println!("Metadata {names:?}");
-        let bloom = BloomForCausalLM::new(&weights);
-        println!("Loaded model in {:?}", start.elapsed());
-
-        loop {
-            let (input_ids, mut past_key_values, rq) = rx
-                .recv()
-                .expect("You probably want to handle this case, but I'm too lazy");
-
-            let logits = bloom.forward(&input_ids, &mut past_key_values);
-
-            rq.send((logits, past_key_values)).unwrap();
-        }
+        thread1(rx, s0, 0);
+    });
+    std::thread::spawn(move || {
+        thread2(r0, s1, 1);
+    });
+    std::thread::spawn(move || {
+        thread2(r1, s2, 2);
+    });
+    std::thread::spawn(move || {
+        thread2(r2, s3, 3);
+    });
+    std::thread::spawn(move || {
+        thread2(r3, s4, 4);
+    });
+    std::thread::spawn(move || {
+        thread2(r4, s5, 5);
+    });
+    std::thread::spawn(move || {
+        thread2(r5, s6, 6);
+    });
+    std::thread::spawn(move || {
+        thread2(r6, s7, 7);
+    });
+    std::thread::spawn(move || {
+        thread2(r7, s8, 8);
+    });
+    std::thread::spawn(move || {
+        thread2(r8, s9, 9);
+    });
+    std::thread::spawn(move || {
+        thread3(r9, 10);
     });
 
     HttpServer::new(move || {
