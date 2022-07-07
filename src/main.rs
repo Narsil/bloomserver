@@ -176,8 +176,14 @@ impl LayerNorm {
         //     self.bias.size(),
         //     xs.size()
         // );
-        xs.f_layer_norm(&[1024], Some(&self.weight), Some(&self.bias), EPS, true)
-            .unwrap()
+        xs.f_layer_norm(
+            &[HIDDEN_SIZE],
+            Some(&self.weight),
+            Some(&self.bias),
+            EPS,
+            true,
+        )
+        .unwrap()
     }
 }
 
@@ -285,7 +291,7 @@ impl BloomAttention {
         let Q = query.size()[1];
         let K = key_layer.size()[1];
         // let NH = value_layer.size()[2];
-        let NH = 64;
+        let NH = (HIDDEN_SIZE / N_HEAD) as i64;
         let output_size = (B, H, Q, K);
 
         let query_layer = query.transpose(1, 0).reshape(&[Q, B * H, -1]);
