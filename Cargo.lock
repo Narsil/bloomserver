@@ -304,6 +304,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tch",
+ "thiserror",
  "tokenizers",
  "tokio",
 ]

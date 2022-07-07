@@ -1,12 +1,13 @@
 #![feature(async_closure)]
 use actix_web::middleware::Logger;
-use actix_web::{post, web, App, HttpServer, Responder};
+use actix_web::{http::StatusCode, post, web, App, HttpResponse, HttpServer, ResponseError};
 use memmap::MmapOptions;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tch::{kind, Device, Tensor};
+use thiserror::Error;
 use tokenizers::Tokenizer;
 
 const PADDING_IDX: i64 = 2;
@@ -39,9 +40,25 @@ struct Generation {
     #[serde(default)]
     parameters: Parameters,
 }
+#[derive(Error, Debug)]
+pub enum MyError {
+    #[error("Queue is full")]
+    QueueFull,
+}
+
+impl ResponseError for MyError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            MyError::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
 
 #[post("/generate")]
-async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) -> impl Responder {
+async fn generate(
+    payload: web::Json<Generation>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, MyError> {
     let start = std::time::Instant::now();
     let inputs = &payload.inputs;
 
@@ -54,20 +71,28 @@ async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) ->
         .view((1, -1));
     let (tx, rx) = std::sync::mpsc::channel::<(Tensor, Past)>();
 
-    let past_key = Tensor::zeros(&[1, 0, 16, 64], kind);
-    let past_value = Tensor::zeros(&[1, 0, 16, 64], kind);
+    let p = N_HEAD as i64;
+    let q = (HIDDEN_SIZE / N_HEAD) as i64;
+    let past_key = Tensor::zeros(&[1, 0, p, q], kind);
+    let past_value = Tensor::zeros(&[1, 0, p, q], kind);
     let mut past_key_values: Vec<_> = (0..N_LAYER)
         .map(|_| (past_key.copy(), past_value.copy()))
         .collect();
-
     let mut full_ids: Vec<u32> = encoded.get_ids().to_vec();
 
     let mut input_ids = t;
-    for _ in 0..payload.parameters.max_new_tokens {
-        state
-            .in_channel
-            .send((input_ids.copy(), past_key_values, tx.clone()))
-            .expect("Can send");
+    for i in 0..payload.parameters.max_new_tokens {
+        if i == 0 {
+            state
+                .in_channel
+                .try_send((input_ids.copy(), past_key_values, tx.clone()))
+                .map_err(|_| MyError::QueueFull)?;
+        } else {
+            state
+                .in_channel
+                .send((input_ids.copy(), past_key_values, tx.clone()))
+                .expect("This send should always work");
+        }
 
         let (logits, r_past_key_values) = rx.recv().unwrap();
         let S = logits.size()[1];
@@ -85,12 +110,13 @@ async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) ->
         start.elapsed().div_f32(n as f32)
     );
     let string = state.tokenizer.decode(full_ids, false).unwrap();
-    format!("{}", json!([{ "generated_text": string }]))
+    Ok(HttpResponse::Ok().json(json!([{ "generated_text": string }])))
 }
 
 #[derive(Clone)]
 struct AppState {
-    in_channel: std::sync::mpsc::Sender<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>,
+    in_channel:
+        std::sync::mpsc::SyncSender<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>,
     tokenizer: Arc<Tokenizer>,
 }
 
@@ -694,7 +720,7 @@ async fn main() -> std::io::Result<()> {
     println!("Loaded tokenizer in {:?}", start.elapsed());
 
     let (tx, rx) =
-        std::sync::mpsc::channel::<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>();
+        std::sync::mpsc::sync_channel::<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>(1);
 
     std::thread::spawn(move || {
         // println!("Start thread");
@@ -713,7 +739,6 @@ async fn main() -> std::io::Result<()> {
                 .recv()
                 .expect("You probably want to handle this case, but I'm too lazy");
 
-            let start = std::time::Instant::now();
             let logits = bloom.forward(&input_ids, &mut past_key_values);
 
             rq.send((logits, past_key_values)).unwrap();
