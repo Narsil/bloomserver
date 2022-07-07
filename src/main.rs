@@ -163,7 +163,7 @@ impl LayerNorm {
             Device::Cuda(0),
         );
         let bias = convert(
-            model.tensor(&format!("{name}.weight")).unwrap(),
+            model.tensor(&format!("{name}.bias")).unwrap(),
             Device::Cuda(0),
         );
         Self { weight, bias }
@@ -177,7 +177,7 @@ impl LayerNorm {
         //     xs.size()
         // );
         xs.f_layer_norm(
-            &[HIDDEN_SIZE],
+            &[HIDDEN_SIZE as i64],
             Some(&self.weight),
             Some(&self.bias),
             EPS,
@@ -447,14 +447,15 @@ impl Embedding {
 }
 
 fn debug(prefix: &str, x: &Tensor) {
-    // println!(
-    //     "{prefix} - Values: {:?}",
-    //     x.reshape(&[-1,])
-    //         .iter::<f64>()
-    //         .unwrap()
-    //         .take(5)
-    //         .collect::<Vec<_>>()
-    // );
+    println!(
+        "{prefix} - {:?} - Values: {:?}",
+        x.size(),
+        x.reshape(&[-1,])
+            .iter::<f64>()
+            .unwrap()
+            .take(5)
+            .collect::<Vec<_>>()
+    );
 }
 
 struct BloomModel {
@@ -485,6 +486,11 @@ impl BloomModel {
         let n_head = N_HEAD;
         let inputs_embeds = self.word_embeddings.forward(input_ids);
         let mut hidden_states = self.word_embeddings_layernorm.forward(&inputs_embeds);
+
+        debug(
+            "First layer norm weights",
+            &self.word_embeddings_layernorm.weight,
+        );
 
         debug("First layer norm", &hidden_states);
 
