@@ -302,6 +302,7 @@ dependencies = [
  "memmap",
  "safetensors",
  "serde",
+ "serde_json",
  "tch",
  "tokenizers",
  "tokio",

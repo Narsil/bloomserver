@@ -4,8 +4,9 @@ use actix_web::{post, web, App, HttpServer, Responder};
 use memmap::MmapOptions;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
-use tch::{kind, Device, IndexOp, Tensor};
+use tch::{kind, Device, Tensor};
 use tokenizers::Tokenizer;
 
 const PADDING_IDX: i64 = 2;
@@ -20,11 +21,15 @@ type Past = Vec<PastLayer>;
 #[derive(Deserialize, Serialize)]
 struct Parameters {
     top_k: Option<usize>,
+    max_new_tokens: usize,
 }
 
 impl Default for Parameters {
     fn default() -> Self {
-        Self { top_k: None }
+        Self {
+            top_k: None,
+            max_new_tokens: 20,
+        }
     }
 }
 
@@ -36,43 +41,56 @@ struct Generation {
 }
 
 #[post("/generate")]
-//async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) -> impl Responder {
 async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) -> impl Responder {
+    let start = std::time::Instant::now();
     let inputs = &payload.inputs;
 
     let encoded = state.tokenizer.encode(inputs.clone(), false).unwrap();
-    let ids = encoded.get_ids();
-    let n = ids.len();
+    let ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
     let kind = (kind::Kind::Int, Device::Cuda(0));
-    let t = Tensor::zeros(&[1, n as i64], kind);
-    // println!("Ids {ids:?}");
-    for (i, id) in ids.into_iter().enumerate() {
-        let _ = t.i((0, i as i64)).fill_((*id) as i64);
-    }
-    // t.print();
-    let (tx, rx) = std::sync::mpsc::channel::<Tensor>();
+    let t = Tensor::of_slice(ids.as_slice())
+        .to_kind(kind.0)
+        .to_device(kind.1)
+        .view((1, -1));
+    let (tx, rx) = std::sync::mpsc::channel::<(Tensor, Past)>();
 
     let past_key = Tensor::zeros(&[1, 0, 16, 64], kind);
     let past_value = Tensor::zeros(&[1, 0, 16, 64], kind);
-    let past_key_values: Vec<_> = (0..N_LAYER)
+    let mut past_key_values: Vec<_> = (0..N_LAYER)
         .map(|_| (past_key.copy(), past_value.copy()))
         .collect();
-    state
-        .in_channel
-        .send((t, past_key_values, tx))
-        .expect("Can send");
 
-    let received = rx.recv().unwrap();
-    let received_ids: Vec<i64> = received.try_into().unwrap();
-    let received_ids: Vec<u32> = received_ids.into_iter().map(|i| i as u32).collect();
+    let mut full_ids: Vec<u32> = encoded.get_ids().to_vec();
 
-    let string = state.tokenizer.decode(received_ids, false).unwrap();
-    format!("Hello {string}!")
+    let mut input_ids = t;
+    for _ in 0..payload.parameters.max_new_tokens {
+        state
+            .in_channel
+            .send((input_ids.copy(), past_key_values, tx.clone()))
+            .expect("Can send");
+
+        let (logits, r_past_key_values) = rx.recv().unwrap();
+        let S = logits.size()[1];
+        let new_id = logits.slice(1, S - 1, S, 1).argmax(-1, false);
+        past_key_values = r_past_key_values;
+        input_ids = Tensor::f_cat(&[input_ids, new_id.copy()], 1).unwrap();
+        let received_ids: Vec<i64> = new_id.try_into().unwrap();
+        full_ids.push(received_ids[0] as u32);
+    }
+
+    let n = full_ids.len() - encoded.get_ids().len();
+    println!(
+        "Inference generated {n} tokens in {:?} ({:?}/tok)",
+        start.elapsed(),
+        start.elapsed().div_f32(n as f32)
+    );
+    let string = state.tokenizer.decode(full_ids, false).unwrap();
+    format!("{}", json!([{ "generated_text": string }]))
 }
 
 #[derive(Clone)]
 struct AppState {
-    in_channel: std::sync::mpsc::Sender<(Tensor, Past, std::sync::mpsc::Sender<Tensor>)>,
+    in_channel: std::sync::mpsc::Sender<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>,
     tokenizer: Arc<Tokenizer>,
 }
 
@@ -208,16 +226,112 @@ impl Linear {
     }
 }
 
-struct BloomScaledSoftmax {}
+fn attention_mask_func(
+    attention_scores: &mut Tensor,
+    attention_mask: &Tensor,
+    causal_mask: &Tensor,
+) -> (Tensor, Tensor) {
+    // TODO
+    let attention_mask_bool = attention_mask
+        .to_kind(kind::Kind::Bool)
+        .f_logical_not()
+        .unwrap();
+
+    let query_length = attention_scores.size()[2];
+    let key_length = attention_scores.size()[3];
+    let n_heads = attention_scores.size()[1];
+
+    let a_attention_mask_bool = attention_mask_bool
+        .unsqueeze(1)
+        .unsqueeze(-1)
+        .f_slice(2, key_length - query_length, key_length, 1)
+        .unwrap();
+    let b_causal_mask = causal_mask
+        .f_logical_not()
+        .unwrap()
+        .f_slice(2, key_length - query_length, key_length, 1)
+        .unwrap()
+        .f_slice(3, 0, key_length, 1)
+        .unwrap();
+    let mut padded_causal_mask = a_attention_mask_bool.f_logical_or(&b_causal_mask).unwrap();
+    padded_causal_mask = padded_causal_mask
+        .f_logical_or(
+            &attention_mask_bool
+                .unsqueeze(1)
+                .unsqueeze(1)
+                .f_slice(3, 0, key_length, 1)
+                .unwrap(),
+        )
+        .unwrap();
+    // TODO
+    // padded_causal_mask = attention_mask_bool.logical_or(
+    //     attention_mask_bool[:, None, key_length - query_length : key_length, None],
+    //     ~causal_mask[:, :, key_length - query_length : key_length, :key_length].bool(),
+    // )
+    // padded_causal_mask = torch.logical_or(padded_causal_mask, attention_mask_bool[:, None, None, :key_length])
+    // (
+    //     attention_scores.masked_fill_(padded_causal_mask.expand(-1, n_heads, -1, -1), -10000.0),
+    //     padded_causal_mask,
+    // )
+    (
+        attention_scores
+            .f_masked_fill_(
+                &padded_causal_mask
+                    .f_expand(&[-1, n_heads, -1, -1], true)
+                    .unwrap(),
+                -10000.0,
+            )
+            .unwrap(),
+        padded_causal_mask,
+    )
+}
+
+struct BloomScaledSoftmax {
+    scale: i64,
+}
 
 impl BloomScaledSoftmax {
-    fn new() -> Self {
-        Self {}
+    fn new(scale: i64) -> Self {
+        Self { scale }
     }
 
-    fn forward(&self, input: &Tensor, _max_positions: i64) -> Tensor {
-        // TODO actually implement this
-        input.copy()
+    fn forward(&self, input: &Tensor, max_positions: i64) -> Tensor {
+        // TODO finish implementation of this
+        debug("input", input);
+        let mut scaled_input = self.scale * input;
+        debug("scaled input", &scaled_input);
+        // TODO mask ?
+        let mask = Tensor::ones(
+            &[input.size()[0], max_positions],
+            (kind::Kind::Bool, input.device()),
+        );
+        let seq_ids = Tensor::f_arange(max_positions, (kind::Kind::Int, input.device())).unwrap();
+
+        let a = seq_ids.unsqueeze(0);
+        let b = seq_ids.unsqueeze(-1);
+        let causal_mask = a.f_le_tensor(&b).unwrap().to_kind(kind::Kind::Bool).view((
+            1,
+            1,
+            max_positions,
+            max_positions,
+        ));
+
+        debug("Causal mask", &causal_mask);
+
+        // TODO Padded causal mask
+        let (mask_output, padded_causal_mask) =
+            attention_mask_func(&mut scaled_input, &mask, &causal_mask);
+        debug("mask output", &mask_output);
+
+        // TODO dtype float16 ?
+        let probs = mask_output.f_softmax(-1, kind::Kind::Float).unwrap()
+            * padded_causal_mask.f_logical_not().unwrap();
+        debug("Probs", &probs);
+
+        let out_probs = probs.to_kind(kind::Kind::Half);
+        debug("Out Probs", &out_probs);
+
+        out_probs
     }
 }
 
@@ -239,7 +353,7 @@ impl BloomAttention {
         let num_attention_heads = N_HEAD as i64;
         let layer_number = std::cmp::max(1, layer_number);
         let norm_factor = (head_dim as f64).sqrt() * layer_number as f64;
-        let scaled_softmax = BloomScaledSoftmax::new();
+        let scaled_softmax = BloomScaledSoftmax::new(layer_number as i64);
         Self {
             dense,
             query_key_value,
@@ -258,7 +372,9 @@ impl BloomAttention {
         layer_past: &mut PastLayer,
         alibi: &Tensor,
     ) -> Tensor {
+        let layer_number = self.layer_number;
         let mut mixed_x_layer = self.query_key_value.forward(hidden_states);
+        debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
             mixed_x_layer.size()[0],
             mixed_x_layer.size()[1],
@@ -274,16 +390,15 @@ impl BloomAttention {
             [query, key, value] => (query, key, value),
             _ => unreachable!(),
         };
-        let (past_key, past_value) = layer_past;
+        // let (past_key, past_value) = layer_past;
 
-        let mut key_layer = Tensor::f_cat(&[past_key.as_ref(), key], 1).unwrap();
-        let mut value_layer = Tensor::f_cat(&[past_value.as_ref(), value], 1).unwrap();
-
-        debug(&format!("Key layer {layer_number}"), &key_layer);
-        debug(&format!("Value layer {layer_number}"), &value_layer);
+        // let mut key_layer = Tensor::f_cat(&[past_key.as_ref(), key], 1).unwrap();
+        // let mut value_layer = Tensor::f_cat(&[past_value.as_ref(), value], 1).unwrap();
+        let mut key_layer = key.copy();
+        let mut value_layer = value.copy();
 
         // Update past for next loops
-        *layer_past = (key_layer.copy(), value_layer.copy());
+        // *layer_past = (key_layer.copy(), value_layer.copy());
 
         // [batch_size, head_dim, q_length, k_length, num_heads]
         let B = query.size()[0];
@@ -301,11 +416,14 @@ impl BloomAttention {
         let sliced_alibi = alibi.slice(0, 0, B * H, 1).slice(2, 0, K, 1);
         let beta = 1.0 / (self.layer_number as f64);
         let alpha = 1.0 / self.norm_factor;
-        // TODO Check why no alpha,beta in this operator.
         let b = beta * sliced_alibi;
         let a = alpha * query_layer.transpose(1, 0);
-        debug(&format!("b {layer_number}"), &b);
-        debug(&format!("a {layer_number}"), &a);
+
+        debug(&format!("Query layer {layer_number}"), &query_layer);
+        debug(&format!("Value layer {layer_number}"), &value_layer);
+        // println!("Alpha {alpha}");
+        // println!("Beta {beta}");
+        // TODO Check why no alpha,beta in this operator.
         let matmul_result = b
             .f_baddbmm(
                 &a,
@@ -343,7 +461,7 @@ struct BloomMlp {
 
 fn bloom_gelu(x: &Tensor) -> Tensor {
     let y: Tensor = 0.79788456 * x * (1.0 + 0.044715 * x * x);
-    return x * 0.5 * (1.0 + (y).tanh());
+    return x * 0.5 * (1.0 + y.tanh());
 }
 
 impl BloomMlp {
@@ -356,10 +474,17 @@ impl BloomMlp {
         }
     }
 
-    fn forward(&self, hidden_states: &Tensor, _residual: &Tensor) -> Tensor {
+    fn forward(&self, hidden_states: &Tensor, residual: &Tensor) -> Tensor {
+        debug("hidden_states", hidden_states);
+        debug("INCOMING residual", residual);
         let hidden_states = self.dense_h_to_4h.forward(hidden_states);
+        debug("hidden_states h to 4h", &hidden_states);
         let hidden_states = bloom_gelu(&hidden_states);
+        debug("hidden_states gelu", &hidden_states);
         let hidden_states = self.dense_4h_to_h.forward(&hidden_states);
+        debug("hidden_states 4h to h", &hidden_states);
+        let hidden_states = hidden_states + residual;
+        debug("hidden_states residual", &hidden_states);
         hidden_states
     }
 }
@@ -447,15 +572,15 @@ impl Embedding {
 }
 
 fn debug(prefix: &str, x: &Tensor) {
-    println!(
-        "{prefix} - {:?} - Values: {:?}",
-        x.size(),
-        x.reshape(&[-1,])
-            .iter::<f64>()
-            .unwrap()
-            .take(5)
-            .collect::<Vec<_>>()
-    );
+    // println!(
+    //     "{prefix} - {:?} - Values: {:?}",
+    //     x.size(),
+    //     x.reshape(&[-1,])
+    //         .iter::<f64>()
+    //         .unwrap()
+    //         .take(5)
+    //         .collect::<Vec<_>>()
+    // );
 }
 
 struct BloomModel {
@@ -568,7 +693,8 @@ async fn main() -> std::io::Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
     println!("Loaded tokenizer in {:?}", start.elapsed());
 
-    let (tx, rx) = std::sync::mpsc::channel::<(Tensor, Past, std::sync::mpsc::Sender<Tensor>)>();
+    let (tx, rx) =
+        std::sync::mpsc::channel::<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>();
 
     std::thread::spawn(move || {
         // println!("Start thread");
@@ -579,7 +705,6 @@ async fn main() -> std::io::Result<()> {
 
         let names = weights.names();
         println!("Metadata {names:?}");
-        let start = std::time::Instant::now();
         let bloom = BloomForCausalLM::new(&weights);
         println!("Loaded model in {:?}", start.elapsed());
 
@@ -591,14 +716,7 @@ async fn main() -> std::io::Result<()> {
             let start = std::time::Instant::now();
             let logits = bloom.forward(&input_ids, &mut past_key_values);
 
-            // println!("Logits {:?}", logits);
-            let S = logits.size()[1];
-            let new_id = logits.slice(1, S - 1, S, 1).argmax(-1, false);
-            // new_id.print();
-            // println!("New id {:?}", new_id);
-
-            println!("Inference ran in {:?}", start.elapsed());
-            rq.send(new_id).unwrap();
+            rq.send((logits, past_key_values)).unwrap();
         }
     });
 
