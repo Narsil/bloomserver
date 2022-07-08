@@ -4,7 +4,7 @@ use actix_web::{
     http::header::ContentType, http::StatusCode, post, web, web::Bytes, App, HttpResponse,
     HttpServer, ResponseError,
 };
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Select, Sender};
 use memmap::MmapOptions;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use serde_json::json;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tch::{kind, Device, IndexOp, Tensor};
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -95,6 +96,7 @@ struct Stream {
     ids: Vec<i64>,
     payload: Generation,
     in_channel: InChan,
+    prio_channel: InChan,
     tokenizer: Arc<Tokenizer>,
     start: std::time::Instant,
     sent: bool,
@@ -103,14 +105,24 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(payload: Generation, in_channel: InChan, tokenizer: Arc<Tokenizer>) -> Self {
+    fn new(
+        payload: Generation,
+        in_channel: InChan,
+        prio_channel: InChan,
+        tokenizer: Arc<Tokenizer>,
+    ) -> Self {
         let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
-        let ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+        let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+        // TODO The model is not able to handle empty input ids
+        if ids.len() == 0 {
+            ids.push(0);
+        }
         let start = std::time::Instant::now();
         let (sx, rx) = unbounded::<(Tensor, Past)>();
         Self {
             payload,
             in_channel,
+            prio_channel,
             tokenizer,
             new_generated_tokens: 0,
             ids,
@@ -148,9 +160,12 @@ impl futures::Stream for Stream {
         if this.new_generated_tokens == 0 {
             this.in_channel
                 .try_send((input_ids.copy(), past_key_values, this.sx.clone()))
-                .map_err(|_| GenerationError::QueueFull)?;
+                .map_err(|_| {
+                    println!("Queue was full {:?}", this.in_channel.len());
+                    GenerationError::QueueFull
+                })?;
         } else {
-            this.in_channel
+            this.prio_channel
                 .send((input_ids.copy(), past_key_values, this.sx.clone()))
                 .expect("This send should always work");
         }
@@ -202,6 +217,7 @@ async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) ->
     let stream = Stream::new(
         payload.into_inner(),
         state.in_channel.clone(),
+        state.prio_channel.clone(),
         state.tokenizer.clone(),
     );
     HttpResponse::Ok()
@@ -212,6 +228,7 @@ async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) ->
 #[derive(Clone)]
 struct AppState {
     in_channel: Sender<Msg>,
+    prio_channel: Sender<Msg>,
     tokenizer: Arc<Tokenizer>,
 }
 
@@ -707,15 +724,15 @@ impl Embedding {
 }
 
 fn debug(prefix: &str, x: &Tensor) {
-    println!(
-        "{prefix} - {:?} - Values: {:?}",
-        x.size(),
-        x.reshape(&[-1,])
-            .iter::<f64>()
-            .unwrap()
-            .take(10)
-            .collect::<Vec<_>>()
-    );
+    // println!(
+    //     "{prefix} - {:?} - Values: {:?}",
+    //     x.size(),
+    //     x.reshape(&[-1,])
+    //         .iter::<f64>()
+    //         .unwrap()
+    //         .take(10)
+    //         .collect::<Vec<_>>()
+    // );
 }
 
 struct BloomModel {
@@ -875,15 +892,16 @@ fn padding(
 
     let alibi = build_alibi_tensor(&attention_mask, N_HEAD, device);
 
-    println!(
-        "Running on batch of size {:?} - Fillrate {:?}%",
-        batch_size,
-        (total_ids * 100) / (batch_size as usize * max_length as usize)
-    );
+    let total = std::cmp::max(1, batch_size as usize * max_length as usize);
+    // println!(
+    //     "Running on batch of size {:?} - Fillrate {:?}%",
+    //     batch_size,
+    //     (total_ids * 100) / total
+    // );
     (all_input_ids, attention_mask, alibi, past_key_values, rqs)
 }
 
-fn thread1(rx: RChan1, s2: SChan, thread_number: usize) {
+fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
     println!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
@@ -918,14 +936,38 @@ fn thread1(rx: RChan1, s2: SChan, thread_number: usize) {
     );
 
     loop {
-        let mut all_items = vec![rx
-            .recv()
-            .expect("You probably want to handle this case, but I'm too lazy")];
-        for _ in 0..rx.len() {
-            let item = rx
-                .recv()
-                .expect("You probably want to handle this case, but I'm too lazy");
-            all_items.push(item);
+        let mut sel = Select::new();
+        let oper1 = sel.recv(&rx);
+        let oper2 = sel.recv(&prio_rx);
+        let oper = sel.select();
+        let mut all_items = match oper.index() {
+            i if i == oper1 => {
+                vec![oper.recv(&rx).unwrap()]
+            }
+            i if i == oper2 => {
+                vec![oper.recv(&prio_rx).unwrap()]
+            }
+            _ => unreachable!(),
+        };
+        let instant = Instant::now();
+        let deadline = instant + Duration::from_millis(1);
+
+        while let Ok(oper) = sel.select_deadline(deadline) {
+            match oper.index() {
+                i if i == oper1 => {
+                    all_items.push(oper.recv(&rx).unwrap());
+                }
+                i if i == oper2 => {
+                    all_items.push(oper.recv(&prio_rx).unwrap());
+                }
+                _ => unreachable!(),
+            }
+        }
+        if rx.len() != 0 {
+            println!("After deadline in queue {:?}", rx.len());
+        }
+        if prio_rx.len() != 0 {
+            println!("After deadline prio queue {:?}", prio_rx.len());
         }
 
         let (input_ids, attention_mask, alibi, mut past_key_values, rqs) = padding(all_items);
@@ -967,11 +1009,12 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize) {
     );
 
     loop {
-        let (mut hidden_states, attention_mask, mut alibi, mut past_key_values, rq) = rx
+        let (mut hidden_states, mut attention_mask, mut alibi, mut past_key_values, rq) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
-        alibi = alibi.to_device(device);
         hidden_states = hidden_states.to_device(device);
+        attention_mask = attention_mask.to_device(device);
+        alibi = alibi.to_device(device);
         for (layer, layer_past) in layers
             .iter()
             .zip(past_key_values.iter_mut().skip(5 + 7 * (thread_number - 1)))
@@ -1026,11 +1069,12 @@ fn thread3(rx: RChan, thread_number: usize) {
     );
 
     loop {
-        let (mut hidden_states, attention_mask, mut alibi, mut past_key_values, rqs) = rx
+        let (mut hidden_states, mut attention_mask, mut alibi, mut past_key_values, rqs) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
 
         hidden_states = hidden_states.to_device(device);
+        attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
         for (layer, layer_past) in layers
             .iter()
@@ -1047,14 +1091,14 @@ fn thread3(rx: RChan, thread_number: usize) {
 
         for (i, rq) in rqs.into_iter().enumerate() {
             let simple_logits = logits.f_slice(0, 0, logits.size()[0], 1).unwrap();
-            let simple_past_key_values: Vec<_> = past_key_values
-                .iter()
-                .map(|(key, values)| {
-                    (
-                        key.f_slice(i as i64, 0, key.size()[0], 1).unwrap(),
-                        values.f_slice(i as i64, 0, values.size()[0], 1).unwrap(),
-                    )
-                })
+
+            let p = N_HEAD as i64;
+            let q = (HIDDEN_SIZE / N_HEAD) as i64;
+            let kind = (kind::Kind::Half, device);
+            let past_key = Tensor::zeros(&[1, 0, p, q], kind);
+            let past_value = Tensor::zeros(&[1, 0, p, q], kind);
+            let simple_past_key_values: Vec<_> = (0..N_LAYER)
+                .map(|_| (past_key.copy(), past_value.copy()))
                 .collect();
             rq.send((simple_logits, simple_past_key_values)).unwrap();
         }
@@ -1071,7 +1115,8 @@ async fn main() -> std::io::Result<()> {
     println!("Loaded tokenizer in {:?}", start.elapsed());
     println!("Starting threads {:?}", std::time::Instant::now());
 
-    let (tx, rx) = bounded::<Msg>(10);
+    let (tx, rx) = bounded::<Msg>(256);
+    let (prio_tx, prio_rx) = unbounded::<Msg>();
     let (s0, r0) = bounded::<Msg2>(1);
     let (s1, r1) = bounded::<Msg2>(1);
     let (s2, r2) = bounded::<Msg2>(1);
@@ -1084,7 +1129,7 @@ async fn main() -> std::io::Result<()> {
     let (s9, r9) = bounded::<Msg2>(1);
 
     std::thread::spawn(move || {
-        thread1(rx, s0, 0);
+        thread1(rx, prio_rx, s0, 0);
     });
     std::thread::spawn(move || {
         thread2(r0, s1, 1);
@@ -1123,6 +1168,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(AppState {
                 tokenizer: tokenizer.clone(),
                 in_channel: tx.clone(),
+                prio_channel: prio_tx.clone(),
             }))
             .service(generate)
     })
