@@ -298,6 +298,7 @@ name = "bloomserver"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "crossbeam-channel",
  "env_logger",
  "futures",
  "memmap",

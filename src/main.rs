@@ -4,6 +4,7 @@ use actix_web::{
     http::header::ContentType, http::StatusCode, post, web, web::Bytes, App, HttpResponse,
     HttpServer, ResponseError,
 };
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use memmap::MmapOptions;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
@@ -20,9 +21,19 @@ const EPS: f64 = 1e-5;
 const N_HEAD: usize = 112;
 const HIDDEN_SIZE: usize = 14336;
 const N_LAYER: usize = 70;
+const LAYERS_FIRST_THREAD: usize = 5;
+const LAYERS_PER_THREAD: usize = 3;
+const N_THREADS: usize = 9;
+const LAYERS_LAST_THREAD: usize = 2;
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
+type Msg = (Tensor, Past, Sender<(Tensor, Past)>);
+type Msg2 = (Tensor, Past, Tensor, Sender<(Tensor, Past)>);
+type InChan = Sender<Msg>;
+type RChan1 = Receiver<Msg>;
+type RChan = Receiver<Msg2>;
+type SChan = Sender<Msg2>;
 
 #[derive(Deserialize, Serialize)]
 struct Parameters {
@@ -63,8 +74,6 @@ impl ResponseError for GenerationError {
     }
 }
 
-type InChan = std::sync::mpsc::SyncSender<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>;
-
 struct Stream {
     new_generated_tokens: usize,
     ids: Vec<i64>,
@@ -72,6 +81,9 @@ struct Stream {
     in_channel: InChan,
     tokenizer: Arc<Tokenizer>,
     start: std::time::Instant,
+    sent: bool,
+    sx: Sender<(Tensor, Past)>,
+    rx: Receiver<(Tensor, Past)>,
 }
 
 impl Stream {
@@ -79,6 +91,7 @@ impl Stream {
         let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
         let ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
         let start = std::time::Instant::now();
+        let (sx, rx) = unbounded::<(Tensor, Past)>();
         Self {
             payload,
             in_channel,
@@ -86,6 +99,9 @@ impl Stream {
             new_generated_tokens: 0,
             ids,
             start,
+            sent: false,
+            sx,
+            rx,
         }
     }
 }
@@ -95,6 +111,7 @@ impl futures::Stream for Stream {
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        // if this.sent {
         if this.new_generated_tokens >= this.payload.parameters.max_new_tokens {
             return Poll::Ready(None);
         }
@@ -103,7 +120,6 @@ impl futures::Stream for Stream {
             .to_kind(kind.0)
             .to_device(kind.1)
             .view((1, -1));
-        let (tx, rx) = std::sync::mpsc::channel::<(Tensor, Past)>();
 
         let p = N_HEAD as i64;
         let q = (HIDDEN_SIZE / N_HEAD) as i64;
@@ -115,15 +131,21 @@ impl futures::Stream for Stream {
 
         if this.new_generated_tokens == 0 {
             this.in_channel
-                .try_send((input_ids.copy(), past_key_values, tx.clone()))
+                .try_send((input_ids.copy(), past_key_values, this.sx.clone()))
                 .map_err(|_| GenerationError::QueueFull)?;
         } else {
             this.in_channel
-                .send((input_ids.copy(), past_key_values, tx.clone()))
+                .send((input_ids.copy(), past_key_values, this.sx.clone()))
                 .expect("This send should always work");
         }
-
-        let (logits, _r_past_key_values) = rx.recv().unwrap();
+        this.sent = true;
+        // } else {
+        // if this.rx.is_empty() {
+        //     println!("Pending waiting on channel");
+        //     Poll::Pending
+        // } else {
+        let (logits, _r_past_key_values) = this.rx.recv().unwrap();
+        this.sent = false;
         let S = logits.size()[1];
         let new_id = logits.slice(1, S - 1, S, 1).argmax(-1, false);
         // past_key_values = r_past_key_values;
@@ -132,27 +154,29 @@ impl futures::Stream for Stream {
         this.ids.push(received_ids[0]);
         this.new_generated_tokens += 1;
 
-        if this.new_generated_tokens == this.payload.parameters.max_new_tokens {
-            let n = this.new_generated_tokens;
-            println!(
-                "Inference generated {n} tokens in {:?} ({:?}/tok)",
-                this.start.elapsed(),
-                this.start.elapsed().div_f32(n as f32)
-            );
-            let full_ids: Vec<_> = this.ids.iter().map(|&i| i as u32).collect();
-            let string = this.tokenizer.decode(full_ids, false).unwrap();
-            let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
+        if this.payload.parameters.stream {
+            let received_ids: Vec<_> = received_ids.iter().map(|&i| i as u32).collect();
+            let string = this.tokenizer.decode(received_ids.clone(), false).unwrap();
+            let result = serde_json::to_string(&json!([{ "text": string }])).unwrap();
             Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
         } else {
-            if this.payload.parameters.stream {
-                let received_ids: Vec<_> = received_ids.iter().map(|&i| i as u32).collect();
-                let string = this.tokenizer.decode(received_ids.clone(), false).unwrap();
-                let result = serde_json::to_string(&json!([{ "text": string }])).unwrap();
+            if this.new_generated_tokens == this.payload.parameters.max_new_tokens {
+                let n = this.new_generated_tokens;
+                println!(
+                    "Inference generated {n} tokens in {:?} ({:?}/tok)",
+                    this.start.elapsed(),
+                    this.start.elapsed().div_f32(n as f32)
+                );
+                let full_ids: Vec<_> = this.ids.iter().map(|&i| i as u32).collect();
+                let string = this.tokenizer.decode(full_ids, false).unwrap();
+                let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
                 Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
             } else {
                 Poll::Ready(Some(Ok(Bytes::copy_from_slice(b""))))
             }
         }
+        // }
+        // }
     }
 }
 
@@ -171,8 +195,7 @@ async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) ->
 
 #[derive(Clone)]
 struct AppState {
-    in_channel:
-        std::sync::mpsc::SyncSender<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>,
+    in_channel: Sender<Msg>,
     tokenizer: Arc<Tokenizer>,
 }
 
@@ -414,7 +437,7 @@ impl BloomScaledSoftmax {
             * padded_causal_mask.f_logical_not().unwrap();
         debug("Probs", &probs);
 
-        let out_probs = probs.to_kind(kind::Kind::Half);
+        let out_probs = probs.to_kind(kind::Kind::BFloat16);
         debug("Out Probs", &out_probs);
 
         out_probs
@@ -763,21 +786,6 @@ impl BloomForCausalLM {
     }
 }
 
-type RChan1 = std::sync::mpsc::Receiver<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>;
-
-type RChan = std::sync::mpsc::Receiver<(
-    Tensor,
-    Past,
-    Tensor,
-    std::sync::mpsc::Sender<(Tensor, Past)>,
-)>;
-type SChan = std::sync::mpsc::SyncSender<(
-    Tensor,
-    Past,
-    Tensor,
-    std::sync::mpsc::Sender<(Tensor, Past)>,
-)>;
-
 fn thread1(rx: RChan1, s2: SChan, thread_number: usize) {
     println!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
@@ -803,7 +811,7 @@ fn thread1(rx: RChan1, s2: SChan, thread_number: usize) {
         device,
     );
 
-    let layers: Vec<BloomBlock> = (0..5)
+    let layers: Vec<BloomBlock> = (0..LAYERS_FIRST_THREAD)
         .map(|i| BloomBlock::new("h.0", &model, i, device))
         .collect();
     println!(
@@ -842,8 +850,15 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize) {
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let layers: Vec<BloomBlock> = (0..7)
-        .map(|i| BloomBlock::new("h.0", &model, i + 5 + 7 * thread_number, device))
+    let layers: Vec<BloomBlock> = (0..LAYERS_PER_THREAD)
+        .map(|i| {
+            BloomBlock::new(
+                "h.0",
+                &model,
+                i + LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * thread_number,
+                device,
+            )
+        })
         .collect();
     println!(
         "{:?} : Loaded thread {thread_number} in {:?}",
@@ -893,7 +908,14 @@ fn thread3(rx: RChan, thread_number: usize) {
     let lm_head = InvertedEmbedding::new(&format!("word_embeddings"), &embedding_model, device);
 
     let layers: Vec<BloomBlock> = (0..2)
-        .map(|i| BloomBlock::new("h.0", &model, 5 + 7 * 9 + i, device))
+        .map(|i| {
+            BloomBlock::new(
+                "h.0",
+                &model,
+                LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * N_THREADS + i,
+                device,
+            )
+        })
         .collect();
 
     println!(
@@ -935,69 +957,17 @@ async fn main() -> std::io::Result<()> {
     println!("Loaded tokenizer in {:?}", start.elapsed());
     println!("Starting threads {:?}", std::time::Instant::now());
 
-    let (tx, rx) =
-        std::sync::mpsc::sync_channel::<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>(1);
-
-    let (s0, r0) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s1, r1) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s2, r2) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s3, r3) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s4, r4) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s5, r5) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s6, r6) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s7, r7) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s8, r8) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
-    let (s9, r9) = std::sync::mpsc::sync_channel::<(
-        Tensor,
-        Past,
-        Tensor,
-        std::sync::mpsc::Sender<(Tensor, Past)>,
-    )>(1);
+    let (tx, rx) = bounded::<Msg>(10);
+    let (s0, r0) = bounded::<Msg2>(1);
+    let (s1, r1) = bounded::<Msg2>(1);
+    let (s2, r2) = bounded::<Msg2>(1);
+    let (s3, r3) = bounded::<Msg2>(1);
+    let (s4, r4) = bounded::<Msg2>(1);
+    let (s5, r5) = bounded::<Msg2>(1);
+    let (s6, r6) = bounded::<Msg2>(1);
+    let (s7, r7) = bounded::<Msg2>(1);
+    let (s8, r8) = bounded::<Msg2>(1);
+    let (s9, r9) = bounded::<Msg2>(1);
 
     std::thread::spawn(move || {
         thread1(rx, s0, 0);
