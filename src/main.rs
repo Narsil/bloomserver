@@ -1,11 +1,16 @@
 #![feature(async_closure)]
 use actix_web::middleware::Logger;
-use actix_web::{http::StatusCode, post, web, App, HttpResponse, HttpServer, ResponseError};
+use actix_web::{
+    http::header::ContentType, http::StatusCode, post, web, web::Bytes, App, HttpResponse,
+    HttpServer, ResponseError,
+};
 use memmap::MmapOptions;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tch::{kind, Device, Tensor};
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -23,6 +28,8 @@ type Past = Vec<PastLayer>;
 struct Parameters {
     top_k: Option<usize>,
     max_new_tokens: usize,
+    #[serde(default)]
+    stream: bool,
 }
 
 impl Default for Parameters {
@@ -30,6 +37,7 @@ impl Default for Parameters {
         Self {
             top_k: None,
             max_new_tokens: 20,
+            stream: false,
         }
     }
 }
@@ -41,76 +49,123 @@ struct Generation {
     parameters: Parameters,
 }
 #[derive(Error, Debug)]
-pub enum MyError {
+pub enum GenerationError {
     #[error("Queue is full")]
     QueueFull,
 }
 
-impl ResponseError for MyError {
+impl ResponseError for GenerationError {
     fn status_code(&self) -> StatusCode {
         match self {
-            MyError::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
+            GenerationError::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+type InChan = std::sync::mpsc::SyncSender<(Tensor, Past, std::sync::mpsc::Sender<(Tensor, Past)>)>;
+
+struct Stream {
+    new_generated_tokens: usize,
+    ids: Vec<i64>,
+    payload: Generation,
+    in_channel: InChan,
+    tokenizer: Arc<Tokenizer>,
+    start: std::time::Instant,
+}
+
+impl Stream {
+    fn new(payload: Generation, in_channel: InChan, tokenizer: Arc<Tokenizer>) -> Self {
+        let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
+        let ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+        let start = std::time::Instant::now();
+        Self {
+            payload,
+            in_channel,
+            tokenizer,
+            new_generated_tokens: 0,
+            ids,
+            start,
+        }
+    }
+}
+
+impl futures::Stream for Stream {
+    type Item = Result<Bytes, GenerationError>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.new_generated_tokens >= this.payload.parameters.max_new_tokens {
+            return Poll::Ready(None);
+        }
+        let kind = (kind::Kind::Int, Device::Cuda(0));
+        let input_ids = Tensor::of_slice(this.ids.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1)
+            .view((1, -1));
+        let (tx, rx) = std::sync::mpsc::channel::<(Tensor, Past)>();
+
+        let p = N_HEAD as i64;
+        let q = (HIDDEN_SIZE / N_HEAD) as i64;
+        let past_key = Tensor::zeros(&[1, 0, p, q], kind);
+        let past_value = Tensor::zeros(&[1, 0, p, q], kind);
+        let past_key_values: Vec<_> = (0..N_LAYER)
+            .map(|_| (past_key.copy(), past_value.copy()))
+            .collect();
+
+        if this.new_generated_tokens == 0 {
+            this.in_channel
+                .try_send((input_ids.copy(), past_key_values, tx.clone()))
+                .map_err(|_| GenerationError::QueueFull)?;
+        } else {
+            this.in_channel
+                .send((input_ids.copy(), past_key_values, tx.clone()))
+                .expect("This send should always work");
+        }
+
+        let (logits, _r_past_key_values) = rx.recv().unwrap();
+        let S = logits.size()[1];
+        let new_id = logits.slice(1, S - 1, S, 1).argmax(-1, false);
+        // past_key_values = r_past_key_values;
+        // input_ids = Tensor::f_cat(&[input_ids, new_id.copy()], 1).unwrap();
+        let received_ids: Vec<i64> = new_id.try_into().unwrap();
+        this.ids.push(received_ids[0]);
+        this.new_generated_tokens += 1;
+
+        if this.new_generated_tokens == this.payload.parameters.max_new_tokens {
+            let n = this.new_generated_tokens;
+            println!(
+                "Inference generated {n} tokens in {:?} ({:?}/tok)",
+                this.start.elapsed(),
+                this.start.elapsed().div_f32(n as f32)
+            );
+            let full_ids: Vec<_> = this.ids.iter().map(|&i| i as u32).collect();
+            let string = this.tokenizer.decode(full_ids, false).unwrap();
+            let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
+            Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
+        } else {
+            if this.payload.parameters.stream {
+                let received_ids: Vec<_> = received_ids.iter().map(|&i| i as u32).collect();
+                let string = this.tokenizer.decode(received_ids.clone(), false).unwrap();
+                let result = serde_json::to_string(&json!([{ "text": string }])).unwrap();
+                Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
+            } else {
+                Poll::Ready(Some(Ok(Bytes::copy_from_slice(b""))))
+            }
         }
     }
 }
 
 #[post("/generate")]
-async fn generate(
-    payload: web::Json<Generation>,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, MyError> {
-    let start = std::time::Instant::now();
-    let inputs = &payload.inputs;
-
-    let encoded = state.tokenizer.encode(inputs.clone(), false).unwrap();
-    let ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
-    let kind = (kind::Kind::Int, Device::Cuda(0));
-    let t = Tensor::of_slice(ids.as_slice())
-        .to_kind(kind.0)
-        .to_device(kind.1)
-        .view((1, -1));
-    let (tx, rx) = std::sync::mpsc::channel::<(Tensor, Past)>();
-
-    let p = N_HEAD as i64;
-    let q = (HIDDEN_SIZE / N_HEAD) as i64;
-    let past_key = Tensor::zeros(&[1, 0, p, q], kind);
-    let past_value = Tensor::zeros(&[1, 0, p, q], kind);
-    let mut past_key_values: Vec<_> = (0..N_LAYER)
-        .map(|_| (past_key.copy(), past_value.copy()))
-        .collect();
-    let mut full_ids: Vec<u32> = encoded.get_ids().to_vec();
-
-    let mut input_ids = t;
-    for i in 0..payload.parameters.max_new_tokens {
-        if i == 0 {
-            state
-                .in_channel
-                .try_send((input_ids.copy(), past_key_values, tx.clone()))
-                .map_err(|_| MyError::QueueFull)?;
-        } else {
-            state
-                .in_channel
-                .send((input_ids.copy(), past_key_values, tx.clone()))
-                .expect("This send should always work");
-        }
-
-        let (logits, r_past_key_values) = rx.recv().unwrap();
-        let S = logits.size()[1];
-        let new_id = logits.slice(1, S - 1, S, 1).argmax(-1, false);
-        past_key_values = r_past_key_values;
-        input_ids = Tensor::f_cat(&[input_ids, new_id.copy()], 1).unwrap();
-        let received_ids: Vec<i64> = new_id.try_into().unwrap();
-        full_ids.push(received_ids[0] as u32);
-    }
-
-    let n = full_ids.len() - encoded.get_ids().len();
-    println!(
-        "Inference generated {n} tokens in {:?} ({:?}/tok)",
-        start.elapsed(),
-        start.elapsed().div_f32(n as f32)
+async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) -> HttpResponse {
+    let state = state.into_inner();
+    let stream = Stream::new(
+        payload.into_inner(),
+        state.in_channel.clone(),
+        state.tokenizer.clone(),
     );
-    let string = state.tokenizer.decode(full_ids, false).unwrap();
-    Ok(HttpResponse::Ok().json(json!([{ "generated_text": string }])))
+    HttpResponse::Ok()
+        .content_type(ContentType::json())
+        .streaming(stream)
 }
 
 #[derive(Clone)]
