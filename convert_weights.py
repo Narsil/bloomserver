@@ -4,11 +4,15 @@ import torch
 
 MODEL_ID = "bigscience/bloom"
 
+filenames = [
+    (f"bloom-h.{i}.bin", f"pytorch_model_000{i+1:02d}-of-00072.bin")
+    for i in range(1, 72)
+]
+
 for (local, filename) in [
     ("bloom-embedding.bin", "pytorch_model_00001-of-00072.bin"),
-    ("bloom-h.1.bin", "pytorch_model_00002-of-00072.bin"),
     ("bloom-final.bin", "pytorch_model_00072-of-00072.bin"),
-]:
+] + filenames:
     filename = hf_hub_download(MODEL_ID, filename=filename)
     data = torch.load(filename, map_location="cpu")
 
