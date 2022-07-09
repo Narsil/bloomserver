@@ -227,6 +227,7 @@ impl futures::Stream for Stream {
         let past_key_values = empty_past(&config);
 
         let uuid = Uuid::new_v4();
+        println!("New request created {uuid:?} - {input_ids:?}");
         if this.new_generated_tokens == 0 {
             this.in_channel
                 .try_send((input_ids.copy(), past_key_values, (uuid, this.sx.clone())))
@@ -251,6 +252,7 @@ impl futures::Stream for Stream {
         // } else {
         let (logits, _r_past_key_values, received_uuid) = this.rx.recv().unwrap();
         if received_uuid != uuid {
+            println!("New request created {uuid:?} - received {received_uuid:?} instead");
             panic!("This is not the correct thing!");
         }
         this.sent = false;
