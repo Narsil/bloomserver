@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use tch::{kind, Device, IndexOp, Tensor};
 use thiserror::Error;
 use tokenizers::Tokenizer;
-use uuid::Uuid;
 
 const PADDING_IDX: i64 = 3;
 const EPS: f64 = 1e-5;
@@ -95,7 +94,7 @@ impl LayoutConfig {
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
-type Ack = (Uuid, Sender<(Tensor, Past, Uuid)>);
+type Ack = Sender<(Tensor, Past)>;
 type Msg = (Tensor, Past, Ack);
 type Msg2 = ((Tensor, Tensor, Tensor, Past), Vec<Ack>);
 type InChan = Sender<Msg>;
@@ -169,9 +168,8 @@ struct Stream {
     tokenizer: Arc<Tokenizer>,
     start: std::time::Instant,
     sent: bool,
-    sx: Sender<(Tensor, Past, Uuid)>,
-    rx: Receiver<(Tensor, Past, Uuid)>,
-    uuid: Uuid,
+    sx: Sender<(Tensor, Past)>,
+    rx: Receiver<(Tensor, Past)>,
 }
 
 impl Stream {
@@ -188,8 +186,7 @@ impl Stream {
             ids.push(0);
         }
         let start = std::time::Instant::now();
-        let (sx, rx) = unbounded::<(Tensor, Past, Uuid)>();
-        let uuid = Uuid::new_v4();
+        let (sx, rx) = unbounded::<(Tensor, Past)>();
         Self {
             payload,
             in_channel,
@@ -201,7 +198,6 @@ impl Stream {
             sent: false,
             sx,
             rx,
-            uuid,
         }
     }
 }
@@ -226,18 +222,16 @@ impl futures::Stream for Stream {
 
         let past_key_values = empty_past(&config);
 
-        let uuid = Uuid::new_v4();
-        println!("New request created {uuid:?} - {input_ids:?}");
         if this.new_generated_tokens == 0 {
             this.in_channel
-                .try_send((input_ids.copy(), past_key_values, (uuid, this.sx.clone())))
+                .try_send((input_ids.copy(), past_key_values, this.sx.clone()))
                 .map_err(|_| {
                     println!("Queue was full {:?}", this.in_channel.len());
                     GenerationError::QueueFull
                 })?;
         } else {
             this.prio_channel
-                .send((input_ids.copy(), past_key_values, (uuid, this.sx.clone())))
+                .send((input_ids.copy(), past_key_values, this.sx.clone()))
                 .expect("This send should always work");
         }
         this.sent = true;
@@ -246,11 +240,7 @@ impl futures::Stream for Stream {
         //     println!("Pending waiting on channel");
         //     Poll::Pending
         // } else {
-        let (logits, _r_past_key_values, received_uuid) = this.rx.recv().unwrap();
-        if received_uuid != uuid {
-            println!("New request created {uuid:?} - received {received_uuid:?} instead");
-            panic!("This is not the correct thing!");
-        }
+        let (logits, _r_past_key_values) = this.rx.recv().unwrap();
         this.sent = false;
         let new_id = choose_next_id(&logits, &this.payload.parameters);
         // past_key_values = r_past_key_values;
@@ -1278,12 +1268,10 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         debug(&format!("After ln_f"), &hidden_states);
         let logits = lm_head.forward(&hidden_states);
 
-        for (i, ack) in rqs.into_iter().enumerate() {
+        for (i, rq) in rqs.into_iter().enumerate() {
             let simple_logits = logits.i(i as i64..i as i64 + 1);
             let past = empty_past(&config);
-            let uuid = ack.0;
-            let rq = ack.1;
-            rq.send((simple_logits, past, uuid)).unwrap();
+            rq.send((simple_logits, past)).unwrap();
         }
     }
 }
