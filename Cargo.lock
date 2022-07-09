@@ -1833,6 +1833,7 @@ checksum = "f3f6f92acf49d1b98f7a81226834412ada05458b7364277387724a237f062695"
 [[package]]
 name = "safetensors"
 version = "0.1.0"
+source = "git+https://github.com/Narsil/safetensors#5c644db0fe101b791fa1e54074d0c2b172bd0b55"
 dependencies = [
  "serde",
  "serde_json",
@@ -2045,6 +2046,7 @@ dependencies = [
 [[package]]
 name = "tch"
 version = "0.8.0"
+source = "git+https://github.com/Narsil/tch-rs?branch=support_optional_baddbmm_args#4a6d82a2cd553d59b35189ed6500c313d7b0b9eb"
 dependencies = [
  "half",
  "lazy_static",
@@ -2241,6 +2243,7 @@ dependencies = [
 [[package]]
 name = "torch-sys"
 version = "0.8.0"
+source = "git+https://github.com/Narsil/tch-rs?branch=support_optional_baddbmm_args#4a6d82a2cd553d59b35189ed6500c313d7b0b9eb"
 dependencies = [
  "anyhow",
  "cc",

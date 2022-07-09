@@ -1531,11 +1531,11 @@ mod tests {
         let input_sentence = "I enjoy walking with my cute dog";
         let input_sentence2 = "Hello my name is";
 
-        // let output = test_generate(&[input_sentence], &config, &tokenizer, &model, 43);
-        // assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
+        let output = test_generate(&[input_sentence], &config, &tokenizer, &model, 43);
+        assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
 
-        // let output = test_generate(&[input_sentence2], &config, &tokenizer, &model, 43);
-        // assert_eq!(output[0], "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good, very good, very good, very good, very good, very good, very good, very good, very");
+        let output = test_generate(&[input_sentence2], &config, &tokenizer, &model, 43);
+        assert_eq!(output[0], "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good, very good, very good, very good, very good, very good, very good, very good, very");
 
         // TODO expected3 and expected4 **are** different.
         // This bug doesn't seem to exist on torch==1.11.0
