@@ -237,11 +237,7 @@ impl futures::Stream for Stream {
                 })?;
         } else {
             this.prio_channel
-                .send((
-                    input_ids.copy(),
-                    past_key_values,
-                    (this.uuid, this.sx.clone()),
-                ))
+                .send((input_ids.copy(), past_key_values, (uuid, this.sx.clone())))
                 .expect("This send should always work");
         }
         this.sent = true;
