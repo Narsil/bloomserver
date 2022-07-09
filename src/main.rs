@@ -1278,22 +1278,12 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         debug(&format!("After ln_f"), &hidden_states);
         let logits = lm_head.forward(&hidden_states);
 
-        for (_i, ack) in rqs.into_iter().enumerate() {
-            let simple_logits = logits.f_slice(0, 0, logits.size()[0], 1).unwrap();
-
-            let p = config.n_head;
-            let q = config.hidden_size / config.n_head;
-            let kind = (kind::Kind::Half, device);
-            let past_key = Tensor::zeros(&[1, 0, p, q], kind);
-            let past_value = Tensor::zeros(&[1, 0, p, q], kind);
-            let simple_past_key_values: Vec<_> = (0..config.n_layer)
-                .map(|_| (past_key.copy(), past_value.copy()))
-                .collect();
+        for (i, ack) in rqs.into_iter().enumerate() {
+            let simple_logits = logits.i(i as i64..i as i64 + 1);
             let past = empty_past(&config);
             let uuid = ack.0;
             let rq = ack.1;
-            rq.send((simple_logits, simple_past_key_values, uuid))
-                .unwrap();
+            rq.send((simple_logits, past, uuid)).unwrap();
         }
     }
 }
