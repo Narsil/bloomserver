@@ -321,8 +321,20 @@ struct LayerNorm {
 
 impl LayerNorm {
     fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
-        let bias = convert(model.tensor(&format!("{name}.bias")).unwrap(), device);
+        let weight_name = format!("{name}.weight");
+        let weight = convert(
+            model
+                .tensor(&weight_name)
+                .expect(&format!("Failed to load {weight_name}")),
+            device,
+        );
+        let bias_name = format!("{name}.bias");
+        let bias = convert(
+            model
+                .tensor(&bias_name)
+                .expect(&format!("Failed to load {bias_name}")),
+            device,
+        );
         Self { weight, bias }
     }
 
@@ -1176,7 +1188,7 @@ async fn main() -> std::io::Result<()> {
             }))
             .service(generate)
     })
-    .bind(("127.0.0.1", 8000))?
+    .bind(("127.0.0.1", 8001))?
     .run()
     .await
 }
