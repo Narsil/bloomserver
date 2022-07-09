@@ -226,13 +226,10 @@ impl futures::Stream for Stream {
 
         let past_key_values = empty_past(&config);
 
+        let uuid = Uuid::new_v4();
         if this.new_generated_tokens == 0 {
             this.in_channel
-                .try_send((
-                    input_ids.copy(),
-                    past_key_values,
-                    (this.uuid, this.sx.clone()),
-                ))
+                .try_send((input_ids.copy(), past_key_values, (uuid, this.sx.clone())))
                 .map_err(|_| {
                     println!("Queue was full {:?}", this.in_channel.len());
                     GenerationError::QueueFull
@@ -253,7 +250,7 @@ impl futures::Stream for Stream {
         //     Poll::Pending
         // } else {
         let (logits, _r_past_key_values, received_uuid) = this.rx.recv().unwrap();
-        if received_uuid != this.uuid {
+        if received_uuid != uuid {
             panic!("This is not the correct thing!");
         }
         this.sent = false;
