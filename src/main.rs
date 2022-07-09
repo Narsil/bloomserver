@@ -822,23 +822,25 @@ impl Embedding {
 }
 
 fn debug_force(prefix: &str, x: &Tensor) {
+    let size = x.size();
+    let B = size[0];
     println!(
         "{prefix} - {:?} - Values: {:?}",
-        x.size(),
+        size,
         x.reshape(&[-1,])
             .iter::<f64>()
             .unwrap()
-            .take(10)
+            .take(30)
             .collect::<Vec<_>>()
     );
-    if x.size()[0] > 1 {
+    if B > 1 {
         println!(
             "                          {:?}",
             x.i(1)
                 .reshape(&[-1,])
                 .iter::<f64>()
                 .unwrap()
-                .take(10)
+                .take(30)
                 .collect::<Vec<_>>()
         );
     }
@@ -918,9 +920,12 @@ impl InvertedEmbedding {
     fn forward(&self, xs: &Tensor) -> Tensor {
         debug("InvertedEmbedding weights", &self.weight);
         debug("Incoming tensor ", xs);
-        let result = xs.f_linear::<Tensor>(&self.weight, None).unwrap();
-        debug("Outgoing tensor ", &result);
-        result
+        let logits = xs.f_linear::<Tensor>(&self.weight, None).unwrap();
+        let max = logits.max_dim(-1, false);
+        debug("lm logits (max)", &max.0);
+        debug("lm logits (max indices)", &max.1);
+        debug("lm logits", &logits);
+        logits
     }
 }
 
@@ -1545,6 +1550,7 @@ mod tests {
             &tokenizer,
             &model,
             43,
+            // 21,
         );
         assert_eq!(expected3, output[0]);
         assert_eq!(expected4, output[1]);
