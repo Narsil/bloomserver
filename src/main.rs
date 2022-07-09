@@ -38,10 +38,10 @@ const N_LAYER: usize = 24;
 #[cfg(feature = "bloom-350m")]
 const MODEL_KIND: kind::Kind = kind::Kind::Half;
 
-const LAYERS_FIRST_THREAD: usize = 5;
-const LAYERS_PER_THREAD: usize = 3;
-const N_THREADS: usize = 9;
-const LAYERS_LAST_THREAD: usize = 2;
+const LAYERS_FIRST_THREAD: usize = 0;
+const LAYERS_PER_THREAD: usize = 5;
+const N_THREADS: usize = 14;
+const LAYERS_LAST_THREAD: usize = 0;
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
@@ -519,7 +519,7 @@ impl BloomAttention {
         residual: &Tensor,
         attention_mask: &Tensor,
         alibi: &Tensor,
-        layer_past: &mut PastLayer,
+        _layer_past: &mut PastLayer,
     ) -> Tensor {
         let layer_number = self.layer_number;
         let mut mixed_x_layer = self.query_key_value.forward(hidden_states);
@@ -544,7 +544,6 @@ impl BloomAttention {
         // let mut key_layer = Tensor::f_cat(&[past_key.as_ref(), key], 1).unwrap();
         // let mut value_layer = Tensor::f_cat(&[past_value.as_ref(), value], 1).unwrap();
         let mut key_layer = key.copy();
-        let mut value_layer = value.copy();
 
         // Update past for next loops
         // *layer_past = (key_layer.copy(), value_layer.copy());
@@ -587,7 +586,7 @@ impl BloomAttention {
         let attention_probs =
             self.scaled_softmax
                 .forward(&attention_scores, attention_mask, max_positions);
-        value_layer = value.transpose(1, 0).reshape(&[K, B * H, -1]);
+        let value_layer = value.transpose(1, 0).reshape(&[K, B * H, -1]);
         let attention_probs_reshaped = attention_probs.f_view((B * H, Q, -1)).unwrap();
         let context_layer = Tensor::bmm(&attention_probs_reshaped, &value_layer.transpose(0, 1));
         let context_layer_r = context_layer.f_view((B, H, Q, -1)).unwrap();
@@ -735,7 +734,7 @@ fn debug(prefix: &str, x: &Tensor) {
     // );
 }
 
-struct BloomModel {
+pub struct BloomModel {
     word_embeddings: Embedding,
     word_embeddings_layernorm: LayerNorm,
     h: Vec<BloomBlock>,
@@ -743,7 +742,7 @@ struct BloomModel {
 }
 
 impl BloomModel {
-    fn new(model: &SafeTensors<'_>, device: Device) -> Self {
+    pub fn new(model: &SafeTensors<'_>, device: Device) -> Self {
         let word_embeddings = Embedding::new(&format!("word_embeddings"), model, device);
         let word_embeddings_layernorm =
             LayerNorm::new(&format!("word_embeddings_layernorm"), model, device);
@@ -759,15 +758,13 @@ impl BloomModel {
         }
     }
 
-    fn forward(
+    pub fn forward(
         &self,
         input_ids: &Tensor,
         attention_mask: &Tensor,
         alibi: &Tensor,
         past_key_values: &mut Past,
     ) -> Tensor {
-        let n_head = N_HEAD;
-        let device = input_ids.device();
         let inputs_embeds = self.word_embeddings.forward(input_ids);
         let mut hidden_states = self.word_embeddings_layernorm.forward(&inputs_embeds);
 
@@ -777,11 +774,6 @@ impl BloomModel {
         );
 
         debug("First layer norm", &hidden_states);
-
-        // TODO Re-enable past ?
-        // let current_sequence_length =
-        //     (hidden_states.size()[1] + past_key_values[0].0.size()[1]) as usize;
-        let current_sequence_length = hidden_states.size()[1] as usize;
 
         debug("Alibi", &alibi);
 
@@ -927,7 +919,7 @@ fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
     );
 
     let layers: Vec<BloomBlock> = (0..LAYERS_FIRST_THREAD)
-        .map(|i| BloomBlock::new("h.0", &model, i, device))
+        .map(|i| BloomBlock::new(&format!("h.{i}"), &model, i, device))
         .collect();
     println!(
         "{:?} : Loaded thread {thread_number} in {:?}",
@@ -994,12 +986,8 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize) {
 
     let layers: Vec<BloomBlock> = (0..LAYERS_PER_THREAD)
         .map(|i| {
-            BloomBlock::new(
-                "h.0",
-                &model,
-                i + LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * thread_number,
-                device,
-            )
+            let layer_number = i + LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * thread_number;
+            BloomBlock::new(&format!("h.{layer_number}"), &model, layer_number, device)
         })
         .collect();
     println!(
@@ -1051,14 +1039,10 @@ fn thread3(rx: RChan, thread_number: usize) {
     let ln_f = LayerNorm::new(&format!("ln_f"), &final_model, device);
     let lm_head = InvertedEmbedding::new(&format!("word_embeddings"), &embedding_model, device);
 
-    let layers: Vec<BloomBlock> = (0..2)
+    let layers: Vec<BloomBlock> = (0..LAYERS_LAST_THREAD)
         .map(|i| {
-            BloomBlock::new(
-                "h.0",
-                &model,
-                LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * N_THREADS + i,
-                device,
-            )
+            let layer_number = LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * N_THREADS + i;
+            BloomBlock::new(&format!("h.{layer_number}"), &model, layer_number, device)
         })
         .collect();
 
@@ -1089,7 +1073,7 @@ fn thread3(rx: RChan, thread_number: usize) {
         debug(&format!("After ln_f"), &hidden_states);
         let logits = lm_head.forward(&hidden_states);
 
-        for (i, rq) in rqs.into_iter().enumerate() {
+        for (_i, rq) in rqs.into_iter().enumerate() {
             let simple_logits = logits.f_slice(0, 0, logits.size()[0], 1).unwrap();
 
             let p = N_HEAD as i64;
@@ -1127,6 +1111,11 @@ async fn main() -> std::io::Result<()> {
     let (s7, r7) = bounded::<Msg2>(1);
     let (s8, r8) = bounded::<Msg2>(1);
     let (s9, r9) = bounded::<Msg2>(1);
+    let (s10, r10) = bounded::<Msg2>(1);
+    let (s11, r11) = bounded::<Msg2>(1);
+    let (s12, r12) = bounded::<Msg2>(1);
+    let (s13, r13) = bounded::<Msg2>(1);
+    let (s14, r14) = bounded::<Msg2>(1);
 
     std::thread::spawn(move || {
         thread1(rx, prio_rx, s0, 0);
@@ -1137,29 +1126,44 @@ async fn main() -> std::io::Result<()> {
     std::thread::spawn(move || {
         thread2(r1, s2, 2);
     });
-    // std::thread::spawn(move || {
-    //     thread2(r2, s3, 3);
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r3, s4, 4);
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r4, s5, 5);
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r5, s6, 6);
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r6, s7, 7);
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r7, s8, 8);
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r8, s9, 9);
-    // });
     std::thread::spawn(move || {
-        thread3(r2, 3);
+        thread2(r2, s3, 3);
+    });
+    std::thread::spawn(move || {
+        thread2(r3, s4, 4);
+    });
+    std::thread::spawn(move || {
+        thread2(r4, s5, 5);
+    });
+    std::thread::spawn(move || {
+        thread2(r5, s6, 6);
+    });
+    std::thread::spawn(move || {
+        thread2(r6, s7, 7);
+    });
+    std::thread::spawn(move || {
+        thread2(r7, s8, 8);
+    });
+    std::thread::spawn(move || {
+        thread2(r8, s9, 9);
+    });
+    std::thread::spawn(move || {
+        thread2(r9, s10, 10);
+    });
+    std::thread::spawn(move || {
+        thread2(r10, s11, 11);
+    });
+    std::thread::spawn(move || {
+        thread2(r11, s12, 12);
+    });
+    std::thread::spawn(move || {
+        thread2(r12, s13, 13);
+    });
+    std::thread::spawn(move || {
+        thread2(r13, s14, 14);
+    });
+    std::thread::spawn(move || {
+        thread3(r14, 15);
     });
 
     HttpServer::new(move || {
@@ -1172,7 +1176,7 @@ async fn main() -> std::io::Result<()> {
             }))
             .service(generate)
     })
-    .bind(("127.0.0.1", 8001))?
+    .bind(("127.0.0.1", 8000))?
     .run()
     .await
 }
