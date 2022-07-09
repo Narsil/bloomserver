@@ -293,7 +293,7 @@ fn build_alibi_tensor(attention_mask: &Tensor, n_head: usize, device: Device) ->
     let kind = MODEL_KIND;
     let slopes = Tensor::of_slice(&slopes).to_kind(kind).to_device(device);
     debug("slopes", &slopes);
-    let A = attention_mask.cumsum(-1, kind).unsqueeze(1) - 1;
+    let A = attention_mask.f_cumsum(-1, kind).unwrap().unsqueeze(1) - 1;
     debug("A", &A);
     let B = attention_mask.unsqueeze(1);
     debug("B", &B);
@@ -1187,12 +1187,15 @@ mod tests {
 
     #[test]
     fn test_padding() {
+        let device = Device::Cuda(0);
         let input_ids = Tensor::of_slice(&[3, 4, 5])
             .view((1, 3))
-            .to_kind(kind::Kind::Int);
+            .to_kind(kind::Kind::Int)
+            .to_device(device);
         let input_ids2 = Tensor::of_slice(&[8, 1, 3, 4, 5, 6])
             .view((1, 6))
-            .to_kind(kind::Kind::Int);
+            .to_kind(kind::Kind::Int)
+            .to_device(device);
         let past = vec![];
         let past2 = vec![];
         let (tx, rx) = bounded::<(Tensor, Past)>(10);
