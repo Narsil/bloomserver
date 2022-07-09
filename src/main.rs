@@ -217,7 +217,7 @@ impl futures::Stream for Stream {
             .view((1, -1));
 
         // TODO This is necessarily the big config
-        let config = Config::new();
+        let config = Config::new350m();
 
         let past_key_values = empty_past(&config);
 
@@ -1038,10 +1038,10 @@ fn thread1(
     prio_rx: RChan1,
     s2: SChan,
     thread_number: usize,
+    config: Config,
     layout_config: LayoutConfig,
 ) {
     println!("Starting thread {thread_number}");
-    let config = Config::new();
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -1130,9 +1130,8 @@ fn thread1(
     }
 }
 
-fn thread2(rx: RChan, s: SChan, thread_number: usize, layout_config: LayoutConfig) {
+fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_config: LayoutConfig) {
     println!("Starting thread {thread_number}");
-    let config = Config::new();
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -1187,9 +1186,8 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, layout_config: LayoutConfi
     }
 }
 
-fn thread3(rx: RChan, thread_number: usize, layout_config: LayoutConfig) {
+fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: LayoutConfig) {
     println!("Starting thread {thread_number}");
-    let config = Config::new();
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -1304,70 +1302,70 @@ async fn main() -> std::io::Result<()> {
     let (s13, r13) = bounded::<Msg2>(1);
     let (s14, r14) = bounded::<Msg2>(1);
 
-    let (is_350m, config_fn) = (true, || LayoutConfig::new350m());
+    let (is_350m, config_fn, layout_config_fn) = (true, ||, Config::new350m(), || LayoutConfig::new350m());
     // let (is_350m, config) = (false, LayoutConfig::new());
 
     if is_350m {
         std::thread::spawn(move || {
-            thread1(rx, prio_rx, s0, 0, config_fn());
+            thread1(rx, prio_rx, s0, 0, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r0, s1, 1, config_fn());
+            thread2(r0, s1, 1, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r1, s2, 2, config_fn());
+            thread2(r1, s2, 2, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread3(r2, 3, config_fn());
+            thread3(r2, 3, config_fn(), layout_config_fn());
         });
     } else {
         std::thread::spawn(move || {
-            thread1(rx, prio_rx, s0, 0, config_fn());
+            thread1(rx, prio_rx, s0, 0, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r0, s1, 1, config_fn());
+            thread2(r0, s1, 1, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r1, s2, 2, config_fn());
+            thread2(r1, s2, 2, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r2, s3, 3, config_fn());
+            thread2(r2, s3, 3, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r3, s4, 4, config_fn());
+            thread2(r3, s4, 4, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r4, s5, 5, config_fn());
+            thread2(r4, s5, 5, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r5, s6, 6, config_fn());
+            thread2(r5, s6, 6, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r6, s7, 7, config_fn());
+            thread2(r6, s7, 7, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r7, s8, 8, config_fn());
+            thread2(r7, s8, 8, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r8, s9, 9, config_fn());
+            thread2(r8, s9, 9, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r9, s10, 10, config_fn());
+            thread2(r9, s10, 10, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r10, s11, 11, config_fn());
+            thread2(r10, s11, 11, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r11, s12, 12, config_fn());
+            thread2(r11, s12, 12, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r12, s13, 13, config_fn());
+            thread2(r12, s13, 13, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread2(r13, s14, 14, config_fn());
+            thread2(r13, s14, 14, config_fn(), layout_config_fn());
         });
         std::thread::spawn(move || {
-            thread3(r14, 15, config_fn());
+            thread3(r14, 15, config_fn(), layout_config_fn());
         });
     }
 
