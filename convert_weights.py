@@ -1,7 +1,8 @@
 from safetensors.torch import save_file, load_file, load
 from huggingface_hub import hf_hub_download
 import torch
-
+import tqdm
+import os
 
 def convert_350m():
     filename = hf_hub_download("bigscience/bloom-350m", filename="pytorch_model.bin")
@@ -16,14 +17,18 @@ def convert_full():
         (f"bloom-h.{i}.bin", f"pytorch_model_000{i+1:02d}-of-00072.bin")
         for i in range(1, 72)
     ]
-    for (local, filename) in [
+    for (local, filename) in tqdm.tqdm([
         ("bloom-embedding.bin", "pytorch_model_00001-of-00072.bin"),
         ("bloom-final.bin", "pytorch_model_00072-of-00072.bin"),
-    ] + filenames:
+    ] + filenames):
+        if os.path.exists(local):
+            continue
         filename = hf_hub_download(MODEL_ID, filename=filename)
         data = torch.load(filename, map_location="cpu")
 
         # Need to copy since that call mutates the tensors to numpy
         save_file(data.copy(), local)
+        os.remove(filename)
 
-convert_350m()
+if __name__ == "__main__":
+    raise Exception("Choose one of the weights to convert.")
