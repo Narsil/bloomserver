@@ -996,6 +996,7 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize) {
     let layers: Vec<BloomBlock> = (0..LAYERS_PER_THREAD)
         .map(|i| {
             let layer_number = i + LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * thread_number;
+            println!("Loading layer {layer_number} on thread2 ({thread_number})");
             let file_number = layer_number + 1;
             let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
             // SAFETY: This is actually unsafe.
@@ -1051,6 +1052,7 @@ fn thread3(rx: RChan, thread_number: usize) {
     let layers: Vec<BloomBlock> = (0..LAYERS_LAST_THREAD)
         .map(|i| {
             let layer_number = LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * N_THREADS + i;
+            println!("Loading layer {layer_number} on thread3 ({thread_number})");
             let file_number = layer_number + 1;
             let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
             // SAFETY: This is actually unsafe.
