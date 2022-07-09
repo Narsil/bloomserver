@@ -302,6 +302,7 @@ dependencies = [
  "env_logger",
  "futures",
  "memmap",
+ "once_cell",
  "safetensors",
  "serde",
  "serde_json",

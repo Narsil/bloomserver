@@ -19,5 +19,8 @@ thiserror = "1.0.31"
 futures = "0.3.21"
 crossbeam-channel = "0.5.5"
 
+[dev-dependencies]
+once_cell = "1.13"
+
 [features]
 bloom-350m = []
