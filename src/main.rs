@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tch::{kind, Device, IndexOp, Tensor};
 use thiserror::Error;
 use tokenizers::Tokenizer;
+use uuid::Uuid;
 
 const PADDING_IDX: i64 = 3;
 const EPS: f64 = 1e-5;
@@ -94,8 +95,9 @@ impl LayoutConfig {
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
-type Msg = (Tensor, Past, Sender<(Tensor, Past)>);
-type Msg2 = (Tensor, Tensor, Tensor, Past, Vec<Sender<(Tensor, Past)>>);
+type Ack = (Uuid, Sender<(Tensor, Past, Uuid)>);
+type Msg = (Tensor, Past, Ack);
+type Msg2 = ((Tensor, Tensor, Tensor, Past), Vec<Ack>);
 type InChan = Sender<Msg>;
 type RChan1 = Receiver<Msg>;
 type RChan = Receiver<Msg2>;
@@ -140,49 +142,6 @@ impl ResponseError for GenerationError {
     }
 }
 
-struct Stream {
-    new_generated_tokens: usize,
-    ids: Vec<i64>,
-    payload: Generation,
-    in_channel: InChan,
-    prio_channel: InChan,
-    tokenizer: Arc<Tokenizer>,
-    start: std::time::Instant,
-    sent: bool,
-    sx: Sender<(Tensor, Past)>,
-    rx: Receiver<(Tensor, Past)>,
-}
-
-impl Stream {
-    fn new(
-        payload: Generation,
-        in_channel: InChan,
-        prio_channel: InChan,
-        tokenizer: Arc<Tokenizer>,
-    ) -> Self {
-        let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
-        let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
-        // TODO The model is not able to handle empty input ids
-        if ids.len() == 0 {
-            ids.push(0);
-        }
-        let start = std::time::Instant::now();
-        let (sx, rx) = unbounded::<(Tensor, Past)>();
-        Self {
-            payload,
-            in_channel,
-            prio_channel,
-            tokenizer,
-            new_generated_tokens: 0,
-            ids,
-            start,
-            sent: false,
-            sx,
-            rx,
-        }
-    }
-}
-
 fn empty_past(config: &Config) -> Past {
     let kind = (config.kind, Device::Cuda(0));
     let p = config.n_head;
@@ -199,6 +158,52 @@ fn choose_next_id(logits: &Tensor, parameters: &Parameters) -> Tensor {
     let S = logits.size()[1];
     let new_id = logits.slice(1, S - 1, S, 1).argmax(-1, false);
     new_id
+}
+
+struct Stream {
+    new_generated_tokens: usize,
+    ids: Vec<i64>,
+    payload: Generation,
+    in_channel: InChan,
+    prio_channel: InChan,
+    tokenizer: Arc<Tokenizer>,
+    start: std::time::Instant,
+    sent: bool,
+    sx: Sender<(Tensor, Past, Uuid)>,
+    rx: Receiver<(Tensor, Past, Uuid)>,
+    uuid: Uuid,
+}
+
+impl Stream {
+    fn new(
+        payload: Generation,
+        in_channel: InChan,
+        prio_channel: InChan,
+        tokenizer: Arc<Tokenizer>,
+    ) -> Self {
+        let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
+        let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+        // TODO The model is not able to handle empty input ids
+        if ids.len() == 0 {
+            ids.push(0);
+        }
+        let start = std::time::Instant::now();
+        let (sx, rx) = unbounded::<(Tensor, Past, Uuid)>();
+        let uuid = Uuid::new_v4();
+        Self {
+            payload,
+            in_channel,
+            prio_channel,
+            tokenizer,
+            new_generated_tokens: 0,
+            ids,
+            start,
+            sent: false,
+            sx,
+            rx,
+            uuid,
+        }
+    }
 }
 
 impl futures::Stream for Stream {
@@ -223,14 +228,22 @@ impl futures::Stream for Stream {
 
         if this.new_generated_tokens == 0 {
             this.in_channel
-                .try_send((input_ids.copy(), past_key_values, this.sx.clone()))
+                .try_send((
+                    input_ids.copy(),
+                    past_key_values,
+                    (this.uuid, this.sx.clone()),
+                ))
                 .map_err(|_| {
                     println!("Queue was full {:?}", this.in_channel.len());
                     GenerationError::QueueFull
                 })?;
         } else {
             this.prio_channel
-                .send((input_ids.copy(), past_key_values, this.sx.clone()))
+                .send((
+                    input_ids.copy(),
+                    past_key_values,
+                    (this.uuid, this.sx.clone()),
+                ))
                 .expect("This send should always work");
         }
         this.sent = true;
@@ -239,7 +252,10 @@ impl futures::Stream for Stream {
         //     println!("Pending waiting on channel");
         //     Poll::Pending
         // } else {
-        let (logits, _r_past_key_values) = this.rx.recv().unwrap();
+        let (logits, _r_past_key_values, received_uuid) = this.rx.recv().unwrap();
+        if received_uuid != this.uuid {
+            panic!("This is not the correct thing!");
+        }
         this.sent = false;
         let new_id = choose_next_id(&logits, &this.payload.parameters);
         // past_key_values = r_past_key_values;
@@ -974,13 +990,22 @@ impl BloomForCausalLM {
         lm_logits
     }
 }
-
-fn padding(
+fn padding_with_ack(
     config: &Config,
-    mut items: Vec<(Tensor, Past, Sender<(Tensor, Past)>)>,
-) -> (Tensor, Tensor, Tensor, Past, Vec<Sender<(Tensor, Past)>>) {
+    mut items: Vec<(Tensor, Past, Ack)>,
+) -> ((Tensor, Tensor, Tensor, Past), Vec<Ack>) {
+    let mut tensors = vec![];
+    let mut acks = vec![];
+    for item in items {
+        tensors.push((item.0, item.1));
+        acks.push(item.2);
+    }
+    (padding(&config, tensors), acks)
+}
+
+fn padding(config: &Config, mut items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
     // TODO
-    let max_length = items.iter().map(|(ids, _, _)| ids.size()[1]).max().unwrap();
+    let max_length = items.iter().map(|(ids, _)| ids.size()[1]).max().unwrap();
     let batch_size = items.len() as i64;
     let kind = (kind::Kind::Int64, Device::Cuda(0));
     let device = items[0].0.device();
@@ -988,11 +1013,10 @@ fn padding(
     let mut all_input_ids = Tensor::zeros(&[batch_size, max_length], kind2) + PADDING_IDX;
     let mut attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
     let mut alibi = Tensor::zeros(&[batch_size, max_length], kind2);
-    let mut rqs = vec![];
 
     let mut total_ids = 0;
 
-    for (i, (input_ids, past_key_values, rq)) in items.into_iter().enumerate() {
+    for (i, (input_ids, past_key_values)) in items.into_iter().enumerate() {
         let seq_length = input_ids.size()[1];
         total_ids += seq_length as usize;
         // all_input_ids[i:i+1, max_length - seq_length:seq_length] = input_ids[0]
@@ -1011,7 +1035,6 @@ fn padding(
         attention_mask = attention_mask
             .f_index_put(&[Some(&batch_index), Some(&id_index)], &attn.i((0,)), false)
             .unwrap();
-        rqs.push(rq);
     }
 
     let p = config.n_head;
@@ -1030,7 +1053,7 @@ fn padding(
     //     batch_size,
     //     (total_ids * 100) / total
     // );
-    (all_input_ids, attention_mask, alibi, past_key_values, rqs)
+    (all_input_ids, attention_mask, alibi, past_key_values)
 }
 
 fn thread1(
@@ -1117,16 +1140,19 @@ fn thread1(
             println!("After deadline prio queue {:?}", prio_rx.len());
         }
 
-        let (input_ids, attention_mask, alibi, mut past_key_values, rqs) =
-            padding(&config, all_items);
+        let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
+            padding_with_ack(&config, all_items);
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
 
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
         }
-        s2.send((hidden_states, attention_mask, alibi, past_key_values, rqs))
-            .unwrap();
+        s2.send((
+            (hidden_states, attention_mask, alibi, past_key_values),
+            acks,
+        ))
+        .unwrap();
     }
 }
 
@@ -1167,7 +1193,7 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
     );
 
     loop {
-        let (mut hidden_states, mut attention_mask, mut alibi, mut past_key_values, rq) = rx
+        let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
         hidden_states = hidden_states.to_device(device);
@@ -1181,7 +1207,7 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
             debug(&format!("past_values thread2"), &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
         }
-        s.send((hidden_states, attention_mask, alibi, past_key_values, rq))
+        s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
             .unwrap();
     }
 }
@@ -1237,7 +1263,7 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
     );
 
     loop {
-        let (mut hidden_states, mut attention_mask, mut alibi, mut past_key_values, rqs) = rx
+        let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
 
@@ -1257,7 +1283,7 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         debug(&format!("After ln_f"), &hidden_states);
         let logits = lm_head.forward(&hidden_states);
 
-        for (_i, rq) in rqs.into_iter().enumerate() {
+        for (_i, ack) in rqs.into_iter().enumerate() {
             let simple_logits = logits.f_slice(0, 0, logits.size()[0], 1).unwrap();
 
             let p = config.n_head;
@@ -1268,7 +1294,11 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
             let simple_past_key_values: Vec<_> = (0..config.n_layer)
                 .map(|_| (past_key.copy(), past_value.copy()))
                 .collect();
-            rq.send((simple_logits, simple_past_key_values)).unwrap();
+            let past = empty_past(&config);
+            let uuid = ack.0;
+            let rq = ack.1;
+            rq.send((simple_logits, simple_past_key_values, uuid))
+                .unwrap();
         }
     }
 }
@@ -1403,11 +1433,10 @@ mod tests {
             .to_device(device);
         let past = vec![];
         let past2 = vec![];
-        let (tx, rx) = bounded::<(Tensor, Past)>(10);
 
-        let items = vec![(input_ids, past, tx.clone()), (input_ids2, past2, tx)];
+        let items = vec![(input_ids, past), (input_ids2, past2)];
 
-        let (all_input_ids, _, _, _, _) = padding(&config, items);
+        let (all_input_ids, _, _, _) = padding(&config, items);
 
         assert_eq!(all_input_ids.size(), vec![2, 6]);
         assert_eq!(
@@ -1496,7 +1525,6 @@ mod tests {
     ) -> Vec<String> {
         // Taken directly from https://github.com/huggingface/transformers/blob/main/tests/models/bloom/test_modeling_bloom.py#L379
         let mut all_items = vec![];
-        let (sx, _) = unbounded::<(Tensor, Past)>();
         for input_string in input {
             let encoded = tokenizer.encode(input_string.to_string(), false).unwrap();
             let ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
@@ -1507,11 +1535,11 @@ mod tests {
             let past = empty_past(&config);
 
             // Not necessary, but want to reuse the real code
-            let item = (input_ids, empty_past(&config), sx.clone());
+            let item = (input_ids, empty_past(&config));
             all_items.push(item);
         }
 
-        let (mut input_ids, mut attention_mask, mut alibi, mut past_key_values, rqs) =
+        let (mut input_ids, mut attention_mask, mut alibi, mut past_key_values) =
             padding(&config, all_items);
 
         for _ in 0..max_new_tokens {
@@ -1529,9 +1557,6 @@ mod tests {
                 attention_mask.device(),
             );
         }
-
-        println!("Input ids");
-        input_ids.print();
 
         let mut all_strings = vec![];
         for i in 0..input.len() {
