@@ -1307,7 +1307,7 @@ async fn main() -> std::io::Result<()> {
 
     // let (is_350m, config_fn, layout_config_fn) =
     //     (true, || Config::new350m(), || LayoutConfig::new350m());
-    let (is_350m, config_fn, layout_config_fn) = (false, || Config::newm(), || LayoutConfig::new());
+    let (is_350m, config_fn, layout_config_fn) = (false, || Config::new(), || LayoutConfig::new());
 
     if is_350m {
         std::thread::spawn(move || {
