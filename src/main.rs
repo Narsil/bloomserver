@@ -915,11 +915,6 @@ fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let file = std::fs::File::open("./bloom-h.1.bin").unwrap();
-    // SAFETY: This is actually unsafe.
-    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
-    let model = SafeTensors::deserialize(&mmap).unwrap();
-
     // println!("Embedding {:?}", embedding_model.names());
     // println!("Layer {:?}", model.names());
 
@@ -931,7 +926,14 @@ fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
     );
 
     let layers: Vec<BloomBlock> = (0..LAYERS_FIRST_THREAD)
-        .map(|i| BloomBlock::new(&format!("h.{i}"), &model, i, device))
+        .map(|i| {
+            let file_number = i + 1;
+            let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
+            // SAFETY: This is actually unsafe.
+            let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+            let model = SafeTensors::deserialize(&mmap).unwrap();
+            BloomBlock::new(&format!("h.{i}"), &model, i, device)
+        })
         .collect();
     println!(
         "{:?} : Loaded thread {thread_number} in {:?}",
@@ -991,14 +993,14 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize) {
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
-    let file = std::fs::File::open("./bloom-h.1.bin").unwrap();
-    // SAFETY: This is actually unsafe.
-    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
-    let model = SafeTensors::deserialize(&mmap).unwrap();
-
     let layers: Vec<BloomBlock> = (0..LAYERS_PER_THREAD)
         .map(|i| {
             let layer_number = i + LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * thread_number;
+            let file_number = layer_number + 1;
+            let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
+            // SAFETY: This is actually unsafe.
+            let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+            let model = SafeTensors::deserialize(&mmap).unwrap();
             BloomBlock::new(&format!("h.{layer_number}"), &model, layer_number, device)
         })
         .collect();
@@ -1038,11 +1040,6 @@ fn thread3(rx: RChan, thread_number: usize) {
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let file = std::fs::File::open("./bloom-h.1.bin").unwrap();
-    // SAFETY: This is actually unsafe.
-    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
-    let model = SafeTensors::deserialize(&mmap).unwrap();
-
     let file = std::fs::File::open("./bloom-final.bin").unwrap();
     // SAFETY: This is actually unsafe.
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
@@ -1054,6 +1051,11 @@ fn thread3(rx: RChan, thread_number: usize) {
     let layers: Vec<BloomBlock> = (0..LAYERS_LAST_THREAD)
         .map(|i| {
             let layer_number = LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * N_THREADS + i;
+            let file_number = layer_number + 1;
+            let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
+            // SAFETY: This is actually unsafe.
+            let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+            let model = SafeTensors::deserialize(&mmap).unwrap();
             BloomBlock::new(&format!("h.{layer_number}"), &model, layer_number, device)
         })
         .collect();
