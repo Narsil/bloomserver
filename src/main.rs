@@ -20,24 +20,6 @@ use tokenizers::Tokenizer;
 const PADDING_IDX: i64 = 3;
 const EPS: f64 = 1e-5;
 
-#[cfg(not(feature = "bloom-350m"))]
-const N_HEAD: usize = 112;
-#[cfg(not(feature = "bloom-350m"))]
-const HIDDEN_SIZE: usize = 14336;
-#[cfg(not(feature = "bloom-350m"))]
-const N_LAYER: usize = 70;
-#[cfg(not(feature = "bloom-350m"))]
-const MODEL_KIND: kind::Kind = kind::Kind::BFloat16;
-
-#[cfg(feature = "bloom-350m")]
-const N_HEAD: usize = 16;
-#[cfg(feature = "bloom-350m")]
-const HIDDEN_SIZE: usize = 1024;
-#[cfg(feature = "bloom-350m")]
-const N_LAYER: usize = 24;
-#[cfg(feature = "bloom-350m")]
-const MODEL_KIND: kind::Kind = kind::Kind::Half;
-
 struct Config {
     n_head: i64,
     hidden_size: i64,
@@ -73,10 +55,42 @@ impl Config {
     }
 }
 
-const LAYERS_FIRST_THREAD: usize = 0;
-const LAYERS_PER_THREAD: usize = 5;
-const N_THREADS: usize = 14;
-const LAYERS_LAST_THREAD: usize = 0;
+#[derive(Clone)]
+struct LayoutConfig {
+    layers_first_thread: usize,
+    layers_per_thread: usize,
+    layers_last_thread: usize,
+    n_threads: usize,
+    embeddings_filename: String,
+    final_filename: String,
+    layer_template_filename: String,
+}
+
+impl LayoutConfig {
+    fn new() -> Self {
+        Self {
+            layers_first_thread: 0,
+            layers_per_thread: 5,
+            layers_last_thread: 0,
+            n_threads: 14,
+            embeddings_filename: "./bloom-embedding.bin".to_string(),
+            final_filename: "./bloom-final.bin".to_string(),
+            layer_template_filename: "./bloom-h.{}.bin".to_string(),
+        }
+    }
+
+    fn new350m() -> Self {
+        Self {
+            layers_first_thread: 0,
+            layers_per_thread: 12,
+            layers_last_thread: 0,
+            n_threads: 2,
+            embeddings_filename: "./bloom-350m.bin".to_string(),
+            final_filename: "./bloom-350m.bin".to_string(),
+            layer_template_filename: "./bloom-350m.bin".to_string(),
+        }
+    }
+}
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
@@ -1019,13 +1033,19 @@ fn padding(
     (all_input_ids, attention_mask, alibi, past_key_values, rqs)
 }
 
-fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
+fn thread1(
+    rx: RChan1,
+    prio_rx: RChan1,
+    s2: SChan,
+    thread_number: usize,
+    layout_config: LayoutConfig,
+) {
     println!("Starting thread {thread_number}");
     let config = Config::new();
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
-    let file = std::fs::File::open("./bloom-embedding.bin").unwrap();
+    let file = std::fs::File::open(&layout_config.embeddings_filename).unwrap();
     // SAFETY: This is actually unsafe.
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
@@ -1041,10 +1061,15 @@ fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
         device,
     );
 
-    let layers: Vec<BloomBlock> = (0..LAYERS_FIRST_THREAD)
+    let layers: Vec<BloomBlock> = (0..layout_config.layers_first_thread)
         .map(|i| {
             let file_number = i + 1;
-            let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
+            let file = std::fs::File::open(
+                layout_config
+                    .layer_template_filename
+                    .replace("{}", &file_number.to_string()),
+            )
+            .unwrap();
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
@@ -1105,18 +1130,25 @@ fn thread1(rx: RChan1, prio_rx: RChan1, s2: SChan, thread_number: usize) {
     }
 }
 
-fn thread2(rx: RChan, s: SChan, thread_number: usize) {
+fn thread2(rx: RChan, s: SChan, thread_number: usize, layout_config: LayoutConfig) {
     println!("Starting thread {thread_number}");
     let config = Config::new();
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
-    let layers: Vec<BloomBlock> = (0..LAYERS_PER_THREAD)
+    let layers: Vec<BloomBlock> = (0..layout_config.layers_per_thread)
         .map(|i| {
-            let layer_number = i + LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * (thread_number - 1);
+            let layer_number = i
+                + layout_config.layers_first_thread
+                + layout_config.layers_per_thread * (thread_number - 1);
             println!("Loading layer {layer_number} on thread2 ({thread_number})");
             let file_number = layer_number + 1;
-            let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
+            let file = std::fs::File::open(
+                layout_config
+                    .layer_template_filename
+                    .replace("{}", &file_number.to_string()),
+            )
+            .unwrap();
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
@@ -1155,18 +1187,18 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize) {
     }
 }
 
-fn thread3(rx: RChan, thread_number: usize) {
+fn thread3(rx: RChan, thread_number: usize, layout_config: LayoutConfig) {
     println!("Starting thread {thread_number}");
     let config = Config::new();
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
-    let file = std::fs::File::open("./bloom-embedding.bin").unwrap();
+    let file = std::fs::File::open(layout_config.embeddings_filename).unwrap();
     // SAFETY: This is actually unsafe.
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let file = std::fs::File::open("./bloom-final.bin").unwrap();
+    let file = std::fs::File::open(layout_config.final_filename).unwrap();
     // SAFETY: This is actually unsafe.
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let final_model = SafeTensors::deserialize(&mmap).unwrap();
@@ -1174,12 +1206,19 @@ fn thread3(rx: RChan, thread_number: usize) {
     let ln_f = LayerNorm::new(config.hidden_size, &format!("ln_f"), &final_model, device);
     let lm_head = InvertedEmbedding::new(&format!("word_embeddings"), &embedding_model, device);
 
-    let layers: Vec<BloomBlock> = (0..LAYERS_LAST_THREAD)
+    let layers: Vec<BloomBlock> = (0..layout_config.layers_last_thread)
         .map(|i| {
-            let layer_number = LAYERS_FIRST_THREAD + LAYERS_PER_THREAD * N_THREADS + i;
+            let layer_number = layout_config.layers_first_thread
+                + layout_config.layers_per_thread * layout_config.n_threads
+                + i;
             println!("Loading layer {layer_number} on thread3 ({thread_number})");
             let file_number = layer_number + 1;
-            let file = std::fs::File::open(&format!("./bloom-h.{file_number}.bin")).unwrap();
+            let file = std::fs::File::open(
+                layout_config
+                    .layer_template_filename
+                    .replace("{}", &file_number.to_string()),
+            )
+            .unwrap();
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
@@ -1265,54 +1304,72 @@ async fn main() -> std::io::Result<()> {
     let (s13, r13) = bounded::<Msg2>(1);
     let (s14, r14) = bounded::<Msg2>(1);
 
-    std::thread::spawn(move || {
-        thread1(rx, prio_rx, s0, 0);
-    });
-    std::thread::spawn(move || {
-        thread2(r0, s1, 1);
-    });
-    std::thread::spawn(move || {
-        thread2(r1, s2, 2);
-    });
-    std::thread::spawn(move || {
-        thread2(r2, s3, 3);
-    });
-    std::thread::spawn(move || {
-        thread2(r3, s4, 4);
-    });
-    std::thread::spawn(move || {
-        thread2(r4, s5, 5);
-    });
-    std::thread::spawn(move || {
-        thread2(r5, s6, 6);
-    });
-    std::thread::spawn(move || {
-        thread2(r6, s7, 7);
-    });
-    std::thread::spawn(move || {
-        thread2(r7, s8, 8);
-    });
-    std::thread::spawn(move || {
-        thread2(r8, s9, 9);
-    });
-    std::thread::spawn(move || {
-        thread2(r9, s10, 10);
-    });
-    std::thread::spawn(move || {
-        thread2(r10, s11, 11);
-    });
-    std::thread::spawn(move || {
-        thread2(r11, s12, 12);
-    });
-    std::thread::spawn(move || {
-        thread2(r12, s13, 13);
-    });
-    std::thread::spawn(move || {
-        thread2(r13, s14, 14);
-    });
-    std::thread::spawn(move || {
-        thread3(r14, 15);
-    });
+    let (is_350m, config_fn) = (true, || LayoutConfig::new350m());
+    // let (is_350m, config) = (false, LayoutConfig::new());
+
+    if is_350m {
+        std::thread::spawn(move || {
+            thread1(rx, prio_rx, s0, 0, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r0, s1, 1, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r1, s2, 2, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread3(r2, 3, config_fn());
+        });
+    } else {
+        std::thread::spawn(move || {
+            thread1(rx, prio_rx, s0, 0, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r0, s1, 1, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r1, s2, 2, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r2, s3, 3, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r3, s4, 4, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r4, s5, 5, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r5, s6, 6, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r6, s7, 7, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r7, s8, 8, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r8, s9, 9, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r9, s10, 10, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r10, s11, 11, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r11, s12, 12, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r12, s13, 13, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread2(r13, s14, 14, config_fn());
+        });
+        std::thread::spawn(move || {
+            thread3(r14, 15, config_fn());
+        });
+    }
 
     HttpServer::new(move || {
         App::new()
