@@ -1302,7 +1302,8 @@ async fn main() -> std::io::Result<()> {
     let (s13, r13) = bounded::<Msg2>(1);
     let (s14, r14) = bounded::<Msg2>(1);
 
-    let (is_350m, config_fn, layout_config_fn) = (true, ||, Config::new350m(), || LayoutConfig::new350m());
+    let (is_350m, config_fn, layout_config_fn) =
+        (true, || Config::new350m(), || LayoutConfig::new350m());
     // let (is_350m, config) = (false, LayoutConfig::new());
 
     if is_350m {
