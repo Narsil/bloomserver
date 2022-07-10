@@ -1434,7 +1434,7 @@ mod tests {
         let p = config.n_head;
         let q = config.hidden_size / config.n_head;
         let device = Device::Cuda(0);
-        let kind = (kind::Kind::Half, device);
+        let kind = (config.kind, device);
         let past_key = Tensor::zeros(&[1, 0, p, q], kind);
         let past_value = Tensor::zeros(&[1, 0, p, q], kind);
         let mut past_key_values: Vec<_> = (0..config.n_layer)
@@ -1455,7 +1455,7 @@ mod tests {
         let expected = Tensor::of_slice(&[
             640.5, 668.5, 671.0, 102.375, 670.5, 676.5, 680.5, 676.0, 671.0, 670.0,
         ])
-        .to_kind(kind::Kind::Half)
+        .to_kind(config.kind)
         .to_device(device);
         assert_all_close(&expected, &logits.i((0, 0, 0..10)));
         let ids = logits.argmax(-1, false);
