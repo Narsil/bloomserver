@@ -660,7 +660,8 @@ impl BloomAttention {
         key_layer = key_layer.transpose(1, 0).reshape(&[K, B * H, -1]);
 
         // let sliced_alibi = alibi[: output_size[0] * output_size[1], :, : output_size[3]]
-        let sliced_alibi = alibi.slice(0, 0, B * H, 1).slice(2, 0, K, 1);
+        let size = alibi.size();
+        let sliced_alibi = alibi.i((0..B * H, 0..size[1], 0..K));
         let beta = 1.0 / (self.layer_number as f64);
         let alpha = 1.0 / self.norm_factor;
 
@@ -1528,8 +1529,10 @@ mod tests {
         for _ in 0..max_new_tokens {
             debug("Input ids", &input_ids);
             let logits = model.forward(&input_ids, &attention_mask, &alibi, &mut past_key_values);
-            let S = logits.size()[1];
-            let new_ids = logits.slice(1, S - 1, S, 1).argmax(-1, false);
+            let size = logits.size();
+            let new_ids = logits
+                .i((0..size[0], size()[1] - 1..size[1]))
+                .argmax(-1, false);
             let ones = new_ids.ones_like();
             input_ids = Tensor::cat(&[input_ids, new_ids], 1);
             attention_mask = Tensor::cat(&[attention_mask, ones], 1);
@@ -1544,7 +1547,7 @@ mod tests {
         let mut all_strings = vec![];
         for i in 0..input.len() {
             let output_ids: Vec<_> = input_ids
-                .slice(0, i as i64, i as i64 + 1, 1)
+                .i(i)
                 .reshape(&[-1])
                 .iter::<i64>()
                 .unwrap()
