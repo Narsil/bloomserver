@@ -1530,7 +1530,7 @@ mod tests {
             let logits = model.forward(&input_ids, &attention_mask, &alibi, &mut past_key_values);
             let size = logits.size();
             let new_ids = logits
-                .i((0..size[0], size()[1] - 1..size[1]))
+                .i((0..size[0], size[1] - 1..size[1]))
                 .argmax(-1, false);
             let ones = new_ids.ones_like();
             input_ids = Tensor::cat(&[input_ids, new_ids], 1);
@@ -1546,7 +1546,7 @@ mod tests {
         let mut all_strings = vec![];
         for i in 0..input.len() {
             let output_ids: Vec<_> = input_ids
-                .i(i)
+                .i(i as i64)
                 .reshape(&[-1])
                 .iter::<i64>()
                 .unwrap()
