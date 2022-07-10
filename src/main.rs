@@ -1001,7 +1001,6 @@ fn padding(config: &Config, mut items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let kind2 = (kind::Kind::Int64, device);
     let mut all_input_ids = Tensor::zeros(&[batch_size, max_length], kind2) + PADDING_IDX;
     let mut attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
-    let mut alibi = Tensor::zeros(&[batch_size, max_length], kind2);
 
     let mut total_ids = 0;
 
@@ -1307,7 +1306,7 @@ async fn main() -> std::io::Result<()> {
     let (s14, r14) = bounded::<Msg2>(1);
 
     let (config, layout_config) = (Config::new350m(), LayoutConfig::new350m());
-    // let (is_350m, config_fn, layout_config_fn) = (false, || Config::new(), || LayoutConfig::new());
+    let (config, layout_config) = (Config::new(), LayoutConfig::new());
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
         .map(|_| bounded::<Msg2>(1))

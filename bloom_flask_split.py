@@ -25,7 +25,7 @@ from torch import nn
 
 
 from queue import Queue, Empty
-from threading import Thread
+from threading import Thread, Lock
 import functools
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -40,7 +40,8 @@ from flask import Flask, jsonify, make_response, request
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "8"))
 QUEUE_SIZE = int(os.environ.get("QUEUE_SIZE", 2 * MAX_BATCH_SIZE))
 PADDING_IDX = 3
-BIG = False
+BIG = True
+mutex = Lock()
 
 if BIG:
     MODEL_ID = "bigscience/bloom"
@@ -97,11 +98,16 @@ def padding(items, config, dtype):
 
 
 def load(filename, device):
+    print(f"[{datetime.datetime.now()}] Loading {filename}")
     shard_url = hf_bucket_url(MODEL_ID, filename=filename)
     cached_filename = cached_path(
         shard_url,
     )
-    return torch.load(cached_filename, map_location=device)
+    print(f"[{datetime.datetime.now()}] Found {cached_filename}")
+    result =  torch.load(cached_filename, map_location=device)
+    print(f"[{datetime.datetime.now()}] Loaded {cached_filename}")
+    return result
+
 
 
 def thread1(q, follow_queue):
@@ -110,11 +116,11 @@ def thread1(q, follow_queue):
     device = "cuda:0"
 
     weights = load(embeddings_filename, device)
-    word_embeddings = nn.Embedding(config.vocab_size, config.n_embed).to(device).eval()
+    word_embeddings = nn.Embedding(config.vocab_size, config.n_embed).to(device=device, dtype=torch.bfloat16).eval()
     word_embeddings.weight = nn.Parameter(weights["word_embeddings.weight"])
 
     word_embeddings_layernorm = (
-        nn.LayerNorm(config.n_embed, eps=config.layer_norm_epsilon).to(device).eval()
+        nn.LayerNorm(config.n_embed, eps=config.layer_norm_epsilon).to(device=device, dtype=torch.bfloat16).eval()
     )
     word_embeddings_layernorm.weight = nn.Parameter(
         weights["word_embeddings_layernorm.weight"]
@@ -163,15 +169,16 @@ def thread1(q, follow_queue):
 
 def thread2(receive_queue, send_queue, thread_number):
     print(f"Loading thread2 ({thread_number})")
+    start = datetime.datetime.now()
     device = f"cuda:{thread_number}"
-    config = AutoConfig.from_pretrained("bigscience/bigscience-small-testing")
+    config = AutoConfig.from_pretrained(MODEL_ID)
     # TODO Load the actual layers
     layers = []
     for i in range(LAYERS_PER_THREAD):
         layer_number = (thread_number - 1) * LAYERS_PER_THREAD + i
 
-        weights = load(layer_template_filename.format(layer_number), device)
-        block = BloomBlock(config, layer_number=layer_number).to(device).eval()
+        weights = load(layer_template_filename.format(layer_number + 2), device)
+        block = BloomBlock(config, layer_number=layer_number).to(device=device, dtype=torch.bfloat16).eval()
         block.input_layernorm.weight = nn.Parameter(
             weights[f"h.{layer_number}.input_layernorm.weight"]
         )
@@ -215,7 +222,8 @@ def thread2(receive_queue, send_queue, thread_number):
         )
 
         layers.append(block)
-    print(f"Loaded thread2 ({thread_number})")
+        print(f"Loaded layer {layer_number} thread2 ({thread_number}) in {datetime.datetime.now() - start}")
+    print(f"Loaded thread2 ({thread_number}) in {datetime.datetime.now() - start}")
     while True:
         with torch.no_grad():
             hidden_states, attention_mask, alibi, rqs = receive_queue.get()
@@ -237,13 +245,14 @@ def thread3(receive_queue, thread_number):
     print(f"Loading thread3 ({thread_number})")
     device = f"cuda:{thread_number}"
     config = AutoConfig.from_pretrained(MODEL_ID)
+
     weights = load(final_filename, device)
-    ln_f = nn.LayerNorm(config.n_embed, eps=config.layer_norm_epsilon).to(device).eval()
+    ln_f = nn.LayerNorm(config.n_embed, eps=config.layer_norm_epsilon).to(device=device, dtype=torch.bfloat16).eval()
     ln_f.weight = nn.Parameter(weights["ln_f.weight"])
     ln_f.bias = nn.Parameter(weights["ln_f.bias"])
     weights = load(embeddings_filename, device)
     lm_head = (
-        nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).eval()
+        nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device=device, dtype=torch.bfloat16).eval()
     )
     lm_head.weight = nn.Parameter(weights["word_embeddings.weight"])
 
