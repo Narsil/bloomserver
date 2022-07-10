@@ -20,6 +20,7 @@ use tokenizers::Tokenizer;
 const PADDING_IDX: i64 = 3;
 const EPS: f64 = 1e-5;
 
+#[derive(Clone)]
 struct Config {
     n_head: i64,
     hidden_size: i64,
@@ -1071,11 +1072,10 @@ fn thread1(
 
     let layers: Vec<BloomBlock> = (0..layout_config.layers_first_thread)
         .map(|i| {
-            let file_number = i + 1;
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
-                    .replace("{}", &file_number.to_string()),
+                    .replace("{}", &i.to_string()),
             )
             .unwrap();
             // SAFETY: This is actually unsafe.
@@ -1152,11 +1152,10 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
                 + layout_config.layers_first_thread
                 + layout_config.layers_per_thread * (thread_number - 1);
             println!("Loading layer {layer_number} on thread2 ({thread_number})");
-            let file_number = layer_number + 1;
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
-                    .replace("{}", &file_number.to_string()),
+                    .replace("{}", &layer_number.to_string()),
             )
             .unwrap();
             // SAFETY: This is actually unsafe.
@@ -1221,11 +1220,10 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
                 + layout_config.layers_per_thread * layout_config.n_threads
                 + i;
             println!("Loading layer {layer_number} on thread3 ({thread_number})");
-            let file_number = layer_number + 1;
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
-                    .replace("{}", &file_number.to_string()),
+                    .replace("{}", &layer_number.to_string()),
             )
             .unwrap();
             // SAFETY: This is actually unsafe.
@@ -1305,73 +1303,82 @@ async fn main() -> std::io::Result<()> {
     let (s13, r13) = bounded::<Msg2>(1);
     let (s14, r14) = bounded::<Msg2>(1);
 
-    // let (is_350m, config_fn, layout_config_fn) =
-    //     (true, || Config::new350m(), || LayoutConfig::new350m());
-    let (is_350m, config_fn, layout_config_fn) = (false, || Config::new(), || LayoutConfig::new());
+    let (config, layout_config) = (Config::new350m(), LayoutConfig::new350m());
+    // let (is_350m, config_fn, layout_config_fn) = (false, || Config::new(), || LayoutConfig::new());
 
-    if is_350m {
+    let channels: Vec<_> = (0..layout_config.n_threads + 1)
+        .map(|_| bounded::<Msg2>(1))
+        .collect();
+
+    let s = channels[0].0.clone();
+    let config_ = config.clone();
+    let layout_config_ = layout_config.clone();
+    std::thread::spawn(move || {
+        thread1(rx, prio_rx, s, 0, config_, layout_config_);
+    });
+
+    for i in 0..layout_config.n_threads {
+        let (r, s) = (channels[i].1.clone(), channels[i + 1].0.clone());
+        let config_ = config.clone();
+        let layout_config_ = layout_config.clone();
         std::thread::spawn(move || {
-            thread1(rx, prio_rx, s0, 0, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r0, s1, 1, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r1, s2, 2, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread3(r2, 3, config_fn(), layout_config_fn());
-        });
-    } else {
-        std::thread::spawn(move || {
-            thread1(rx, prio_rx, s0, 0, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r0, s1, 1, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r1, s2, 2, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r2, s3, 3, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r3, s4, 4, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r4, s5, 5, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r5, s6, 6, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r6, s7, 7, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r7, s8, 8, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r8, s9, 9, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r9, s10, 10, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r10, s11, 11, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r11, s12, 12, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r12, s13, 13, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread2(r13, s14, 14, config_fn(), layout_config_fn());
-        });
-        std::thread::spawn(move || {
-            thread3(r14, 15, config_fn(), layout_config_fn());
+            thread2(r, s, i + 1, config_, layout_config_);
         });
     }
+    let r = channels[layout_config.n_threads].1.clone();
+    let config_ = config.clone();
+    let layout_config_ = layout_config.clone();
+    std::thread::spawn(move || {
+        thread3(r, layout_config.n_threads + 1, config_, layout_config_);
+    });
+    // std::thread::spawn(move || {
+    //     thread1(rx, prio_rx, s0, 0, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r0, s1, 1, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r1, s2, 2, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r2, s3, 3, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r3, s4, 4, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r4, s5, 5, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r5, s6, 6, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r6, s7, 7, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r7, s8, 8, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r8, s9, 9, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r9, s10, 10, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r10, s11, 11, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r11, s12, 12, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r12, s13, 13, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread2(r13, s14, 14, config_fn(), layout_config_fn());
+    // });
+    // std::thread::spawn(move || {
+    //     thread3(r14, 15, config_fn(), layout_config_fn());
+    // });
 
     HttpServer::new(move || {
         App::new()
@@ -1450,7 +1457,7 @@ mod tests {
         ])
         .to_kind(kind::Kind::Half)
         .to_device(device);
-        // all_close(&expected, &logits.i((0, 0, 0..10)));
+        assert_all_close(&expected, &logits.i((0, 0, 0..10)));
         let ids = logits.argmax(-1, false);
         assert_eq!(ids.size(), vec![2, 4]);
         assert_eq!(
@@ -1462,9 +1469,10 @@ mod tests {
         );
     }
 
-    fn all_close(left: &Tensor, right: &Tensor) {
-        if !left.allclose(right, 1e-4, 1.0, false) {
-            (left - right).print();
+    fn assert_all_close(left: &Tensor, right: &Tensor) {
+        if !left.allclose(right, 1e-7, 1e-7, false) {
+            left.print();
+            right.print();
             panic!("{left:?} is not close to {right:?}");
         }
     }
@@ -1552,6 +1560,8 @@ mod tests {
 
     static BLOOM_350M: Lazy<Arc<Mutex<BloomForCausalLM>>> =
         Lazy::new(|| Arc::new(Mutex::new(bloom_350m())));
+    static BLOOM_TESTING: Lazy<Arc<Mutex<BloomForCausalLM>>> =
+        Lazy::new(|| Arc::new(Mutex::new(bloom_testing())));
 
     fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();
@@ -1608,5 +1618,173 @@ mod tests {
         // **but** we need 1.12.0 for cumsum on bfloat16.
         // This bug is also present in `transformers` where the values where taken from.
         assert_eq!(output[1],  "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good and very good man, I am very good at my job, I am very good at my job, I am");
+    }
+
+    #[test]
+    fn test_logits_testing() {
+        let config = Config::new_testing();
+        let model = BLOOM_TESTING.lock().unwrap();
+        let tokenizer = Tokenizer::from_file("./tokenizer.json").unwrap();
+        let device = Device::Cuda(0);
+
+        let example_ids = &[
+            3478, 368, 109586, 35433, 2, 77, 132619, 3478, 368, 109586, 35433, 2, 2175, 23714,
+            73173, 144252, 2, 77, 132619, 3478,
+        ];
+        let tensor_ids = Tensor::of_slice(example_ids)
+            .view((1, -1))
+            .to_kind(kind::Kind::Int64)
+            .to_device(device);
+        let past = empty_past(&config);
+        let (mut input_ids, mut attention_mask, mut alibi, mut past_key_values) =
+            padding(&config, vec![(tensor_ids, past)]);
+
+        let logits = model.forward(&input_ids, &attention_mask, &alibi, &mut past_key_values);
+        let splits = logits.split(125440, -1);
+        assert_eq!(splits.len(), 2);
+        let output_gpu_1 = &splits[0];
+        let output_gpu_2 = &splits[1];
+
+        assert_all_close(
+            &output_gpu_1.mean(logits.kind()),
+            &Tensor::of_slice(&[-1.823902130126953e-05])
+                .to_kind(config.kind)
+                .to_device(device),
+        );
+        assert_all_close(
+            &output_gpu_2.mean(logits.kind()),
+            &Tensor::of_slice(&[1.9431114196777344e-05])
+                .to_kind(config.kind)
+                .to_device(device),
+        );
+    }
+
+    #[test]
+    fn test_embeddings_testing() {
+        let config = Config::new_testing();
+        let model = BLOOM_TESTING.lock().unwrap();
+        let tokenizer = Tokenizer::from_file("./tokenizer.json").unwrap();
+        let device = Device::Cuda(0);
+
+        let example_ids = &[
+            3478, 368, 109586, 35433, 2, 77, 132619, 2175, 23714, 73173, 144252,
+        ];
+        let tensor_ids = Tensor::of_slice(example_ids)
+            .view((1, -1))
+            .to_kind(kind::Kind::Int64)
+            .to_device(device);
+        let past = empty_past(&config);
+        let (mut input_ids, mut attention_mask, mut alibi, mut past_key_values) =
+            padding(&config, vec![(tensor_ids, past)]);
+
+        let embeddings = model.transformer.word_embeddings.forward(&input_ids);
+
+        assert_all_close(
+            &embeddings.mean_dim(&[-1], false, embeddings.kind()),
+            &Tensor::of_slice(&[
+                0.0002307891845703125,
+                -0.000568389892578125,
+                -0.0003910064697265625,
+                -0.000194549560546875,
+                0.0004138946533203125,
+                0.000659942626953125,
+                -0.00031280517578125,
+                0.000457763671875,
+                0.000263214111328125,
+                -0.000286102294921875,
+                0.00052642822265625,
+            ])
+            .view((1, -1))
+            .to_kind(config.kind)
+            .to_device(device),
+        );
+
+        println!("Mean OK");
+        assert_all_close(
+            &embeddings.min_dim(-1, false).0,
+            &Tensor::of_slice(&[
+                -0.00921630859375,
+                -0.010009765625,
+                -0.01031494140625,
+                -0.01177978515625,
+                -0.0074462890625,
+                -0.00848388671875,
+                -0.009521484375,
+                -0.0074462890625,
+                -0.0145263671875,
+                -0.007415771484375,
+                -0.01007080078125,
+            ])
+            .view((1, -1))
+            .to_kind(config.kind)
+            .to_device(device),
+        );
+        println!("Min OK");
+
+        assert_all_close(
+            &embeddings.max_dim(-1, false).0,
+            &Tensor::of_slice(&[
+                0.0128173828125,
+                0.01214599609375,
+                0.0111083984375,
+                0.01019287109375,
+                0.0157470703125,
+                0.0174560546875,
+                0.0078125,
+                0.0113525390625,
+                0.0146484375,
+                0.01116943359375,
+                0.01141357421875,
+            ])
+            .view((1, -1))
+            .to_kind(config.kind)
+            .to_device(device),
+        );
+
+        let embeddings_ln = model
+            .transformer
+            .word_embeddings_layernorm
+            .forward(&embeddings);
+
+        assert_all_close(
+            &embeddings_ln.mean_dim(&[-1], false, embeddings_ln.kind()),
+            &Tensor::of_slice(&[
+                -6.580352783203125e-05,
+                0.0001316070556640625,
+                -0.00030517578125,
+                4.00543212890625e-05,
+                -7.2479248046875e-05,
+                -8.96453857421875e-05,
+                0.0001583099365234375,
+                2.1219253540039062e-05,
+                -0.000247955322265625,
+                -0.00021839141845703125,
+                -0.0001430511474609375,
+            ])
+            .view((1, -1))
+            .to_kind(config.kind)
+            .to_device(device),
+        );
+
+        assert_all_close(
+            &embeddings_ln.min_dim(-1, false).0,
+            &Tensor::of_slice(&[
+                -1.6953125, -1.6875, -1.6875, -2.125, -1.390625, -1.5390625, -1.875, -1.4609375,
+                -2.296875, -1.3515625, -1.78125,
+            ])
+            .view((1, -1))
+            .to_kind(config.kind)
+            .to_device(device),
+        );
+        assert_all_close(
+            &embeddings_ln.max_dim(-1, false).0,
+            &Tensor::of_slice(&[
+                2.265625, 2.28125, 1.953125, 1.90625, 2.703125, 2.828125, 1.65625, 2.015625,
+                2.234375, 2.171875, 1.828125,
+            ])
+            .view((1, -1))
+            .to_kind(config.kind)
+            .to_device(device),
+        );
     }
 }
