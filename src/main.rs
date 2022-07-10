@@ -480,30 +480,32 @@ fn attention_mask_func(
     let key_length = attention_scores.size()[3];
     let n_heads = attention_scores.size()[1];
 
-    let a_attention_mask_bool = attention_mask_bool
-        .unsqueeze(1)
-        .unsqueeze(-1)
-        .f_slice(2, key_length - query_length, key_length, 1)
-        .unwrap();
-    let b_causal_mask = causal_mask
-        .f_logical_not()
-        .unwrap()
-        .f_slice(2, key_length - query_length, key_length, 1)
-        .unwrap()
-        .f_slice(3, 0, key_length, 1)
-        .unwrap();
+    let a_attention_mask_bool = attention_mask_bool.unsqueeze(1).unsqueeze(-1);
+    let size = a_attention_mask_bool.size();
+    let a_attention_mask_bool = a_attention_mask_bool.i((
+        0..size[0],
+        0..size[1],
+        key_length - query_length..key_length,
+    ));
+    let b_causal_mask = causal_mask.f_logical_not().unwrap();
+
+    let size = b_causal_mask.size();
+    let b_causal_mask = b_causal_mask.i((
+        0..size[0],
+        0..size[1],
+        key_length - query_length..key_length,
+    ));
     debug("A attention_mask_bool", &a_attention_mask_bool);
     debug("b causal mask", &b_causal_mask);
     let mut padded_causal_mask = a_attention_mask_bool.f_logical_or(&b_causal_mask).unwrap();
     debug("padded causal_mask", &padded_causal_mask);
+    let size = attention_mask_bool.size();
+    let c_attention_mask_bool = &attention_mask_bool
+        .i((0..size[0], 0..key_length))
+        .unsqueeze(1)
+        .unsqueeze(1);
     padded_causal_mask = padded_causal_mask
-        .f_logical_or(
-            &attention_mask_bool
-                .unsqueeze(1)
-                .unsqueeze(1)
-                .f_slice(3, 0, key_length, 1)
-                .unwrap(),
-        )
+        .f_logical_or(c_attention_mask_bool)
         .unwrap();
     // TODO
     // padded_causal_mask = attention_mask_bool.logical_or(
