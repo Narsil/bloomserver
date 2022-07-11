@@ -155,15 +155,9 @@ fn empty_past(config: &Config) -> Past {
     past_key_values
 }
 
-fn choose_next_id(logits: &Tensor, parameters: &Parameters) -> Tensor {
-    let S = logits.size()[1];
-    let new_id = logits.i((0, S - 1..S)).argmax(-1, false);
-    new_id
-}
-
 struct Stream {
+    input_ids: Tensor,
     new_generated_tokens: usize,
-    ids: Vec<i64>,
     payload: Generation,
     in_channel: InChan,
     prio_channel: InChan,
@@ -189,18 +183,46 @@ impl Stream {
         }
         let start = std::time::Instant::now();
         let (sx, rx) = unbounded::<(Tensor, Past)>();
+        let kind = (kind::Kind::Int64, Device::Cuda(0));
+        let input_ids = Tensor::of_slice(ids.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1)
+            .view((1, -1));
         Self {
             payload,
             in_channel,
             prio_channel,
             tokenizer,
             new_generated_tokens: 0,
-            ids,
+            input_ids,
             start,
             sent: false,
             sx,
             rx,
         }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.new_generated_tokens >= self.payload.parameters.max_new_tokens
+    }
+    fn get_ids(&self) -> Vec<u32> {
+        // TODO handle batching maybe
+        // first row should be ~ok.
+        self.input_ids
+            .i((0,))
+            .iter::<i64>()
+            .unwrap()
+            .map(|i| i as u32)
+            .collect()
+    }
+    fn add_next_id(&mut self, logits: &Tensor) {
+        // TODO handle batching
+        let S = logits.size()[1];
+        let new_ids = logits
+            .i((0..1, S - 1..S))
+            .argmax(-1, false)
+            .to_device(self.input_ids.device());
+        self.input_ids = Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
     }
 }
 
@@ -209,17 +231,12 @@ impl futures::Stream for Stream {
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        // if this.sent {
-        if this.new_generated_tokens >= this.payload.parameters.max_new_tokens {
+        if this.is_finished() {
             return Poll::Ready(None);
         }
-        let kind = (kind::Kind::Int64, Device::Cuda(0));
-        let input_ids = Tensor::of_slice(this.ids.as_slice())
-            .to_kind(kind.0)
-            .to_device(kind.1)
-            .view((1, -1));
 
-        // TODO This is necessarily the big config
+        // TODO This config does not really matter
+        // as we're not using past right now
         let config = Config::new350m();
 
         let past_key_values = empty_past(&config);
@@ -227,51 +244,37 @@ impl futures::Stream for Stream {
         let ack = (1, this.sx.clone());
         if this.new_generated_tokens == 0 {
             this.in_channel
-                .try_send((input_ids.copy(), past_key_values, ack))
+                .try_send((this.input_ids.copy(), past_key_values, ack))
                 .map_err(|_| {
                     println!("Queue was full {:?}", this.in_channel.len());
                     GenerationError::QueueFull
                 })?;
         } else {
             this.prio_channel
-                .send((input_ids.copy(), past_key_values, ack))
+                .send((this.input_ids.copy(), past_key_values, ack))
                 .expect("This send should always work");
         }
         this.sent = true;
-        // } else {
-        // if this.rx.is_empty() {
-        //     println!("Pending waiting on channel");
-        //     Poll::Pending
-        // } else {
         let (logits, _r_past_key_values) = this.rx.recv().unwrap();
         this.sent = false;
-        let new_id = choose_next_id(&logits, &this.payload.parameters);
+        this.add_next_id(&logits);
         // past_key_values = r_past_key_values;
         // input_ids = Tensor::f_cat(&[input_ids, new_id.copy()], 1).unwrap();
-        let received_ids: Vec<i64> = new_id.try_into().unwrap();
-        this.ids.push(received_ids[0]);
         this.new_generated_tokens += 1;
 
-        if this.payload.parameters.stream {
-            let received_ids: Vec<_> = received_ids.iter().map(|&i| i as u32).collect();
-            let string = this.tokenizer.decode(received_ids.clone(), false).unwrap();
-            let result = serde_json::to_string(&json!([{ "text": string }])).unwrap();
+        if this.is_finished() {
+            let n = this.new_generated_tokens;
+            println!(
+                "Inference generated {n} tokens in {:?} ({:?}/tok)",
+                this.start.elapsed(),
+                this.start.elapsed().div_f32(n as f32)
+            );
+            let full_ids = this.get_ids();
+            let string = this.tokenizer.decode(full_ids, false).unwrap();
+            let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
             Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
         } else {
-            if this.new_generated_tokens == this.payload.parameters.max_new_tokens {
-                let n = this.new_generated_tokens;
-                println!(
-                    "Inference generated {n} tokens in {:?} ({:?}/tok)",
-                    this.start.elapsed(),
-                    this.start.elapsed().div_f32(n as f32)
-                );
-                let full_ids: Vec<_> = this.ids.iter().map(|&i| i as u32).collect();
-                let string = this.tokenizer.decode(full_ids, false).unwrap();
-                let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
-                Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
-            } else {
-                Poll::Ready(Some(Ok(Bytes::copy_from_slice(b""))))
-            }
+            Poll::Ready(Some(Ok(Bytes::copy_from_slice(b""))))
         }
         // }
         // }
