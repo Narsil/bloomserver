@@ -29,6 +29,14 @@ struct Config {
 }
 
 impl Config {
+    fn new() -> Self {
+        Self {
+            n_head: 112,
+            hidden_size: 14336,
+            n_layer: 70,
+            kind: kind::Kind::BFloat16,
+        }
+    }
     fn new350m() -> Self {
         Self {
             n_head: 16,
@@ -43,14 +51,6 @@ impl Config {
             n_head: 8,
             hidden_size: 64,
             n_layer: 2,
-            kind: kind::Kind::BFloat16,
-        }
-    }
-    fn new() -> Self {
-        Self {
-            n_head: 112,
-            hidden_size: 14336,
-            n_layer: 70,
             kind: kind::Kind::BFloat16,
         }
     }
@@ -94,11 +94,11 @@ impl LayoutConfig {
 
     fn new_dgx() -> Self {
         Self {
-            layers_first_thread: 4,
-            layers_per_thread: 10,
+            layers_first_thread: 0,
+            layers_per_thread: 5,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-embeddings.bin".to_string(),
+            embeddings_filename: "./bloom-embedding.bin".to_string(),
             final_filename: "./bloom-final.bin".to_string(),
             layer_template_filename: "./bloom-h.1.bin".to_string(),
         }
@@ -451,7 +451,7 @@ async fn generate(
         ids.push(0);
     }
     let start = std::time::Instant::now();
-    let (sx, rx) = bounded::<(Tensor, Past)>(1);
+    let (sx, rx) = bounded::<(Tensor, Past)>(2);
     let kind = (kind::Kind::Int64, Device::Cuda(0));
     let mut input_ids = Tensor::of_slice(ids.as_slice())
         .to_kind(kind.0)
@@ -622,7 +622,7 @@ impl LayerNorm {
         let weight = convert(
             model
                 .tensor(&weight_name)
-                .expect(&format!("Failed to load {weight_name}")),
+                .expect(&format!("Failed to load {weight_name} with name {name}")),
             device,
         );
         let bias_name = format!("{name}.bias");
@@ -1381,7 +1381,7 @@ fn thread1(
         start.elapsed()
     );
 
-    // let mut last_loop = Instant::now();
+    let mut last_loop = Instant::now();
     loop {
         let mut sel = Select::new();
         let oper1 = sel.recv(&rx);
@@ -1400,20 +1400,20 @@ fn thread1(
         let max_batch_size = 8;
 
         let now = Instant::now();
-        // let deadline = std::cmp::max(
-        //     last_loop + Duration::from_millis(10),
-        //     now + Duration::from_millis(1),
-        // );
-        let deadline = now + Duration::from_millis(1);
-        // while let Ok(item) = prio_rx.recv_deadline(deadline) {
-        //     all_items.push(item);
-        // }
+        let deadline = std::cmp::max(
+            last_loop + Duration::from_millis(10),
+            now + Duration::from_millis(1),
+        );
+        // let deadline = now + Duration::from_millis(1);
+        while let Ok(item) = prio_rx.recv_deadline(deadline) {
+            all_items.push(item);
+        }
 
-        // if all_items.len() < max_batch_size {
-        //     while let Ok(item) = rx.recv_deadline(deadline) {
-        //         all_items.push(item);
-        //     }
-        // }
+        if all_items.len() < max_batch_size {
+            while let Ok(item) = rx.recv_deadline(deadline) {
+                all_items.push(item);
+            }
+        }
 
         while let Ok(oper) = sel.select_deadline(deadline) {
             match oper.index() {
@@ -1442,7 +1442,7 @@ fn thread1(
             acks,
         ))
         .unwrap();
-        // last_loop = Instant::now();
+        last_loop = Instant::now();
     }
 }
 
@@ -1468,7 +1468,11 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
             let model = SafeTensors::deserialize(&mmap).unwrap();
             BloomBlock::new(
                 &config,
-                &format!("h.{layer_number}"),
+                &if std::env::var("BLOOM").unwrap_or("".to_string()) == "bloom-dgx" {
+                    "h.0".to_string()
+                } else {
+                    format!("h.{layer_number}")
+                },
                 &model,
                 layer_number,
                 device,
@@ -1595,14 +1599,16 @@ async fn main() -> std::io::Result<()> {
     let (tx, rx) = bounded::<Msg>(1);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
 
-    let (config, layout_config) = match std::env::var("BLOOM")
-        .unwrap_or("bloom".to_string())
-        .as_ref()
-    {
-        "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
-        "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
-        "bloom" => (Config::new(), LayoutConfig::new()),
-        other => panic!("Model {other} is not known"),
+    let (config, layout_config) = if let Ok(env) = std::env::var("BLOOM") {
+        match env.as_ref() {
+            "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
+            "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
+            "bloom" => (Config::new(), LayoutConfig::new()),
+            "bloom-dgx" => (Config::new(), LayoutConfig::new_dgx()),
+            other => panic!("Model {other} is not known"),
+        }
+    } else {
+        (Config::new(), LayoutConfig::new())
     };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
