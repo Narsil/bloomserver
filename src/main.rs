@@ -119,8 +119,9 @@ type SChan = Sender<Msg2>;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct Sampling {
-    top_p: f64,
-    top_k: usize,
+    do_sample: bool,
+    // top_p: Option<f64>,
+    top_k: Option<usize>,
     #[serde(default = "default_temperature")]
     temperature: f64,
     #[serde(default = "default_max_new_tokens")]
@@ -133,8 +134,6 @@ struct BeamSearch {
     num_beams: usize,
     #[serde(default = "default_max_new_tokens")]
     max_new_tokens: usize,
-    #[serde(default = "default_temperature")]
-    temperature: f64,
 }
 
 fn default_temperature() -> f64 {
@@ -209,6 +208,7 @@ struct Stream {
     sent: bool,
     sx: Sender<(Tensor, Past)>,
     rx: Receiver<(Tensor, Past)>,
+    beam_scores: Option<Tensor>,
 }
 
 impl Stream {
@@ -242,15 +242,18 @@ impl Stream {
             sent: false,
             sx,
             rx,
+            beam_scores: None,
         }
     }
 
     fn is_finished(&self) -> bool {
         match &self.payload.parameters {
-            Parameters::Greedy(greedy) => self.new_generated_tokens >= greedy.max_new_tokens,
-            param => panic!("Param {param:?} is not supported yet !"),
+            Parameters::Greedy(params) => self.new_generated_tokens >= params.max_new_tokens,
+            Parameters::BeamSearch(params) => self.new_generated_tokens >= params.max_new_tokens,
+            Parameters::Sampling(params) => self.new_generated_tokens >= params.max_new_tokens,
         }
     }
+
     fn get_ids(&self) -> Vec<u32> {
         // TODO handle batching maybe
         // first row should be ~ok.
@@ -263,12 +266,74 @@ impl Stream {
     }
     fn add_next_id(&mut self, logits: &Tensor) {
         // TODO handle batching
-        let S = logits.size()[1];
-        let new_ids = logits
-            .i((0..1, S - 1..S))
-            .argmax(-1, false)
-            .to_device(self.input_ids.device());
-        self.input_ids = Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
+        match &self.payload.parameters {
+            Parameters::Greedy(params) => {
+                let S = logits.size()[1];
+                let new_ids = logits
+                    .i((0..1, S - 1..S))
+                    .argmax(-1, false)
+                    .to_device(self.input_ids.device());
+                self.input_ids =
+                    Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
+            }
+            Parameters::Sampling(params) => {
+                let S = logits.size()[1];
+                let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
+
+                let mut scored_logits = last_logits / params.temperature;
+
+                if let Some(top_k) = params.top_k {
+                    // indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
+                    let largest = true;
+                    let sorted = true;
+                    let top_ks = scored_logits.topk(top_k as i64, -1, largest, sorted).0;
+                    let size = top_ks.size();
+                    let top_k = top_ks.i((0..size[0], -1));
+
+                    let filter_value = f64::NEG_INFINITY;
+
+                    let indices_to_remove = scored_logits.le_tensor(&top_k);
+                    scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
+                }
+
+                let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
+                let new_ids = probs.f_multinomial(1, false).unwrap();
+                self.input_ids =
+                    Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
+            }
+            Parameters::BeamSearch(params) => {
+                let num_beams = params.num_beams as i64;
+                if self.new_generated_tokens == 0 {
+                    // We're in the first step it's rather easy.
+                    let S = logits.size()[1];
+                    let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
+                    let largest = true;
+                    let sorted = true;
+                    let top_ks = last_logits.topk(num_beams, -1, largest, sorted);
+                    let values = top_ks.0;
+                    let indices = top_ks.1;
+
+                    // repeat input_ids to fit the new tokens
+                    let input_ids = self.input_ids.repeat(&[num_beams, 1]);
+                    let new_ids = indices.to_device(self.input_ids.device());
+
+                    // new_ids is now of shape [1, num_beams]
+                    // input_ids is of shape [num_beams, seq_length]
+                    // So transposing to we can concatenate the indices within input_ids
+                    let new_ids = new_ids.transpose(1, 0);
+                    println!("Input ids {:?}", input_ids);
+                    println!("New ids {:?}", new_ids);
+                    self.input_ids = Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap();
+                    println!(
+                        "After beam search first step we have input_ids {:?}",
+                        self.input_ids
+                    );
+                } else {
+                    // Now the tricky part.
+                    panic!("We haven't handled that part !");
+                }
+            }
+        }
     }
 }
 
@@ -725,48 +790,46 @@ impl BloomAttention {
         debug("Sliced alibi", &a);
         debug("query layer", &b);
         debug("key layer", &c);
-        // println!("Alpha {alpha}");
-        // println!("beta {beta}");
-        // a.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_sliced_alibi_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
-        // b.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_query_layer_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
-        // c.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_key_layer_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
-        // Tensor::of_slice(&[beta])
-        //     .write_npy(&format!("rust_baddbmm_beta_{}.npy", self.real_layer_number))
-        //     .unwrap();
-        // Tensor::of_slice(&[alpha])
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_alpha_{}.npy",
-        //         self.real_layer_number
-        //     ))
-        //     .unwrap();
+        a.to_device(Device::Cpu)
+            .to_kind(kind::Kind::Float)
+            .write_npy(&format!(
+                "rust_baddbmm_sliced_alibi_{}.npy",
+                self.real_layer_number,
+            ))
+            .unwrap();
+        b.to_device(Device::Cpu)
+            .to_kind(kind::Kind::Float)
+            .write_npy(&format!(
+                "rust_baddbmm_query_layer_{}.npy",
+                self.real_layer_number,
+            ))
+            .unwrap();
+        c.to_device(Device::Cpu)
+            .to_kind(kind::Kind::Float)
+            .write_npy(&format!(
+                "rust_baddbmm_key_layer_{}.npy",
+                self.real_layer_number,
+            ))
+            .unwrap();
+        Tensor::of_slice(&[beta])
+            .write_npy(&format!("rust_baddbmm_beta_{}.npy", self.real_layer_number))
+            .unwrap();
+        Tensor::of_slice(&[alpha])
+            .write_npy(&format!(
+                "rust_baddbmm_alpha_{}.npy",
+                self.real_layer_number
+            ))
+            .unwrap();
         let matmul_result = a.f_baddbmm(&b, &c, beta, alpha).unwrap();
 
-        // matmul_result
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_matmul_result_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
+        matmul_result
+            .to_device(Device::Cpu)
+            .to_kind(kind::Kind::Float)
+            .write_npy(&format!(
+                "rust_baddbmm_matmul_result_{}.npy",
+                self.real_layer_number,
+            ))
+            .unwrap();
 
         let attention_scores = matmul_result.f_view(output_size).unwrap();
         debug(
@@ -1253,7 +1316,6 @@ fn thread1(
             acks,
         ))
         .unwrap();
-        println!("Sent to thread2 ! ");
     }
 }
 
@@ -1296,16 +1358,10 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
         let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
-        println!("received on thread2 ! {}", thread_number);
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
 
-        println!(
-            "We have {} layers and {} past",
-            layers.len(),
-            past_key_values.len()
-        );
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             debug(&format!("past_key thread2"), &layer_past.0);
             debug(&format!("past_values thread2"), &layer_past.1);
@@ -1369,7 +1425,6 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
-        println!("received on thread3 ! {}", thread_number);
 
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
@@ -1383,11 +1438,6 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         hidden_states = ln_f.forward(&hidden_states);
         debug(&format!("After ln_f"), &hidden_states);
         let lm_logits = lm_head.forward(&hidden_states);
-        // lm_logits
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy("rust_lm_logits.npy")
-        //     .unwrap();
 
         let mut current_batch = 0;
         for (mini_batch_size, rq) in rqs {
