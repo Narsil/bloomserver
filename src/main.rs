@@ -197,213 +197,307 @@ fn empty_past(config: &Config) -> Past {
     past_key_values
 }
 
-struct Stream {
-    input_ids: Tensor,
-    new_generated_tokens: usize,
-    payload: Generation,
-    in_channel: InChan,
-    prio_channel: InChan,
-    tokenizer: Arc<Tokenizer>,
-    start: std::time::Instant,
-    sent: bool,
-    sx: Sender<(Tensor, Past)>,
-    rx: Receiver<(Tensor, Past)>,
-    beam_scores: Option<Tensor>,
+// struct Stream {
+//     input_ids: Tensor,
+//     new_generated_tokens: usize,
+//     payload: Generation,
+//     in_channel: InChan,
+//     prio_channel: InChan,
+//     tokenizer: Arc<Tokenizer>,
+//     start: std::time::Instant,
+//     sent: bool,
+//     sx: Sender<(Tensor, Past)>,
+//     rx: Receiver<(Tensor, Past)>,
+//     beam_scores: Option<Tensor>,
+// }
+//
+// impl Stream {
+//     fn new(
+//         payload: Generation,
+//         in_channel: InChan,
+//         prio_channel: InChan,
+//         tokenizer: Arc<Tokenizer>,
+//     ) -> Self {
+//         let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
+//         let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+//         // TODO The model is not able to handle empty input ids
+//         if ids.len() == 0 {
+//             ids.push(0);
+//         }
+//         let start = std::time::Instant::now();
+//         let (sx, rx) = bounded::<(Tensor, Past)>(0);
+//         let kind = (kind::Kind::Int64, Device::Cuda(0));
+//         let input_ids = Tensor::of_slice(ids.as_slice())
+//             .to_kind(kind.0)
+//             .to_device(kind.1)
+//             .view((1, -1));
+//         Self {
+//             payload,
+//             in_channel,
+//             prio_channel,
+//             tokenizer,
+//             new_generated_tokens: 0,
+//             input_ids,
+//             start,
+//             sent: false,
+//             sx,
+//             rx,
+//             beam_scores: None,
+//         }
+//     }
+//
+//     fn is_finished(&self) -> bool {
+//         match &self.payload.parameters {
+//             Parameters::Greedy(params) => self.new_generated_tokens >= params.max_new_tokens,
+//             Parameters::BeamSearch(params) => self.new_generated_tokens >= params.max_new_tokens,
+//             Parameters::Sampling(params) => self.new_generated_tokens >= params.max_new_tokens,
+//         }
+//     }
+//
+//     fn get_ids(&self) -> Vec<u32> {
+//         // TODO handle batching maybe
+//         // first row should be ~ok.
+//         self.input_ids
+//             .i((0,))
+//             .iter::<i64>()
+//             .unwrap()
+//             .map(|i| i as u32)
+//             .collect()
+//     }
+//     }
+// }
+//
+// impl futures::Stream for Stream {
+//     type Item = Result<Bytes, GenerationError>;
+//
+//     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+//         let this = self.get_mut();
+//         if this.is_finished() {
+//             return Poll::Ready(None);
+//         }
+//
+//         // TODO This config does not really matter
+//         // as we're not using past right now
+//         let config = Config::new350m();
+//
+//         let past_key_values = empty_past(&config);
+//
+//         let ack = (1, this.sx.clone());
+//         if this.new_generated_tokens == 0 {
+//             this.in_channel
+//                 .try_send((this.input_ids.copy(), past_key_values, ack))
+//                 .map_err(|_| {
+//                     println!("Queue was full {:?}", this.in_channel.len());
+//                     GenerationError::QueueFull
+//                 })?;
+//         } else {
+//             this.prio_channel
+//                 .send((this.input_ids.copy(), past_key_values, ack))
+//                 .expect("This send should always work");
+//         }
+//         this.sent = true;
+//         let start = Instant::now();
+//         let (logits, _r_past_key_values) = this.rx.recv().unwrap();
+//         println!(
+//             "Wasted {:?} on thread {:?}",
+//             start.elapsed(),
+//             std::thread::current().name()
+//         );
+//         this.sent = false;
+//         this.add_next_id(&logits);
+//         // past_key_values = r_past_key_values;
+//         // input_ids = Tensor::f_cat(&[input_ids, new_id.copy()], 1).unwrap();
+//         this.new_generated_tokens += 1;
+//
+//         if this.is_finished() {
+//             let n = this.new_generated_tokens;
+//             println!(
+//                 "Inference generated {n} tokens in {:?} ({:?}/tok)",
+//                 this.start.elapsed(),
+//                 this.start.elapsed().div_f32(n as f32)
+//             );
+//             let full_ids = this.get_ids();
+//             let string = this.tokenizer.decode(full_ids, false).unwrap();
+//             let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
+//             Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
+//         } else {
+//             Poll::Ready(Some(Ok(Bytes::copy_from_slice(b""))))
+//         }
+//         // }
+//         // }
+//     }
+// }
+//
+// #[post("/generate")]
+// async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) -> HttpResponse {
+//     let state = state.into_inner();
+//     let stream = Stream::new(
+//         payload.into_inner(),
+//         state.in_channel.clone(),
+//         state.prio_channel.clone(),
+//         state.tokenizer.clone(),
+//     );
+//     HttpResponse::Ok()
+//         .content_type(ContentType::json())
+//         .streaming(stream)
+// }
+
+fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tensor {
+    // TODO handle batching
+    match params {
+        Parameters::Greedy(params) => {
+            let S = logits.size()[1];
+            let new_ids = logits
+                .i((0..1, S - 1..S))
+                .argmax(-1, false)
+                .to_device(input_ids.device());
+            Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
+        }
+        _ => todo!(),
+        // Parameters::Sampling(params) => {
+        //     let S = logits.size()[1];
+        //     let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
+
+        //     let mut scored_logits = last_logits / params.temperature;
+
+        //     if let Some(top_k) = params.top_k {
+        //         // indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
+        //         let largest = true;
+        //         let sorted = true;
+        //         let top_ks = scored_logits.topk(top_k as i64, -1, largest, sorted).0;
+        //         let size = top_ks.size();
+        //         let top_k = top_ks.i((0..size[0], -1));
+
+        //         let filter_value = f64::NEG_INFINITY;
+
+        //         let indices_to_remove = scored_logits.le_tensor(&top_k);
+        //         scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
+        //     }
+
+        //     let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
+        //     let new_ids = probs.f_multinomial(1, false).unwrap();
+        //     self.input_ids =
+        //         Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
+        // }
+        // Parameters::BeamSearch(params) => {
+        //     let num_beams = params.num_beams as i64;
+        //     if self.new_generated_tokens == 0 {
+        //         // We're in the first step it's rather easy.
+        //         let S = logits.size()[1];
+        //         let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
+        //         // Actually cast to logits so we can save the scores
+        //         let last_logits = last_logits.f_log_softmax(-1, kind::Kind::Float).unwrap();
+        //         let largest = true;
+        //         let sorted = true;
+        //         let top_ks = last_logits.topk(num_beams, -1, largest, sorted);
+        //         let values = top_ks.0;
+        //         let indices = top_ks.1;
+
+        //         // repeat input_ids to fit the new tokens
+        //         let input_ids = self.input_ids.repeat(&[num_beams, 1]);
+        //         let new_ids = indices.to_device(self.input_ids.device());
+
+        //         // new_ids is now of shape [1, num_beams]
+        //         // input_ids is of shape [num_beams, seq_length]
+        //         // So transposing to we can concatenate the indices within input_ids
+        //         let new_ids = new_ids.transpose(1, 0);
+        //         println!("Input ids {:?}", input_ids);
+        //         println!("New ids {:?}", new_ids);
+        //         self.input_ids = Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap();
+        //         // Save the current scores in logits form.
+        //         self.beam_scores = Some(values);
+        //         println!(
+        //             "After beam search first step we have input_ids {:?}",
+        //             self.input_ids
+        //         );
+        //     } else {
+        //         // Now the tricky part.
+        //         let size = logits.size();
+        //         let last_logits = logits
+        //             .i((0..size[0], size[1] - 1..size[1]))
+        //             .to_device(self.input_ids.device());
+        //         // Actually cast to logits so we can save the scores
+        //         let last_logits = last_logits.f_log_softmax(-1, kind::Kind::Float).unwrap();
+        //         panic!("We haven't handled that part !");
+        //     }
+        // }
+    }
 }
-
-impl Stream {
-    fn new(
-        payload: Generation,
-        in_channel: InChan,
-        prio_channel: InChan,
-        tokenizer: Arc<Tokenizer>,
-    ) -> Self {
-        let encoded = tokenizer.encode(payload.inputs.clone(), false).unwrap();
-        let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
-        // TODO The model is not able to handle empty input ids
-        if ids.len() == 0 {
-            ids.push(0);
-        }
-        let start = std::time::Instant::now();
-        let (sx, rx) = unbounded::<(Tensor, Past)>();
-        let kind = (kind::Kind::Int64, Device::Cuda(0));
-        let input_ids = Tensor::of_slice(ids.as_slice())
-            .to_kind(kind.0)
-            .to_device(kind.1)
-            .view((1, -1));
-        Self {
-            payload,
-            in_channel,
-            prio_channel,
-            tokenizer,
-            new_generated_tokens: 0,
-            input_ids,
-            start,
-            sent: false,
-            sx,
-            rx,
-            beam_scores: None,
-        }
+#[post("/generate")]
+async fn generate(
+    payload: web::Json<Generation>,
+    state: web::Data<AppState>,
+) -> actix_web::Result<HttpResponse> {
+    let state = state.into_inner();
+    let encoded = state
+        .tokenizer
+        .encode(payload.inputs.clone(), false)
+        .unwrap();
+    let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+    // TODO The model is not able to handle empty input ids
+    if ids.len() == 0 {
+        ids.push(0);
     }
+    let start = std::time::Instant::now();
+    let (sx, rx) = bounded::<(Tensor, Past)>(0);
+    let kind = (kind::Kind::Int64, Device::Cuda(0));
+    let mut input_ids = Tensor::of_slice(ids.as_slice())
+        .to_kind(kind.0)
+        .to_device(kind.1)
+        .view((1, -1));
+    let max_new_tokens = match &payload.parameters {
+        Parameters::Greedy(params) => params.max_new_tokens,
+        Parameters::BeamSearch(params) => params.max_new_tokens,
+        Parameters::Sampling(params) => params.max_new_tokens,
+    };
+    let config = Config::new350m();
+    let start = Instant::now();
 
-    fn is_finished(&self) -> bool {
-        match &self.payload.parameters {
-            Parameters::Greedy(params) => self.new_generated_tokens >= params.max_new_tokens,
-            Parameters::BeamSearch(params) => self.new_generated_tokens >= params.max_new_tokens,
-            Parameters::Sampling(params) => self.new_generated_tokens >= params.max_new_tokens,
-        }
-    }
-
-    fn get_ids(&self) -> Vec<u32> {
-        // TODO handle batching maybe
-        // first row should be ~ok.
-        self.input_ids
-            .i((0,))
-            .iter::<i64>()
-            .unwrap()
-            .map(|i| i as u32)
-            .collect()
-    }
-    fn add_next_id(&mut self, logits: &Tensor) {
-        // TODO handle batching
-        match &self.payload.parameters {
-            Parameters::Greedy(params) => {
-                let S = logits.size()[1];
-                let new_ids = logits
-                    .i((0..1, S - 1..S))
-                    .argmax(-1, false)
-                    .to_device(self.input_ids.device());
-                self.input_ids =
-                    Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
-            }
-            Parameters::Sampling(params) => {
-                let S = logits.size()[1];
-                let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
-
-                let mut scored_logits = last_logits / params.temperature;
-
-                if let Some(top_k) = params.top_k {
-                    // indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
-                    let largest = true;
-                    let sorted = true;
-                    let top_ks = scored_logits.topk(top_k as i64, -1, largest, sorted).0;
-                    let size = top_ks.size();
-                    let top_k = top_ks.i((0..size[0], -1));
-
-                    let filter_value = f64::NEG_INFINITY;
-
-                    let indices_to_remove = scored_logits.le_tensor(&top_k);
-                    scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
-                }
-
-                let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
-                let new_ids = probs.f_multinomial(1, false).unwrap();
-                self.input_ids =
-                    Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
-            }
-            Parameters::BeamSearch(params) => {
-                let num_beams = params.num_beams as i64;
-                if self.new_generated_tokens == 0 {
-                    // We're in the first step it's rather easy.
-                    let S = logits.size()[1];
-                    let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
-                    let largest = true;
-                    let sorted = true;
-                    let top_ks = last_logits.topk(num_beams, -1, largest, sorted);
-                    let values = top_ks.0;
-                    let indices = top_ks.1;
-
-                    // repeat input_ids to fit the new tokens
-                    let input_ids = self.input_ids.repeat(&[num_beams, 1]);
-                    let new_ids = indices.to_device(self.input_ids.device());
-
-                    // new_ids is now of shape [1, num_beams]
-                    // input_ids is of shape [num_beams, seq_length]
-                    // So transposing to we can concatenate the indices within input_ids
-                    let new_ids = new_ids.transpose(1, 0);
-                    println!("Input ids {:?}", input_ids);
-                    println!("New ids {:?}", new_ids);
-                    self.input_ids = Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap();
-                    println!(
-                        "After beam search first step we have input_ids {:?}",
-                        self.input_ids
-                    );
-                } else {
-                    // Now the tricky part.
-                    panic!("We haven't handled that part !");
-                }
-            }
-        }
-    }
-}
-
-impl futures::Stream for Stream {
-    type Item = Result<Bytes, GenerationError>;
-
-    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.is_finished() {
-            return Poll::Ready(None);
-        }
-
+    for i in 0..max_new_tokens {
         // TODO This config does not really matter
         // as we're not using past right now
-        let config = Config::new350m();
-
+        let ack = (input_ids.size()[0], sx.clone());
         let past_key_values = empty_past(&config);
-
-        let ack = (1, this.sx.clone());
-        if this.new_generated_tokens == 0 {
-            this.in_channel
-                .try_send((this.input_ids.copy(), past_key_values, ack))
+        if i == 0 {
+            state
+                .in_channel
+                .try_send((input_ids.copy(), past_key_values, ack))
                 .map_err(|_| {
-                    println!("Queue was full {:?}", this.in_channel.len());
+                    println!("Queue was full {:?}", state.in_channel.len());
                     GenerationError::QueueFull
                 })?;
         } else {
-            this.prio_channel
-                .send((this.input_ids.copy(), past_key_values, ack))
+            state
+                .in_channel
+                .send((input_ids.copy(), past_key_values, ack))
                 .expect("This send should always work");
         }
-        this.sent = true;
-        let (logits, _r_past_key_values) = this.rx.recv().unwrap();
-        this.sent = false;
-        this.add_next_id(&logits);
-        // past_key_values = r_past_key_values;
-        // input_ids = Tensor::f_cat(&[input_ids, new_id.copy()], 1).unwrap();
-        this.new_generated_tokens += 1;
-
-        if this.is_finished() {
-            let n = this.new_generated_tokens;
-            println!(
-                "Inference generated {n} tokens in {:?} ({:?}/tok)",
-                this.start.elapsed(),
-                this.start.elapsed().div_f32(n as f32)
-            );
-            let full_ids = this.get_ids();
-            let string = this.tokenizer.decode(full_ids, false).unwrap();
-            let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
-            Poll::Ready(Some(Ok(Bytes::copy_from_slice(result.as_bytes()))))
-        } else {
-            Poll::Ready(Some(Ok(Bytes::copy_from_slice(b""))))
-        }
-        // }
-        // }
+        let start = Instant::now();
+        let (logits, _r_past_key_values) = rx.recv().unwrap();
+        // println!(
+        //     "Wasted {:?} on thread {:?}",
+        //     start.elapsed(),
+        //     std::thread::current().name()
+        // );
+        input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
     }
-}
-
-#[post("/generate")]
-async fn generate(payload: web::Json<Generation>, state: web::Data<AppState>) -> HttpResponse {
-    let state = state.into_inner();
-    let stream = Stream::new(
-        payload.into_inner(),
-        state.in_channel.clone(),
-        state.prio_channel.clone(),
-        state.tokenizer.clone(),
+    let n = max_new_tokens;
+    println!(
+        "Inference generated {n} tokens in {:?} ({:?}/tok)",
+        start.elapsed(),
+        start.elapsed().div_f32(n as f32)
     );
-    HttpResponse::Ok()
+    let full_ids = input_ids
+        .i((0,))
+        .iter::<i64>()
+        .unwrap()
+        .map(|i| i as u32)
+        .collect();
+    let string = state.tokenizer.decode(full_ids, false).unwrap();
+    let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
+    Ok(HttpResponse::Ok()
         .content_type(ContentType::json())
-        .streaming(stream)
+        .json(json!([{ "generated_text": result }])))
 }
 
 #[derive(Clone)]
@@ -1212,11 +1306,11 @@ fn padding(config: &Config, mut items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
     let total = std::cmp::max(1, batch_size as usize * max_length as usize);
-    // println!(
-    //     "Running on batch of size {:?} - Fillrate {:?}%",
-    //     batch_size,
-    //     (total_ids * 100) / total
-    // );
+    println!(
+        "Running on batch of size {:?} - Fillrate {:?}%",
+        batch_size,
+        (total_ids * 100) / total
+    );
     (all_input_ids, attention_mask, alibi, past_key_values)
 }
 
@@ -1283,7 +1377,7 @@ fn thread1(
             _ => unreachable!(),
         };
         let instant = Instant::now();
-        let deadline = instant + Duration::from_millis(1);
+        let deadline = instant + Duration::from_millis(0);
 
         while let Ok(oper) = sel.select_deadline(deadline) {
             match oper.index() {
@@ -1296,21 +1390,17 @@ fn thread1(
                 _ => unreachable!(),
             }
         }
-        if rx.len() != 0 {
-            println!("After deadline in queue {:?}", rx.len());
-        }
-        if prio_rx.len() != 0 {
-            println!("After deadline prio queue {:?}", prio_rx.len());
-        }
-
+        // let start = Instant::now();
         let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
             padding_with_ack(&config, all_items);
+        // println!("Padding took {:?}", start.elapsed());
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
 
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
         }
+        // println!("Thread1 took {:?}", start.elapsed());
         s2.send((
             (hidden_states, attention_mask, alibi, past_key_values),
             acks,
@@ -1362,11 +1452,17 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
 
+        let start = Instant::now();
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             debug(&format!("past_key thread2"), &layer_past.0);
             debug(&format!("past_values thread2"), &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
         }
+        println!(
+            "Thread2 {thread_number} took {:?} on batch size {:?}",
+            start.elapsed(),
+            hidden_states.size()[0]
+        );
         s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
             .unwrap();
     }
@@ -1459,7 +1555,7 @@ async fn main() -> std::io::Result<()> {
     println!("Loaded tokenizer in {:?}", start.elapsed());
     println!("Starting threads {:?}", std::time::Instant::now());
 
-    let (tx, rx) = bounded::<Msg>(256);
+    let (tx, rx) = bounded::<Msg>(1);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
 
     let (config, layout_config) = match std::env::var("BLOOM")
@@ -1473,7 +1569,7 @@ async fn main() -> std::io::Result<()> {
     };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
-        .map(|_| bounded::<Msg2>(1))
+        .map(|_| bounded::<Msg2>(0))
         .collect();
 
     let s = channels[0].0.clone();
