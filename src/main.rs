@@ -630,6 +630,7 @@ struct BloomAttention {
     scaled_softmax: BloomScaledSoftmax,
     head_dim: i64,
     layer_number: usize,
+    real_layer_number: usize,
     norm_factor: f64,
     n_head: i64,
     hidden_size: i64,
@@ -647,6 +648,7 @@ impl BloomAttention {
         let query_key_value = Linear::new(&format!("{name}.query_key_value"), model, device);
         let head_dim = (config.hidden_size / config.n_head) as i64;
         let num_attention_heads = config.n_head as i64;
+        let real_layer_number = layer_number;
         let layer_number = std::cmp::max(1, layer_number);
         let norm_factor = (head_dim as f64).sqrt() * layer_number as f64;
         let scaled_softmax = BloomScaledSoftmax::new(layer_number as i64, config.kind);
@@ -656,6 +658,7 @@ impl BloomAttention {
             num_attention_heads,
             head_dim,
             layer_number,
+            real_layer_number,
             norm_factor,
             scaled_softmax,
             n_head: config.n_head as i64,
@@ -722,7 +725,49 @@ impl BloomAttention {
         debug("Sliced alibi", &a);
         debug("query layer", &b);
         debug("key layer", &c);
+        // println!("Alpha {alpha}");
+        // println!("beta {beta}");
+        // a.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_sliced_alibi_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        // b.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_query_layer_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        // c.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_key_layer_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        // Tensor::of_slice(&[beta])
+        //     .write_npy(&format!("rust_baddbmm_beta_{}.npy", self.real_layer_number))
+        //     .unwrap();
+        // Tensor::of_slice(&[alpha])
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_alpha_{}.npy",
+        //         self.real_layer_number
+        //     ))
+        //     .unwrap();
         let matmul_result = a.f_baddbmm(&b, &c, beta, alpha).unwrap();
+
+        // matmul_result
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_matmul_result_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+
         let attention_scores = matmul_result.f_view(output_size).unwrap();
         debug(
             &format!("Attention baddbmm {layer_number}"),
@@ -1208,6 +1253,7 @@ fn thread1(
             acks,
         ))
         .unwrap();
+        println!("Sent to thread2 ! ");
     }
 }
 
@@ -1250,13 +1296,17 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
         let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
+        println!("received on thread2 ! {}", thread_number);
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
-        for (layer, layer_past) in layers
-            .iter()
-            .zip(past_key_values.iter_mut().skip(5 + 7 * (thread_number - 1)))
-        {
+
+        println!(
+            "We have {} layers and {} past",
+            layers.len(),
+            past_key_values.len()
+        );
+        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             debug(&format!("past_key thread2"), &layer_past.0);
             debug(&format!("past_values thread2"), &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
@@ -1319,14 +1369,12 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
+        println!("received on thread3 ! {}", thread_number);
 
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
-        for (layer, layer_past) in layers
-            .iter()
-            .zip(past_key_values.iter_mut().skip(5 + 7 * 9))
-        {
+        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             debug(&format!("past_key thread3"), &layer_past.0);
             debug(&format!("past_values thread3"), &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
@@ -1334,11 +1382,16 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         debug(&format!("last_hidden_states"), &hidden_states);
         hidden_states = ln_f.forward(&hidden_states);
         debug(&format!("After ln_f"), &hidden_states);
-        let logits = lm_head.forward(&hidden_states);
+        let lm_logits = lm_head.forward(&hidden_states);
+        // lm_logits
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy("rust_lm_logits.npy")
+        //     .unwrap();
 
         let mut current_batch = 0;
         for (mini_batch_size, rq) in rqs {
-            let simple_logits = logits.i(current_batch..current_batch + mini_batch_size);
+            let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
             let past = empty_past(&config);
             rq.send((simple_logits, past)).unwrap();
             current_batch += mini_batch_size;
@@ -1394,54 +1447,6 @@ async fn main() -> std::io::Result<()> {
     std::thread::spawn(move || {
         thread3(r, layout_config.n_threads + 1, config_, layout_config_);
     });
-    // std::thread::spawn(move || {
-    //     thread1(rx, prio_rx, s0, 0, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r0, s1, 1, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r1, s2, 2, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r2, s3, 3, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r3, s4, 4, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r4, s5, 5, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r5, s6, 6, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r6, s7, 7, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r7, s8, 8, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r8, s9, 9, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r9, s10, 10, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r10, s11, 11, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r11, s12, 12, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r12, s13, 13, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread2(r13, s14, 14, config_fn(), layout_config_fn());
-    // });
-    // std::thread::spawn(move || {
-    //     thread3(r14, 15, config_fn(), layout_config_fn());
-    // });
 
     HttpServer::new(move || {
         App::new()
@@ -1856,28 +1861,35 @@ mod tests {
     #[test]
     fn test_embeddings_full() {
         let device = Device::Cuda(0);
+        let config = Config::new();
         let file = std::fs::File::open("bloom-embedding.bin").unwrap();
         // SAFETY: This is actually unsafe.
         let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
         let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
-        let weight = convert(
-            embedding_model.tensor("word_embeddings.weight").unwrap(),
+
+        let word_embeddings = Embedding::new("word_embeddings", &embedding_model, device);
+        let word_embeddings_layernorm = LayerNorm::new(
+            config.hidden_size,
+            "word_embeddings_layernorm",
+            &embedding_model,
             device,
         );
-        println!("Weight {:?}", weight);
-        // weight
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy("rust_embedding.npy").unwrap();
-
         let input_ids = Tensor::of_slice(&[0, 1, 2, 3, 4, 5])
             .view((1, -1))
             .to_device(device);
-        let input_embeds = Tensor::embedding(&weight, &input_ids, PADDING_IDX, false, false);
-        input_embeds
-            .to_device(Device::Cpu)
-            .to_kind(kind::Kind::Float)
-            .write_npy("rust_input_embeds.npy")
-            .unwrap();
+
+        let input_embeds = word_embeddings.forward(&input_ids);
+        // input_embeds
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy("rust_input_embeds.npy")
+        //     .unwrap();
+
+        let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
+        // hidden_states
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy("rust_word_embeddings_layernorm.npy")
+        //     .unwrap();
     }
 }
