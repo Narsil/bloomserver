@@ -1401,7 +1401,7 @@ fn thread1(
 
         let now = Instant::now();
         let deadline = std::cmp::max(
-            last_loop + Duration::from_millis(10),
+            last_loop + Duration::from_millis(100),
             now + Duration::from_millis(1),
         );
         // let deadline = now + Duration::from_millis(1);
