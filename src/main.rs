@@ -95,7 +95,8 @@ impl LayoutConfig {
 
 type PastLayer = (Tensor, Tensor);
 type Past = Vec<PastLayer>;
-type Ack = Sender<(Tensor, Past)>;
+/// Size of batch and response channel
+type Ack = (i64, Sender<(Tensor, Past)>);
 type Msg = (Tensor, Past, Ack);
 type Msg2 = ((Tensor, Tensor, Tensor, Past), Vec<Ack>);
 type InChan = Sender<Msg>;
@@ -223,16 +224,17 @@ impl futures::Stream for Stream {
 
         let past_key_values = empty_past(&config);
 
+        let ack = (1, this.sx.clone());
         if this.new_generated_tokens == 0 {
             this.in_channel
-                .try_send((input_ids.copy(), past_key_values, this.sx.clone()))
+                .try_send((input_ids.copy(), past_key_values, ack))
                 .map_err(|_| {
                     println!("Queue was full {:?}", this.in_channel.len());
                     GenerationError::QueueFull
                 })?;
         } else {
             this.prio_channel
-                .send((input_ids.copy(), past_key_values, this.sx.clone()))
+                .send((input_ids.copy(), past_key_values, ack))
                 .expect("This send should always work");
         }
         this.sent = true;
@@ -995,7 +997,7 @@ fn padding_with_ack(
 fn padding(config: &Config, mut items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
     // TODO
     let max_length = items.iter().map(|(ids, _)| ids.size()[1]).max().unwrap();
-    let batch_size = items.len() as i64;
+    let batch_size: i64 = items.iter().map(|(ids, _)| ids.size()[0]).sum::<i64>();
     let kind = (kind::Kind::Int64, Device::Cuda(0));
     let device = items[0].0.device();
     let kind2 = (kind::Kind::Int64, device);
@@ -1004,25 +1006,42 @@ fn padding(config: &Config, mut items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
 
     let mut total_ids = 0;
 
-    for (i, (input_ids, past_key_values)) in items.into_iter().enumerate() {
+    let mut current_batch = 0;
+    for (input_ids, past_key_values) in items {
         let seq_length = input_ids.size()[1];
-        total_ids += seq_length as usize;
-        // all_input_ids[i:i+1, max_length - seq_length:seq_length] = input_ids[0]
-        //
-        let batch_index = Tensor::of_slice(vec![i as i64; seq_length as usize].as_slice())
+        let mini_batch_size = input_ids.size()[0];
+        total_ids += mini_batch_size as usize * seq_length as usize;
+        // all_input_ids[i:i+mini_batch_size, max_length - seq_length:seq_length] =
+        // input_ids
+
+        let mut batch_indices = vec![];
+        let mut id_indices = vec![];
+        for i in 0..mini_batch_size {
+            for j in 0..seq_length {
+                let batch_index = i + current_batch;
+                let id_index = j + max_length - seq_length;
+                batch_indices.push(batch_index);
+                id_indices.push(id_index);
+            }
+        }
+        let batch_index = Tensor::of_slice(batch_indices.as_slice())
             .to_kind(kind.0)
             .to_device(kind.1);
-        let id_index = Tensor::arange(seq_length, kind) + max_length - seq_length;
+        let id_index = Tensor::of_slice(id_indices.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1);
 
-        let id_row = input_ids.i((0,));
+        // input_put requires 1-d tensor ?
+        let id_row = input_ids.view((-1,));
         all_input_ids = all_input_ids
             .f_index_put_(&[Some(&batch_index), Some(&id_index)], &id_row, false)
             .unwrap();
 
-        let attn = input_ids.fill(1);
+        let attn = input_ids.fill(1).view((-1,));
         attention_mask = attention_mask
-            .f_index_put(&[Some(&batch_index), Some(&id_index)], &attn.i((0,)), false)
+            .f_index_put_(&[Some(&batch_index), Some(&id_index)], &attn, false)
             .unwrap();
+        current_batch += mini_batch_size;
     }
 
     let p = config.n_head;
@@ -1268,10 +1287,12 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
         debug(&format!("After ln_f"), &hidden_states);
         let logits = lm_head.forward(&hidden_states);
 
-        for (i, rq) in rqs.into_iter().enumerate() {
-            let simple_logits = logits.i(i as i64..i as i64 + 1);
+        let mut current_batch = 0;
+        for (mini_batch_size, rq) in rqs {
+            let simple_logits = logits.i(current_batch..current_batch + mini_batch_size);
             let past = empty_past(&config);
             rq.send((simple_logits, past)).unwrap();
+            current_batch += mini_batch_size;
         }
     }
 }
@@ -1289,24 +1310,12 @@ async fn main() -> std::io::Result<()> {
     let (tx, rx) = bounded::<Msg>(256);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
 
-    let (s0, r0) = bounded::<Msg2>(1);
-    let (s1, r1) = bounded::<Msg2>(1);
-    let (s2, r2) = bounded::<Msg2>(1);
-    let (s3, r3) = bounded::<Msg2>(1);
-    let (s4, r4) = bounded::<Msg2>(1);
-    let (s5, r5) = bounded::<Msg2>(1);
-    let (s6, r6) = bounded::<Msg2>(1);
-    let (s7, r7) = bounded::<Msg2>(1);
-    let (s8, r8) = bounded::<Msg2>(1);
-    let (s9, r9) = bounded::<Msg2>(1);
-    let (s10, r10) = bounded::<Msg2>(1);
-    let (s11, r11) = bounded::<Msg2>(1);
-    let (s12, r12) = bounded::<Msg2>(1);
-    let (s13, r13) = bounded::<Msg2>(1);
-    let (s14, r14) = bounded::<Msg2>(1);
-
-    let (config, layout_config) = (Config::new350m(), LayoutConfig::new350m());
-    let (config, layout_config) = (Config::new(), LayoutConfig::new());
+    let (config, layout_config) = if std::env::var("BLOOM").unwrap_or("full".to_string()) == "350m"
+    {
+        (Config::new350m(), LayoutConfig::new350m())
+    } else {
+        (Config::new(), LayoutConfig::new())
+    };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
         .map(|_| bounded::<Msg2>(1))
@@ -1790,5 +1799,33 @@ mod tests {
             .to_kind(config.kind)
             .to_device(device),
         );
+    }
+
+    #[test]
+    fn test_embeddings_full() {
+        let device = Device::Cuda(0);
+        let file = std::fs::File::open("bloom-embedding.bin").unwrap();
+        // SAFETY: This is actually unsafe.
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
+        let weight = convert(
+            embedding_model.tensor("word_embeddings.weight").unwrap(),
+            device,
+        );
+        println!("Weight {:?}", weight);
+        // weight
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy("rust_embedding.npy").unwrap();
+
+        let input_ids = Tensor::of_slice(&[0, 1, 2, 3, 4, 5])
+            .view((1, -1))
+            .to_device(device);
+        let input_embeds = Tensor::embedding(&weight, &input_ids, PADDING_IDX, false, false);
+        input_embeds
+            .to_device(Device::Cpu)
+            .to_kind(kind::Kind::Float)
+            .write_npy("rust_input_embeds.npy")
+            .unwrap();
     }
 }
