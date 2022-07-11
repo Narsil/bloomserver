@@ -80,6 +80,18 @@ impl LayoutConfig {
         }
     }
 
+    fn new_testing() -> Self {
+        Self {
+            layers_first_thread: 0,
+            layers_per_thread: 1,
+            layers_last_thread: 0,
+            n_threads: 2,
+            embeddings_filename: "./bloom-testing.bin".to_string(),
+            final_filename: "./bloom-testing.bin".to_string(),
+            layer_template_filename: "./bloom-testing.bin".to_string(),
+        }
+    }
+
     fn new350m() -> Self {
         Self {
             layers_first_thread: 0,
@@ -104,21 +116,52 @@ type RChan1 = Receiver<Msg>;
 type RChan = Receiver<Msg2>;
 type SChan = Sender<Msg2>;
 
-#[derive(Deserialize, Serialize)]
-struct Parameters {
-    top_k: Option<usize>,
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct Sampling {
+    top_p: f64,
+    top_k: usize,
+    #[serde(default = "default_temperature")]
+    temperature: f64,
+    #[serde(default = "default_max_new_tokens")]
     max_new_tokens: usize,
-    #[serde(default)]
-    stream: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct BeamSearch {
+    num_beams: usize,
+    #[serde(default = "default_max_new_tokens")]
+    max_new_tokens: usize,
+    #[serde(default = "default_temperature")]
+    temperature: f64,
+}
+
+fn default_temperature() -> f64 {
+    1.0
+}
+fn default_max_new_tokens() -> usize {
+    20
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct Greedy {
+    #[serde(default = "default_max_new_tokens")]
+    max_new_tokens: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+enum Parameters {
+    BeamSearch(BeamSearch),
+    Sampling(Sampling),
+    Greedy(Greedy),
 }
 
 impl Default for Parameters {
     fn default() -> Self {
-        Self {
-            top_k: None,
-            max_new_tokens: 20,
-            stream: false,
-        }
+        Parameters::Greedy(Greedy { max_new_tokens: 20 })
     }
 }
 
@@ -203,7 +246,10 @@ impl Stream {
     }
 
     fn is_finished(&self) -> bool {
-        self.new_generated_tokens >= self.payload.parameters.max_new_tokens
+        match &self.payload.parameters {
+            Parameters::Greedy(greedy) => self.new_generated_tokens >= greedy.max_new_tokens,
+            param => panic!("Param {param:?} is not supported yet !"),
+        }
     }
     fn get_ids(&self) -> Vec<u32> {
         // TODO handle batching maybe
@@ -1313,11 +1359,14 @@ async fn main() -> std::io::Result<()> {
     let (tx, rx) = bounded::<Msg>(256);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
 
-    let (config, layout_config) = if std::env::var("BLOOM").unwrap_or("full".to_string()) == "350m"
+    let (config, layout_config) = match std::env::var("BLOOM")
+        .unwrap_or("bloom".to_string())
+        .as_ref()
     {
-        (Config::new350m(), LayoutConfig::new350m())
-    } else {
-        (Config::new(), LayoutConfig::new())
+        "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
+        "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
+        "bloom" => (Config::new(), LayoutConfig::new()),
+        other => panic!("Model {other} is not known"),
     };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
