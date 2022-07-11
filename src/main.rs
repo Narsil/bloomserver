@@ -92,6 +92,18 @@ impl LayoutConfig {
         }
     }
 
+    fn new_dgx() -> Self {
+        Self {
+            layers_first_thread: 4,
+            layers_per_thread: 10,
+            layers_last_thread: 0,
+            n_threads: 2,
+            embeddings_filename: "./bloom-embeddings.bin".to_string(),
+            final_filename: "./bloom-final.bin".to_string(),
+            layer_template_filename: "./bloom-h.1.bin".to_string(),
+        }
+    }
+
     fn new350m() -> Self {
         Self {
             layers_first_thread: 0,
@@ -439,7 +451,7 @@ async fn generate(
         ids.push(0);
     }
     let start = std::time::Instant::now();
-    let (sx, rx) = bounded::<(Tensor, Past)>(0);
+    let (sx, rx) = bounded::<(Tensor, Past)>(1);
     let kind = (kind::Kind::Int64, Device::Cuda(0));
     let mut input_ids = Tensor::of_slice(ids.as_slice())
         .to_kind(kind.0)
@@ -450,12 +462,15 @@ async fn generate(
         Parameters::BeamSearch(params) => params.max_new_tokens,
         Parameters::Sampling(params) => params.max_new_tokens,
     };
+    // TODO This config does not really matter
+    // as we're not using past right now
     let config = Config::new350m();
     let start = Instant::now();
+    let mut loops = vec![];
+    let mut show = false;
 
     for i in 0..max_new_tokens {
-        // TODO This config does not really matter
-        // as we're not using past right now
+        let start_loop = Instant::now();
         let ack = (input_ids.size()[0], sx.clone());
         let past_key_values = empty_past(&config);
         if i == 0 {
@@ -463,30 +478,32 @@ async fn generate(
                 .in_channel
                 .try_send((input_ids.copy(), past_key_values, ack))
                 .map_err(|_| {
-                    println!("Queue was full {:?}", state.in_channel.len());
+                    // println!("Queue was full {:?}", state.in_channel.len());
                     GenerationError::QueueFull
                 })?;
         } else {
             state
-                .in_channel
+                .prio_channel
                 .send((input_ids.copy(), past_key_values, ack))
                 .expect("This send should always work");
         }
-        let start = Instant::now();
         let (logits, _r_past_key_values) = rx.recv().unwrap();
-        // println!(
-        //     "Wasted {:?} on thread {:?}",
-        //     start.elapsed(),
-        //     std::thread::current().name()
-        // );
         input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
+        if start_loop.elapsed() > Duration::from_millis(1000) {
+            println!("Total loop took {:?}", start_loop.elapsed());
+            show = true;
+        }
+        loops.push(start_loop.elapsed());
     }
     let n = max_new_tokens;
-    println!(
-        "Inference generated {n} tokens in {:?} ({:?}/tok)",
-        start.elapsed(),
-        start.elapsed().div_f32(n as f32)
-    );
+    if show {
+        println!(
+            "Inference generated {n} tokens in {:?} ({:?}/tok) ({:?})",
+            start.elapsed(),
+            start.elapsed().div_f32(n as f32),
+            loops
+        );
+    }
     let full_ids = input_ids
         .i((0,))
         .iter::<i64>()
@@ -884,46 +901,46 @@ impl BloomAttention {
         debug("Sliced alibi", &a);
         debug("query layer", &b);
         debug("key layer", &c);
-        a.to_device(Device::Cpu)
-            .to_kind(kind::Kind::Float)
-            .write_npy(&format!(
-                "rust_baddbmm_sliced_alibi_{}.npy",
-                self.real_layer_number,
-            ))
-            .unwrap();
-        b.to_device(Device::Cpu)
-            .to_kind(kind::Kind::Float)
-            .write_npy(&format!(
-                "rust_baddbmm_query_layer_{}.npy",
-                self.real_layer_number,
-            ))
-            .unwrap();
-        c.to_device(Device::Cpu)
-            .to_kind(kind::Kind::Float)
-            .write_npy(&format!(
-                "rust_baddbmm_key_layer_{}.npy",
-                self.real_layer_number,
-            ))
-            .unwrap();
-        Tensor::of_slice(&[beta])
-            .write_npy(&format!("rust_baddbmm_beta_{}.npy", self.real_layer_number))
-            .unwrap();
-        Tensor::of_slice(&[alpha])
-            .write_npy(&format!(
-                "rust_baddbmm_alpha_{}.npy",
-                self.real_layer_number
-            ))
-            .unwrap();
+        // a.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_sliced_alibi_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        // b.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_query_layer_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        // c.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_key_layer_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        // Tensor::of_slice(&[beta])
+        //     .write_npy(&format!("rust_baddbmm_beta_{}.npy", self.real_layer_number))
+        //     .unwrap();
+        // Tensor::of_slice(&[alpha])
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_alpha_{}.npy",
+        //         self.real_layer_number
+        //     ))
+        //     .unwrap();
         let matmul_result = a.f_baddbmm(&b, &c, beta, alpha).unwrap();
 
-        matmul_result
-            .to_device(Device::Cpu)
-            .to_kind(kind::Kind::Float)
-            .write_npy(&format!(
-                "rust_baddbmm_matmul_result_{}.npy",
-                self.real_layer_number,
-            ))
-            .unwrap();
+        // matmul_result
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_baddbmm_matmul_result_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
 
         let attention_scores = matmul_result.f_view(output_size).unwrap();
         debug(
@@ -1306,11 +1323,13 @@ fn padding(config: &Config, mut items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
     let total = std::cmp::max(1, batch_size as usize * max_length as usize);
-    println!(
-        "Running on batch of size {:?} - Fillrate {:?}%",
-        batch_size,
-        (total_ids * 100) / total
-    );
+    // if batch_size > 4 {
+    //     println!(
+    //         "Running on batch of size {:?} - Fillrate {:?}%",
+    //         batch_size,
+    //         (total_ids * 100) / total
+    //     );
+    // }
     (all_input_ids, attention_mask, alibi, past_key_values)
 }
 
@@ -1362,6 +1381,7 @@ fn thread1(
         start.elapsed()
     );
 
+    // let mut last_loop = Instant::now();
     loop {
         let mut sel = Select::new();
         let oper1 = sel.recv(&rx);
@@ -1376,8 +1396,24 @@ fn thread1(
             }
             _ => unreachable!(),
         };
-        let instant = Instant::now();
-        let deadline = instant + Duration::from_millis(0);
+
+        let max_batch_size = 8;
+
+        let now = Instant::now();
+        // let deadline = std::cmp::max(
+        //     last_loop + Duration::from_millis(10),
+        //     now + Duration::from_millis(1),
+        // );
+        let deadline = now + Duration::from_millis(1);
+        // while let Ok(item) = prio_rx.recv_deadline(deadline) {
+        //     all_items.push(item);
+        // }
+
+        // if all_items.len() < max_batch_size {
+        //     while let Ok(item) = rx.recv_deadline(deadline) {
+        //         all_items.push(item);
+        //     }
+        // }
 
         while let Ok(oper) = sel.select_deadline(deadline) {
             match oper.index() {
@@ -1406,6 +1442,7 @@ fn thread1(
             acks,
         ))
         .unwrap();
+        // last_loop = Instant::now();
     }
 }
 
@@ -1458,11 +1495,11 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
             debug(&format!("past_values thread2"), &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
         }
-        println!(
-            "Thread2 {thread_number} took {:?} on batch size {:?}",
-            start.elapsed(),
-            hidden_states.size()[0]
-        );
+        // println!(
+        //     "Thread2 {thread_number} took {:?} on batch size {:?}",
+        //     start.elapsed(),
+        //     hidden_states.size()[0]
+        // );
         s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
             .unwrap();
     }
@@ -1575,7 +1612,7 @@ async fn main() -> std::io::Result<()> {
     let s = channels[0].0.clone();
     let config_ = config.clone();
     let layout_config_ = layout_config.clone();
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         thread1(rx, prio_rx, s, 0, config_, layout_config_);
     });
 
@@ -1583,14 +1620,14 @@ async fn main() -> std::io::Result<()> {
         let (r, s) = (channels[i].1.clone(), channels[i + 1].0.clone());
         let config_ = config.clone();
         let layout_config_ = layout_config.clone();
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
             thread2(r, s, i + 1, config_, layout_config_);
         });
     }
     let r = channels[layout_config.n_threads].1.clone();
     let config_ = config.clone();
     let layout_config_ = layout_config.clone();
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         thread3(r, layout_config.n_threads + 1, config_, layout_config_);
     });
 
