@@ -131,7 +131,7 @@ type SChan = Sender<Msg2>;
 #[derive(Serialize, Deserialize, Debug)]
 struct Sampling {
     do_sample: bool,
-    // top_p: Option<f64>,
+    top_p: Option<f64>,
     top_k: Option<usize>,
     #[serde(default = "default_temperature")]
     temperature: f64,
@@ -365,6 +365,8 @@ fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tens
         }
         Parameters::Sampling(params) => {
             let S = logits.size()[1];
+            let B = logits.size()[0];
+            let filter_value = f64::NEG_INFINITY;
             let last_logits = logits.i((0, S - 1..S)).to_device(input_ids.device());
 
             let mut scored_logits = last_logits / params.temperature;
@@ -377,10 +379,41 @@ fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tens
                 let size = top_ks.size();
                 let top_k = top_ks.i((0..size[0], -1));
 
-                let filter_value = f64::NEG_INFINITY;
-
                 let indices_to_remove = scored_logits.le_tensor(&top_k);
                 scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
+            }
+
+            if let Some(top_p) = params.top_p {
+                // sorted_logits, sorted_indices = torch.sort(scores, descending=True)
+                let descending = true;
+                let (sorted_logits, sorted_indices) = scored_logits.sort(-1, descending);
+                // cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                let cumulative_probs = sorted_logits
+                    .softmax(-1, kind::Kind::Float)
+                    .cumsum(-1, kind::Kind::Float);
+
+                // # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+                // sorted_indices_to_remove = cumulative_probs > self.top_p
+                let mut sorted_indices_to_remove = cumulative_probs.gt(top_p);
+                // if self.min_tokens_to_keep > 1:
+                //     # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+                //     sorted_indices_to_remove[..., : self.min_tokens_to_keep - 1] = 0
+                // # Shift the indices to the right to keep also the first token above the threshold
+                // sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                // sorted_indices_to_remove[..., 0] = 0
+
+                sorted_indices_to_remove = sorted_indices_to_remove
+                    .i((0..B, 1..S))
+                    .fill_tensor(&sorted_indices_to_remove.i((0..B, 0..S - 1)));
+                sorted_indices_to_remove = sorted_indices_to_remove.i((0..B, 0)).fill(0);
+
+                // # scatter sorted tensors to original indexing
+                // indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                let indices_to_remove =
+                    sorted_indices_to_remove.scatter(1, &sorted_indices, &sorted_indices_to_remove);
+                let scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
+                // scores = scores.masked_fill(indices_to_remove, self.filter_value)
+                // return scores
             }
 
             let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
@@ -2092,7 +2125,7 @@ mod tests {
             .view((1, -1))
             .to_device(device);
 
-        let input_embeds = word_embeddings.forward(&input_ids);
+        let inputs_embeds = word_embeddings.forward(&input_ids);
         // input_embeds
         //     .to_device(Device::Cpu)
         //     .to_kind(kind::Kind::Float)
