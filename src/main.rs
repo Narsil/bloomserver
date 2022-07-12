@@ -402,16 +402,19 @@ fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tens
                 // sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 // sorted_indices_to_remove[..., 0] = 0
 
-                sorted_indices_to_remove = sorted_indices_to_remove
-                    .i((0..B, 1..S))
-                    .fill_tensor(&sorted_indices_to_remove.i((0..B, 0..S - 1)));
-                sorted_indices_to_remove = sorted_indices_to_remove.i((0..B, 0)).fill(0);
+                // sorted_indices_to_remove = sorted_indices_to_remove
+                //     .i((0..B, 1..S))
+                //     .fill_tensor(&sorted_indices_to_remove.i((0..B, 0..S - 1)).view((-1)));
+                sorted_indices_to_remove.i((0..B, 0)).f_fill(0).unwrap();
 
                 // # scatter sorted tensors to original indexing
                 // indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                let indices_to_remove =
-                    sorted_indices_to_remove.scatter(1, &sorted_indices, &sorted_indices_to_remove);
-                let scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
+                let indices_to_remove = sorted_indices_to_remove
+                    .f_scatter(1, &sorted_indices, &sorted_indices_to_remove)
+                    .unwrap();
+                let scored_logits = scored_logits
+                    .f_masked_fill(&indices_to_remove, filter_value)
+                    .unwrap();
                 // scores = scores.masked_fill(indices_to_remove, self.filter_value)
                 // return scores
             }
