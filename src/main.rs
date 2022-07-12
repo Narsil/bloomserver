@@ -467,7 +467,7 @@ async fn generate(
     let config = Config::new350m();
     let start = Instant::now();
     let mut loops = vec![];
-    let mut show = false;
+    // let mut show = false;
 
     for i in 0..max_new_tokens {
         let start_loop = Instant::now();
@@ -489,21 +489,21 @@ async fn generate(
         }
         let (logits, _r_past_key_values) = rx.recv().unwrap();
         input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
-        if start_loop.elapsed() > Duration::from_millis(1000) {
-            println!("Total loop took {:?}", start_loop.elapsed());
-            show = true;
-        }
+        // if start_loop.elapsed() > Duration::from_millis(1000) {
+        //     println!("Total loop took {:?}", start_loop.elapsed());
+        //     show = true;
+        // }
         loops.push(start_loop.elapsed());
     }
     let n = max_new_tokens;
-    if show {
-        println!(
-            "Inference generated {n} tokens in {:?} ({:?}/tok) ({:?})",
-            start.elapsed(),
-            start.elapsed().div_f32(n as f32),
-            loops
-        );
-    }
+    // if show {
+    //     println!(
+    //         "Inference generated {n} tokens in {:?} ({:?}/tok) ({:?})",
+    //         start.elapsed(),
+    //         start.elapsed().div_f32(n as f32),
+    //         loops
+    //     );
+    // }
     let full_ids = input_ids
         .i((0,))
         .iter::<i64>()
@@ -1372,7 +1372,17 @@ fn thread1(
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(&config, &format!("h.{i}"), &model, i, device)
+            BloomBlock::new(
+                &config,
+                &if std::env::var("BLOOM").unwrap_or("".to_string()) == "bloom-dgx" {
+                    "h.0".to_string()
+                } else {
+                    format!("h.{i}")
+                },
+                &model,
+                i,
+                device,
+            )
         })
         .collect();
     println!(
@@ -1397,11 +1407,11 @@ fn thread1(
             _ => unreachable!(),
         };
 
-        let max_batch_size = 8;
+        let max_batch_size = 4;
 
         let now = Instant::now();
         let deadline = std::cmp::max(
-            last_loop + Duration::from_millis(100),
+            last_loop + Duration::from_millis(10),
             now + Duration::from_millis(1),
         );
         // let deadline = now + Duration::from_millis(1);
@@ -1484,28 +1494,58 @@ fn thread2(rx: RChan, s: SChan, thread_number: usize, config: Config, layout_con
         std::time::Instant::now(),
         start.elapsed()
     );
-
     loop {
-        let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) = rx
-            .recv()
-            .expect("You probably want to handle this case, but I'm too lazy");
-        hidden_states = hidden_states.to_device(device);
-        attention_mask = attention_mask.to_device(device);
-        alibi = alibi.to_device(device);
+        // Receive 1 item
+        // println!("start loop  thread {thread_number}");
+        // let start = Instant::now();
+        let mut all_items = vec![rx.recv().unwrap()];
+        // if start.elapsed() > Duration::from_millis(200) {
+        //     println!(
+        //         "Got stuck on RECEIVE thread {thread_number} for {:?}",
+        //         start.elapsed()
+        //     );
+        // }
 
         let start = Instant::now();
-        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
-            debug(&format!("past_key thread2"), &layer_past.0);
-            debug(&format!("past_values thread2"), &layer_past.1);
-            hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+        let deadline = start + Duration::from_millis(1);
+        while let Ok(item) = rx.recv_deadline(deadline) {
+            all_items.push(item);
         }
-        // println!(
-        //     "Thread2 {thread_number} took {:?} on batch size {:?}",
-        //     start.elapsed(),
-        //     hidden_states.size()[0]
-        // );
-        s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
-            .unwrap();
+        all_items.sort_by(|a, b| {
+            let a_size = a.0 .0.size();
+            let b_size = b.0 .0.size();
+            let a = a_size[0] * a_size[1];
+            let b = b_size[0] * b_size[1];
+            a.cmp(&b)
+        });
+
+        for item in all_items {
+            let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) =
+                item;
+            hidden_states = hidden_states.to_device(device);
+            attention_mask = attention_mask.to_device(device);
+            alibi = alibi.to_device(device);
+
+            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
+                debug(&format!("past_key thread2"), &layer_past.0);
+                debug(&format!("past_values thread2"), &layer_past.1);
+                hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+            }
+            // println!(
+            //     "Thread2 {thread_number} took {:?} on batch size {:?}",
+            //     start.elapsed(),
+            //     hidden_states.size()[0]
+            // );
+            let start = Instant::now();
+            s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
+                .unwrap();
+            if start.elapsed() > Duration::from_millis(200) {
+                println!(
+                    "Got stuck on SEND thread {thread_number} for {:?}",
+                    start.elapsed()
+                );
+            }
+        }
     }
 }
 
@@ -1544,7 +1584,11 @@ fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: Layou
             let model = SafeTensors::deserialize(&mmap).unwrap();
             BloomBlock::new(
                 &config,
-                &format!("h.{layer_number}"),
+                &if std::env::var("BLOOM").unwrap_or("".to_string()) == "bloom-dgx" {
+                    "h.0".to_string()
+                } else {
+                    format!("h.{i}")
+                },
                 &model,
                 layer_number,
                 device,
@@ -1612,7 +1656,7 @@ async fn main() -> std::io::Result<()> {
     };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
-        .map(|_| bounded::<Msg2>(0))
+        .map(|_| unbounded::<Msg2>())
         .collect();
 
     let s = channels[0].0.clone();
