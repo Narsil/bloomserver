@@ -129,7 +129,6 @@ type RChan = Receiver<Msg2>;
 type SChan = Sender<Msg2>;
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
 struct Sampling {
     do_sample: bool,
     // top_p: Option<f64>,
@@ -141,7 +140,6 @@ struct Sampling {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
 struct BeamSearch {
     num_beams: usize,
     #[serde(default = "default_max_new_tokens")]
@@ -365,32 +363,31 @@ fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tens
                 .to_device(input_ids.device());
             Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
         }
+        Parameters::Sampling(params) => {
+            let S = logits.size()[1];
+            let last_logits = logits.i((0, S - 1..S)).to_device(input_ids.device());
+
+            let mut scored_logits = last_logits / params.temperature;
+
+            if let Some(top_k) = params.top_k {
+                // indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
+                let largest = true;
+                let sorted = true;
+                let top_ks = scored_logits.topk(top_k as i64, -1, largest, sorted).0;
+                let size = top_ks.size();
+                let top_k = top_ks.i((0..size[0], -1));
+
+                let filter_value = f64::NEG_INFINITY;
+
+                let indices_to_remove = scored_logits.le_tensor(&top_k);
+                scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
+            }
+
+            let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
+            let new_ids = probs.f_multinomial(1, false).unwrap();
+            Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
+        }
         _ => todo!(),
-        // Parameters::Sampling(params) => {
-        //     let S = logits.size()[1];
-        //     let last_logits = logits.i((0, S - 1..S)).to_device(self.input_ids.device());
-
-        //     let mut scored_logits = last_logits / params.temperature;
-
-        //     if let Some(top_k) = params.top_k {
-        //         // indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
-        //         let largest = true;
-        //         let sorted = true;
-        //         let top_ks = scored_logits.topk(top_k as i64, -1, largest, sorted).0;
-        //         let size = top_ks.size();
-        //         let top_k = top_ks.i((0..size[0], -1));
-
-        //         let filter_value = f64::NEG_INFINITY;
-
-        //         let indices_to_remove = scored_logits.le_tensor(&top_k);
-        //         scored_logits = scored_logits.masked_fill(&indices_to_remove, filter_value);
-        //     }
-
-        //     let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
-        //     let new_ids = probs.f_multinomial(1, false).unwrap();
-        //     self.input_ids =
-        //         Tensor::f_cat(&[self.input_ids.copy(), new_ids.copy()], 1).unwrap();
-        // }
         // Parameters::BeamSearch(params) => {
         //     let num_beams = params.num_beams as i64;
         //     if self.new_generated_tokens == 0 {
@@ -466,11 +463,9 @@ async fn generate(
     // as we're not using past right now
     let config = Config::new350m();
     let start = Instant::now();
-    let mut loops = vec![];
-    // let mut show = false;
 
     for i in 0..max_new_tokens {
-        let start_loop = Instant::now();
+        // let start_loop = Instant::now();
         let ack = (input_ids.size()[0], sx.clone());
         let past_key_values = empty_past(&config);
         if i == 0 {
@@ -489,21 +484,8 @@ async fn generate(
         }
         let (logits, _r_past_key_values) = rx.recv().unwrap();
         input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
-        // if start_loop.elapsed() > Duration::from_millis(1000) {
-        //     println!("Total loop took {:?}", start_loop.elapsed());
-        //     show = true;
-        // }
-        loops.push(start_loop.elapsed());
     }
     let n = max_new_tokens;
-    // if show {
-    //     println!(
-    //         "Inference generated {n} tokens in {:?} ({:?}/tok) ({:?})",
-    //         start.elapsed(),
-    //         start.elapsed().div_f32(n as f32),
-    //         loops
-    //     );
-    // }
     let full_ids = input_ids
         .i((0,))
         .iter::<i64>()
@@ -511,10 +493,9 @@ async fn generate(
         .map(|i| i as u32)
         .collect();
     let string = state.tokenizer.decode(full_ids, false).unwrap();
-    let result = serde_json::to_string(&json!([{ "generated_text": string }])).unwrap();
     Ok(HttpResponse::Ok()
         .content_type(ContentType::json())
-        .json(json!([{ "generated_text": result }])))
+        .json(json!([{ "generated_text": string }])))
 }
 
 #[derive(Clone)]

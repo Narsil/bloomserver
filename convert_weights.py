@@ -43,8 +43,9 @@ def convert_full():
 
         # Need to copy since that call mutates the tensors to numpy
         save_file(data.copy(), local)
-        os.remove(filename)
+        # os.remove(filename)
 
 
 if __name__ == "__main__":
+    convert_full()
     raise Exception("Choose one of the weights to convert.")
