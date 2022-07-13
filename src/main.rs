@@ -26,6 +26,8 @@ struct Config {
     hidden_size: i64,
     n_layer: i64,
     kind: kind::Kind,
+    slow_but_exact: bool,
+    pretraining_tp: usize,
 }
 
 impl Config {
@@ -35,6 +37,8 @@ impl Config {
             hidden_size: 14336,
             n_layer: 70,
             kind: kind::Kind::BFloat16,
+            slow_but_exact: true,
+            pretraining_tp: 4,
         }
     }
     fn new350m() -> Self {
@@ -43,6 +47,8 @@ impl Config {
             hidden_size: 1024,
             n_layer: 24,
             kind: kind::Kind::Half,
+            slow_but_exact: false,
+            pretraining_tp: 1,
         }
     }
 
@@ -52,6 +58,8 @@ impl Config {
             hidden_size: 64,
             n_layer: 2,
             kind: kind::Kind::BFloat16,
+            slow_but_exact: true,
+            pretraining_tp: 2,
         }
     }
 }
@@ -881,6 +889,8 @@ struct BloomAttention {
     norm_factor: f64,
     n_head: i64,
     hidden_size: i64,
+    pretraining_tp: i64,
+    slow_but_exact: bool,
 }
 
 impl BloomAttention {
@@ -910,6 +920,8 @@ impl BloomAttention {
             scaled_softmax,
             n_head: config.n_head as i64,
             hidden_size: config.hidden_size as i64,
+            slow_but_exact: config.slow_but_exact,
+            pretraining_tp: config.pretraining_tp as i64,
         }
     }
 
@@ -1023,16 +1035,65 @@ impl BloomAttention {
         let attention_probs =
             self.scaled_softmax
                 .forward(&attention_scores, attention_mask, max_positions);
+        // attention_probs
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_softmax_attention_probs_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
         let value_layer = value.transpose(1, 0).reshape(&[K, B * H, -1]);
         let attention_probs_reshaped = attention_probs.f_view((B * H, Q, -1)).unwrap();
         let bmm = Tensor::bmm(&attention_probs_reshaped, &value_layer.transpose(0, 1));
+        // bmm.to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_bmm_context_layer_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
         debug("Bmm", &bmm);
         let context_layer_r = bmm.f_view((B, H, Q, -1)).unwrap();
         let context_layer_p = context_layer_r.permute(&[2, 0, 1, 3]).contiguous();
         let context = context_layer_p.f_view((Q, B, H * NH)).unwrap();
-        let output_tensor = self.dense.forward(&context);
+        // context
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!(
+        //         "rust_bmm_context_layer2_{}.npy",
+        //         self.real_layer_number,
+        //     ))
+        //     .unwrap();
+        let output_tensor = if self.slow_but_exact {
+            let slices = context.size().last().unwrap() / self.pretraining_tp;
+            let mut output_tensor = Tensor::zeros_like(&context);
+            for i in 0..self.pretraining_tp {
+                let context_tp = context.i((.., .., i * slices..(i + 1) * slices));
+                let dense_tp = self.dense.weight.i((.., i * slices..(i + 1) * slices));
+                output_tensor += context_tp.linear::<Tensor>(&dense_tp, None);
+            }
+            output_tensor
+        } else {
+            self.dense.forward(&context)
+        };
+        // output_tensor
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!("rust_bmm_dense_{}.npy", self.real_layer_number,))
+        //     .unwrap();
+        // residual
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!("rust_bmm_residual_{}.npy", self.real_layer_number,))
+        //     .unwrap();
         let mut output = output_tensor.transpose(1, 0);
         output += residual;
+        // output
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!("rust_bmm_dropout_{}.npy", self.real_layer_number,))
+        //     .unwrap();
         output
     }
 }
@@ -1040,6 +1101,9 @@ impl BloomAttention {
 struct BloomMlp {
     dense_h_to_4h: Linear,
     dense_4h_to_h: Linear,
+    real_layer_number: usize,
+    slow_but_exact: bool,
+    pretraining_tp: i64,
 }
 
 fn bloom_gelu(x: &Tensor) -> Tensor {
@@ -1048,26 +1112,66 @@ fn bloom_gelu(x: &Tensor) -> Tensor {
 }
 
 impl BloomMlp {
-    fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+    fn new(
+        config: &Config,
+        name: &str,
+        model: &SafeTensors<'_>,
+        device: Device,
+        real_layer_number: usize,
+    ) -> Self {
         let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model, device);
         let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model, device);
         Self {
             dense_h_to_4h,
             dense_4h_to_h,
+            real_layer_number,
+            slow_but_exact: config.slow_but_exact,
+            pretraining_tp: config.pretraining_tp as i64,
         }
     }
 
     fn forward(&self, hidden_states: &Tensor, residual: &Tensor) -> Tensor {
+        // hidden_states
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!("rust_mlp_init_{}.npy", self.real_layer_number,))
+        //     .unwrap();
         debug("hidden_states", hidden_states);
         debug("INCOMING residual", residual);
         let hidden_states = self.dense_h_to_4h.forward(hidden_states);
         debug("hidden_states h to 4h", &hidden_states);
         let hidden_states = bloom_gelu(&hidden_states);
+        // hidden_states
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!("rust_mlp_gelu_{}.npy", self.real_layer_number,))
+        //     .unwrap();
         debug("hidden_states gelu", &hidden_states);
-        let hidden_states = self.dense_4h_to_h.forward(&hidden_states);
+        let hidden_states = if self.slow_but_exact {
+            let mut intermediate_output = Tensor::zeros_like(&residual);
+            let slices = self.dense_4h_to_h.weight.size().last().unwrap() / self.pretraining_tp;
+            for i in 0..self.pretraining_tp {
+                let i = i as i64;
+                let tp = hidden_states.i((.., .., i * slices..(i + 1) * slices));
+                let dense_size = self.dense_4h_to_h.weight.size();
+                let dense_tp = self
+                    .dense_4h_to_h
+                    .weight
+                    .i((.., i * slices..(i + 1) * slices));
+                intermediate_output += tp.linear::<Tensor>(&dense_tp, None);
+            }
+            intermediate_output
+        } else {
+            self.dense_4h_to_h.forward(&hidden_states)
+        };
         debug("hidden_states 4h to h", &hidden_states);
         let hidden_states = hidden_states + residual;
         debug("hidden_states residual", &hidden_states);
+        // hidden_states
+        //     .to_device(Device::Cpu)
+        //     .to_kind(kind::Kind::Float)
+        //     .write_npy(&format!("rust_mlp_output_{}.npy", self.real_layer_number,))
+        //     .unwrap();
         hidden_states
     }
 }
@@ -1108,7 +1212,13 @@ impl BloomBlock {
             layer_number,
             device,
         );
-        let mlp = BloomMlp::new(&format!("{prefix}.mlp"), model, device);
+        let mlp = BloomMlp::new(
+            config,
+            &format!("{prefix}.mlp"),
+            model,
+            device,
+            layer_number,
+        );
         Self {
             input_layernorm,
             self_attention,
