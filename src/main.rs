@@ -146,7 +146,6 @@ fn default_temperature() -> f64 {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
 struct Greedy {}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -216,7 +215,6 @@ impl Default for Parameters {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
 struct IntermediateParameters {
     do_sample: Option<bool>,
     num_beams: Option<usize>,
