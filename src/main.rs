@@ -128,53 +128,105 @@ type RChan1 = Receiver<Msg>;
 type RChan = Receiver<Msg2>;
 type SChan = Sender<Msg2>;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Sampling {
-    do_sample: bool,
     top_p: Option<f64>,
     top_k: Option<usize>,
     #[serde(default = "default_temperature")]
     temperature: f64,
-    #[serde(default = "default_max_new_tokens")]
-    max_new_tokens: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct BeamSearch {
     num_beams: usize,
-    #[serde(default = "default_max_new_tokens")]
-    max_new_tokens: usize,
 }
 
 fn default_temperature() -> f64 {
     1.0
 }
-fn default_max_new_tokens() -> usize {
-    20
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Greedy {}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+enum GenerationMode {
+    BeamSearch(BeamSearch),
+    Sampling(Sampling),
+    Greedy,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-struct Greedy {
-    #[serde(default = "default_max_new_tokens")]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(try_from = "IntermediateParameters")]
+struct Parameters {
+    generation_mode: GenerationMode,
     max_new_tokens: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-enum Parameters {
-    BeamSearch(BeamSearch),
-    Sampling(Sampling),
-    Greedy(Greedy),
+impl TryFrom<IntermediateParameters> for Parameters {
+    // TODO: impl proper error type instead of `String`
+    type Error = String;
+
+    fn try_from(data: IntermediateParameters) -> Result<Self, Self::Error> {
+        let generation_mode = match (data.do_sample, data.num_beams) {
+            (Some(do_sample), _) if do_sample => GenerationMode::Sampling(Sampling {
+                temperature: data.temperature.unwrap_or(1.0),
+                top_k: data.top_k,
+                top_p: data.top_p,
+            }),
+            (_, Some(num_beams)) => GenerationMode::BeamSearch(BeamSearch { num_beams }),
+            _ => {
+                if let Some(temperature) = data.temperature {
+                    GenerationMode::Sampling(Sampling {
+                        temperature: data.temperature.unwrap_or(1.0),
+                        top_k: data.top_k,
+                        top_p: data.top_p,
+                    })
+                } else if let Some(top_k) = data.top_k {
+                    GenerationMode::Sampling(Sampling {
+                        temperature: data.temperature.unwrap_or(1.0),
+                        top_k: data.top_k,
+                        top_p: data.top_p,
+                    })
+                } else if let Some(top_p) = data.top_p {
+                    GenerationMode::Sampling(Sampling {
+                        temperature: data.temperature.unwrap_or(1.0),
+                        top_k: data.top_k,
+                        top_p: data.top_p,
+                    })
+                } else {
+                    GenerationMode::Greedy
+                }
+            }
+        };
+        Ok(Parameters {
+            generation_mode,
+            max_new_tokens: data.max_new_tokens.unwrap_or(20),
+        })
+    }
 }
 
 impl Default for Parameters {
     fn default() -> Self {
-        Parameters::Greedy(Greedy { max_new_tokens: 20 })
+        Self {
+            generation_mode: GenerationMode::Greedy,
+            max_new_tokens: 20,
+        }
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct IntermediateParameters {
+    do_sample: Option<bool>,
+    num_beams: Option<usize>,
+    top_p: Option<f64>,
+    top_k: Option<usize>,
+    temperature: Option<f64>,
+    max_new_tokens: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Generation {
     inputs: String,
     #[serde(default)]
@@ -352,10 +404,48 @@ fn empty_past(config: &Config) -> Past {
 //         .streaming(stream)
 // }
 
+fn filter_top_p(scored_logits: &Tensor, top_p: f64) -> Tensor {
+    let B = scored_logits.size()[0];
+    let filter_value = f64::NEG_INFINITY;
+    let descending = true;
+    let (sorted_logits, sorted_indices) = scored_logits.sort(-1, descending);
+    // cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+    let cumulative_probs = sorted_logits
+        .softmax(-1, kind::Kind::Float)
+        .cumsum(-1, kind::Kind::Float);
+
+    // # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+    // sorted_indices_to_remove = cumulative_probs > self.top_p
+    let mut sorted_indices_to_remove = cumulative_probs.gt(top_p);
+    // if self.min_tokens_to_keep > 1:
+    //     # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+    //     sorted_indices_to_remove[..., : self.min_tokens_to_keep - 1] = 0
+    // # Shift the indices to the right to keep also the first token above the threshold
+    // sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    // sorted_indices_to_remove[..., 0] = 0
+
+    // sorted_indices_to_remove = sorted_indices_to_remove
+    //     .i((0..B, 1..S))
+    //     .fill_tensor(&sorted_indices_to_remove.i((0..B, 0..S - 1)).view((-1)));
+    sorted_indices_to_remove.i((0..B, -1)).f_fill_(0).unwrap();
+    sorted_indices_to_remove = sorted_indices_to_remove.roll(&[1], &[1]);
+
+    // # scatter sorted tensors to original indexing
+    // indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+    let indices_to_remove = sorted_indices_to_remove
+        .f_scatter(1, &sorted_indices, &sorted_indices_to_remove)
+        .unwrap();
+    scored_logits
+        .f_masked_fill(&indices_to_remove, filter_value)
+        .unwrap()
+    // scores = scores.masked_fill(indices_to_remove, self.filter_value)
+    // return scores
+}
+
 fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tensor {
     // TODO handle batching
-    match params {
-        Parameters::Greedy(params) => {
+    match &params.generation_mode {
+        GenerationMode::Greedy => {
             let S = logits.size()[1];
             let new_ids = logits
                 .i((0..1, S - 1..S))
@@ -363,7 +453,7 @@ fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tens
                 .to_device(input_ids.device());
             Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
         }
-        Parameters::Sampling(params) => {
+        GenerationMode::Sampling(params) => {
             let S = logits.size()[1];
             let B = logits.size()[0];
             let filter_value = f64::NEG_INFINITY;
@@ -385,38 +475,8 @@ fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tens
 
             if let Some(top_p) = params.top_p {
                 // sorted_logits, sorted_indices = torch.sort(scores, descending=True)
-                let descending = true;
-                let (sorted_logits, sorted_indices) = scored_logits.sort(-1, descending);
-                // cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-                let cumulative_probs = sorted_logits
-                    .softmax(-1, kind::Kind::Float)
-                    .cumsum(-1, kind::Kind::Float);
 
-                // # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
-                // sorted_indices_to_remove = cumulative_probs > self.top_p
-                let mut sorted_indices_to_remove = cumulative_probs.gt(top_p);
-                // if self.min_tokens_to_keep > 1:
-                //     # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
-                //     sorted_indices_to_remove[..., : self.min_tokens_to_keep - 1] = 0
-                // # Shift the indices to the right to keep also the first token above the threshold
-                // sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                // sorted_indices_to_remove[..., 0] = 0
-
-                // sorted_indices_to_remove = sorted_indices_to_remove
-                //     .i((0..B, 1..S))
-                //     .fill_tensor(&sorted_indices_to_remove.i((0..B, 0..S - 1)).view((-1)));
-                sorted_indices_to_remove.i((0..B, 0)).f_fill(0).unwrap();
-
-                // # scatter sorted tensors to original indexing
-                // indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                let indices_to_remove = sorted_indices_to_remove
-                    .f_scatter(1, &sorted_indices, &sorted_indices_to_remove)
-                    .unwrap();
-                let scored_logits = scored_logits
-                    .f_masked_fill(&indices_to_remove, filter_value)
-                    .unwrap();
-                // scores = scores.masked_fill(indices_to_remove, self.filter_value)
-                // return scores
+                scored_logits = filter_top_p(&scored_logits, top_p);
             }
 
             let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
@@ -490,11 +550,7 @@ async fn generate(
         .to_kind(kind.0)
         .to_device(kind.1)
         .view((1, -1));
-    let max_new_tokens = match &payload.parameters {
-        Parameters::Greedy(params) => params.max_new_tokens,
-        Parameters::BeamSearch(params) => params.max_new_tokens,
-        Parameters::Sampling(params) => params.max_new_tokens,
-    };
+    let max_new_tokens = payload.parameters.max_new_tokens;
     // TODO This config does not really matter
     // as we're not using past right now
     let config = Config::new350m();
@@ -1132,13 +1188,14 @@ impl Embedding {
 fn debug_force(prefix: &str, x: &Tensor) {
     let size = x.size();
     let B = size[0];
+    let S = if size.len() > 1 { size[1] } else { B };
     println!(
         "{prefix} - {:?} - Values: {:?}",
         size,
         x.reshape(&[-1,])
             .iter::<f64>()
             .unwrap()
-            .take(30)
+            .take(std::cmp::min(S as usize, 10))
             .collect::<Vec<_>>()
     );
     if B > 1 {
@@ -2141,5 +2198,74 @@ mod tests {
         //     .to_kind(kind::Kind::Float)
         //     .write_npy("rust_word_embeddings_layernorm.npy")
         //     .unwrap();
+    }
+
+    #[test]
+    fn test_unpacking_params() {
+        let parameters: Parameters = serde_json::from_str(r#"{"do_sample": true}"#).unwrap();
+        assert_eq!(
+            parameters,
+            Parameters {
+                generation_mode: GenerationMode::Sampling(Sampling {
+                    top_p: None,
+                    top_k: None,
+                    temperature: 1.0,
+                }),
+                max_new_tokens: 20
+            }
+        );
+        let parameters: Parameters = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            parameters,
+            Parameters {
+                generation_mode: GenerationMode::Greedy,
+                max_new_tokens: 20
+            }
+        );
+        let parameters: Parameters = serde_json::from_str(r#"{"do_sample": false}"#).unwrap();
+        assert_eq!(
+            parameters,
+            Parameters {
+                generation_mode: GenerationMode::Greedy,
+                max_new_tokens: 20
+            }
+        );
+        let parameters: Parameters = serde_json::from_str(r#"{"top_k": 20}"#).unwrap();
+        assert_eq!(
+            parameters,
+            Parameters {
+                generation_mode: GenerationMode::Sampling(Sampling {
+                    top_p: None,
+                    top_k: Some(20),
+                    temperature: 1.0,
+                }),
+                max_new_tokens: 20
+            }
+        );
+    }
+    #[test]
+    fn test_sampling_top_p() {
+        // dist = torch.log(
+        //     torch.tensor([[0.3, 0.1, 0.1, 0.5], [0.15, 0.3, 0.3, 0.25]], device=torch_device, dtype=torch.float)
+        // )
+        let top_p = 0.7;
+        let dist = Tensor::of_slice(&[0.3, 0.1, 0.1, 0.5, 0.15, 0.3, 0.3, 0.25]).view((2, 4));
+
+        // top_p_warp = TopPLogitsWarper(0.7)
+        // filtered_dist = torch.exp(top_p_warp(input_ids, dist))
+        let filtered_dist = filter_top_p(&dist.log(), top_p).exp();
+
+        // # dist should be filtered to keep min num values so that sum is >= 0.7
+        // # exp (-inf) => 0
+        // EXPECTED_FILTERED_DIST = torch.tensor(
+        //     [[0.3, 0.0, 0.0, 0.5], [0.0, 0.3, 0.3, 0.25]], device=torch_device, dtype=torch.float
+        // )
+        let expected = Tensor::of_slice(&[0.3, 0.0, 0.0, 0.5, 0.0, 0.3, 0.3, 0.25]).view((2, 4));
+
+        // self.assertTrue(torch.allclose(filtered_dist, EXPECTED_FILTERED_DIST, atol=1e-3))
+        let rtol = 1e-05;
+        let atol = 1e-03;
+        let equal_nan = false;
+        assert!(filtered_dist.allclose(&expected, rtol, atol, equal_nan));
     }
 }
