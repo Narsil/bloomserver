@@ -984,46 +984,33 @@ impl BloomAttention {
         debug("Sliced alibi", &a);
         debug("query layer", &b);
         debug("key layer", &c);
-        // a.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_sliced_alibi_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
-        // b.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_query_layer_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
-        // c.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_key_layer_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
-        // Tensor::of_slice(&[beta])
-        //     .write_npy(&format!("rust_baddbmm_beta_{}.npy", self.real_layer_number))
-        //     .unwrap();
-        // Tensor::of_slice(&[alpha])
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_alpha_{}.npy",
-        //         self.real_layer_number
-        //     ))
-        //     .unwrap();
+
+        save_layer_to_disk(
+            &a,
+            &format!("rust_baddbmm_sliced_alibi_{}.npy", self.real_layer_number,),
+        );
+        save_layer_to_disk(
+            &b,
+            &format!("rust_baddbmm_query_layer_{}.npy", self.real_layer_number,),
+        );
+        save_layer_to_disk(
+            &c,
+            &format!("rust_baddbmm_key_layer_{}.npy", self.real_layer_number,),
+        );
+        save_layer_to_disk(
+            &Tensor::of_slice(&[beta]),
+            &format!("rust_baddbmm_beta_{}.npy", self.real_layer_number,),
+        );
+        save_layer_to_disk(
+            &Tensor::of_slice(&[alpha]),
+            &format!("rust_baddbmm_alpha_{}.npy", self.real_layer_number,),
+        );
         let matmul_result = a.f_baddbmm(&b, &c, beta, alpha).unwrap();
 
-        // matmul_result
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_baddbmm_matmul_result_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
+        save_layer_to_disk(
+            &matmul_result,
+            &format!("rust_baddbmm_matmul_result_{}.npy", self.real_layer_number,),
+        );
 
         let attention_scores = matmul_result.f_view(output_size).unwrap();
         debug(
@@ -1035,36 +1022,28 @@ impl BloomAttention {
         let attention_probs =
             self.scaled_softmax
                 .forward(&attention_scores, attention_mask, max_positions);
-        // attention_probs
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_softmax_attention_probs_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
+        save_layer_to_disk(
+            &attention_probs,
+            &format!(
+                "rust_softmax_attention_probs_{}.npy",
+                self.real_layer_number,
+            ),
+        );
         let value_layer = value.transpose(1, 0).reshape(&[K, B * H, -1]);
         let attention_probs_reshaped = attention_probs.f_view((B * H, Q, -1)).unwrap();
         let bmm = Tensor::bmm(&attention_probs_reshaped, &value_layer.transpose(0, 1));
-        // bmm.to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_bmm_context_layer_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
+        save_layer_to_disk(
+            &bmm,
+            &format!("rust_bmm_context_layer_{}.npy", self.real_layer_number,),
+        );
         debug("Bmm", &bmm);
         let context_layer_r = bmm.f_view((B, H, Q, -1)).unwrap();
         let context_layer_p = context_layer_r.permute(&[2, 0, 1, 3]).contiguous();
         let context = context_layer_p.f_view((Q, B, H * NH)).unwrap();
-        // context
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!(
-        //         "rust_bmm_context_layer2_{}.npy",
-        //         self.real_layer_number,
-        //     ))
-        //     .unwrap();
+        save_layer_to_disk(
+            &context,
+            &format!("rust_bmm_context_layer2_{}.npy", self.real_layer_number,),
+        );
         let output_tensor = if self.slow_but_exact {
             let slices = context.size().last().unwrap() / self.pretraining_tp;
             let mut output_tensor = Tensor::zeros_like(&context);
@@ -1077,23 +1056,20 @@ impl BloomAttention {
         } else {
             self.dense.forward(&context)
         };
-        // output_tensor
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!("rust_bmm_dense_{}.npy", self.real_layer_number,))
-        //     .unwrap();
-        // residual
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!("rust_bmm_residual_{}.npy", self.real_layer_number,))
-        //     .unwrap();
+        save_layer_to_disk(
+            &output_tensor,
+            &format!("rust_bmm_dense_{}.npy", self.real_layer_number,),
+        );
+        save_layer_to_disk(
+            &residual,
+            &format!("rust_bmm_residual_{}.npy", self.real_layer_number,),
+        );
         let mut output = output_tensor.transpose(1, 0);
         output += residual;
-        // output
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!("rust_bmm_dropout_{}.npy", self.real_layer_number,))
-        //     .unwrap();
+        save_layer_to_disk(
+            &output,
+            &format!("rust_bmm_dropout_{}.npy", self.real_layer_number,),
+        );
         output
     }
 }
@@ -1131,21 +1107,19 @@ impl BloomMlp {
     }
 
     fn forward(&self, hidden_states: &Tensor, residual: &Tensor) -> Tensor {
-        // hidden_states
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!("rust_mlp_init_{}.npy", self.real_layer_number,))
-        //     .unwrap();
+        save_layer_to_disk(
+            &hidden_states,
+            &format!("rust_mlp_init_{}.npy", self.real_layer_number,),
+        );
         debug("hidden_states", hidden_states);
         debug("INCOMING residual", residual);
         let hidden_states = self.dense_h_to_4h.forward(hidden_states);
         debug("hidden_states h to 4h", &hidden_states);
         let hidden_states = bloom_gelu(&hidden_states);
-        // hidden_states
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!("rust_mlp_gelu_{}.npy", self.real_layer_number,))
-        //     .unwrap();
+        save_layer_to_disk(
+            &hidden_states,
+            &format!("rust_mlp_gelu_{}.npy", self.real_layer_number,),
+        );
         debug("hidden_states gelu", &hidden_states);
         let hidden_states = if self.slow_but_exact {
             let mut intermediate_output = Tensor::zeros_like(&residual);
@@ -1167,11 +1141,10 @@ impl BloomMlp {
         debug("hidden_states 4h to h", &hidden_states);
         let hidden_states = hidden_states + residual;
         debug("hidden_states residual", &hidden_states);
-        // hidden_states
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy(&format!("rust_mlp_output_{}.npy", self.real_layer_number,))
-        //     .unwrap();
+        save_layer_to_disk(
+            &hidden_states,
+            &format!("rust_mlp_output_{}.npy", self.real_layer_number,),
+        );
         hidden_states
     }
 }
@@ -1291,6 +1264,14 @@ impl Embedding {
         debug("Embedding", &result);
         result
     }
+}
+
+fn save_layer_to_disk(tensor: &Tensor, filename: &str) {
+    tensor
+        .to_device(Device::Cpu)
+        .to_kind(kind::Kind::Float)
+        .write_npy(filename)
+        .unwrap();
 }
 
 fn debug_force(prefix: &str, x: &Tensor) {
@@ -2294,18 +2275,8 @@ mod tests {
             .to_device(device);
 
         let inputs_embeds = word_embeddings.forward(&input_ids);
-        // input_embeds
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy("rust_input_embeds.npy")
-        //     .unwrap();
 
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
-        // hidden_states
-        //     .to_device(Device::Cpu)
-        //     .to_kind(kind::Kind::Float)
-        //     .write_npy("rust_word_embeddings_layernorm.npy")
-        //     .unwrap();
     }
 
     #[test]
