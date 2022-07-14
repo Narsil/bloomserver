@@ -638,19 +638,23 @@ fn next_pow2(mut x: usize) -> usize {
     x |= x >> 8;
     x |= x >> 16;
     x |= x >> 32;
-    return x + 1;
+    return (x + 1) >> 1;
 }
 
 fn get_slopes(n: usize) -> Vec<f64> {
-    let is_power_of_2 = n == 0 || n & (n - 1) != 0;
+    let is_power_of_2 = n == 0 || n & (n - 1) == 0;
+    // println!("Slopes {:?}", n);
+    // println!("Is power {:?}", is_power_of_2);
+    // println!("Is power {:?}", n & (n - 1));
     if is_power_of_2 {
         return get_slopes_power_of_2(n);
     } else {
         let closest_power_of_2 = next_pow2(n);
+        // println!("Closest power of 2 {:?}", closest_power_of_2);
         return get_slopes_power_of_2(closest_power_of_2)
             .into_iter()
             .chain(
-                get_slopes(closest_power_of_2 >> 1)
+                get_slopes(closest_power_of_2 << 1)
                     .into_iter()
                     .step_by(2)
                     .take(n - closest_power_of_2),
@@ -666,6 +670,7 @@ fn build_alibi_tensor(
     device: Device,
 ) -> Tensor {
     let slopes = get_slopes(n_head as usize);
+    //println!("Slopes {:?}", slopes);
     let slopes = Tensor::of_slice(&slopes).to_kind(kind).to_device(device);
     // debug("slopes", &slopes);
     let A = attention_mask.f_cumsum(-1, kind).unwrap().unsqueeze(1) - 1;
@@ -1958,6 +1963,29 @@ mod tests {
                 .take(8)
                 .collect::<Vec<_>>(),
             vec![-0.0, -0.0, 0.0, 0.70703125, -0.0, -0.0, 0.0, 0.5]
+        );
+    }
+
+    #[test]
+    fn test_alibi2() {
+        // let config = Config::new();
+        let device = Device::Cuda(0);
+        let kind = kind::Kind::BFloat16;
+        let n_head = 5;
+        let attention_mask = Tensor::of_slice(&[1, 1, 1]).view((1, 3)).to_device(device);
+
+        assert_eq!(attention_mask.size(), vec![1, 3]);
+        let alibi = build_alibi_tensor(&attention_mask, n_head, kind, device);
+        assert_eq!(alibi.size(), vec![5, 1, 3]);
+        assert_eq!(
+            Vec::<f64>::from(alibi)
+                .into_iter()
+                .take(15)
+                .collect::<Vec<_>>(),
+            vec![
+                0.0, 0.25, 0.5, 0.0, 0.0625, 0.125, 0.0, 0.015625, 0.03125, 0.0, 0.00390625,
+                0.0078125, 0.0, 0.5, 1.0
+            ]
         );
     }
 
