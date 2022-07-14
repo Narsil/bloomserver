@@ -1987,6 +1987,24 @@ mod tests {
                 0.0078125, 0.0, 0.5, 1.0
             ]
         );
+
+        let attention_mask = Tensor::of_slice(&[1, 1, 1, 1])
+            .view((1, 4))
+            .to_device(device);
+
+        assert_eq!(attention_mask.size(), vec![1, 4]);
+        let alibi = build_alibi_tensor(&attention_mask, n_head, kind, device);
+        assert_eq!(alibi.size(), vec![5, 1, 4]);
+        assert_eq!(
+            Vec::<f64>::from(alibi)
+                .into_iter()
+                .take(20)
+                .collect::<Vec<_>>(),
+            vec![
+                0.0, 0.25, 0.5, 0.75, 0.0, 0.0625, 0.125, 0.1875, 0.0, 0.015625, 0.03125, 0.046875,
+                0.0, 0.00390625, 0.0078125, 0.01171875, 0.0, 0.5, 1.0, 1.5
+            ]
+        );
     }
 
     fn test_generate(
