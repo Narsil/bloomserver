@@ -671,7 +671,9 @@ fn build_alibi_tensor(
 ) -> Tensor {
     let slopes = get_slopes(n_head as usize);
     //println!("Slopes {:?}", slopes);
-    let slopes = Tensor::of_slice(&slopes).to_kind(kind).to_device(device);
+    let slopes = Tensor::of_slice(&slopes)
+        .to_kind(kind::Kind::Float)
+        .to_device(device);
     // debug("slopes", &slopes);
     let A = attention_mask.f_cumsum(-1, kind).unwrap().unsqueeze(1) - 1;
     // debug("A", &A);
@@ -2004,6 +2006,29 @@ mod tests {
                 0.0, 0.25, 0.5, 0.75, 0.0, 0.0625, 0.125, 0.1875, 0.0, 0.015625, 0.03125, 0.046875,
                 0.0, 0.00390625, 0.0078125, 0.01171875, 0.0, 0.5, 1.0, 1.5
             ]
+        );
+    }
+
+    #[test]
+    fn test_alibi3() {
+        // let config = Config::new();
+        let device = Device::Cuda(0);
+        let kind = kind::Kind::BFloat16;
+        let n_head = 112;
+        let attention_mask = Tensor::of_slice(&[1, 1, 1, 1, 1, 1, 1])
+            .view((1, 7))
+            .to_device(device);
+
+        assert_eq!(attention_mask.size(), vec![1, 7]);
+        let alibi = build_alibi_tensor(&attention_mask, n_head, kind, device);
+        assert_eq!(alibi.size(), vec![112, 1, 7]);
+        assert_eq!(
+            Vec::<f64>::from(alibi.i(0)).into_iter().collect::<Vec<_>>(),
+            vec![0., 0.91796875, 1.8359375, 2.75, 3.671875, 4.59375, 5.5]
+        );
+        assert_eq!(
+            Vec::<f64>::from(alibi.i(1)).into_iter().collect::<Vec<_>>(),
+            vec![0., 0.83984375, 1.6796875, 2.515625, 3.359375, 4.21875, 5.03125]
         );
     }
 
