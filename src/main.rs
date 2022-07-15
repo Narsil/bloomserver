@@ -37,7 +37,7 @@ impl Config {
             hidden_size: 14336,
             n_layer: 70,
             kind: kind::Kind::BFloat16,
-            slow_but_exact: true,
+            slow_but_exact: false,
             pretraining_tp: 4,
         }
     }
