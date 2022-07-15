@@ -671,6 +671,8 @@ fn build_alibi_tensor(
 ) -> Tensor {
     let slopes = get_slopes(n_head as usize);
     //println!("Slopes {:?}", slopes);
+
+    // IMPORTANT, use f32 for this tensor
     let slopes = Tensor::of_slice(&slopes)
         .to_kind(kind::Kind::Float)
         .to_device(device);
@@ -692,7 +694,9 @@ fn build_alibi_tensor(
     let batch_size = size[0];
     let seq_length = size[1];
     alibi = alibi.reshape(&[batch_size * n_head, 1, seq_length]);
-    // debug("alibi", &alibi);
+
+    // Cast back to what model expects
+    alibi = alibi.to_kind(kind);
     return alibi;
 }
 
@@ -2136,7 +2140,7 @@ mod tests {
         let input_sentence2 = "Hello my name is";
 
         let output = test_generate(&[input_sentence], &config, &tokenizer, &model, 43);
-        assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am a very good listener. I am a very good person, and I am a very good person. I am a");
+        assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
 
         let output = test_generate(&[input_sentence2], &config, &tokenizer, &model, 40);
         assert_eq!(output[0], "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good, very good, very good, very good, very good, very good, very good, very");
@@ -2149,7 +2153,7 @@ mod tests {
             43,
             // 21,
         );
-        assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am a very good listener. I am a very good person, and I am a very good person. I am a");
+        assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
         // TODO This is different from the single generation for some reason
         // This bug doesn't seem to exist on torch==1.11.0
         // **but** we need 1.12.0 for cumsum on bfloat16.
@@ -2236,7 +2240,6 @@ mod tests {
             .to_device(device),
         );
 
-        println!("Mean OK");
         assert_all_close(
             &embeddings.min_dim(-1, false).0,
             &Tensor::of_slice(&[
@@ -2256,7 +2259,6 @@ mod tests {
             .to_kind(config.kind)
             .to_device(device),
         );
-        println!("Min OK");
 
         assert_all_close(
             &embeddings.max_dim(-1, false).0,
