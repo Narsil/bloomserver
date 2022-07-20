@@ -115,7 +115,11 @@ pub fn build_alibi_tensor(
         .to_kind(Kind::Float)
         .to_device(device);
     // debug("slopes", &slopes);
-    let a = attention_mask.f_cumsum(-1, kind).unwrap().unsqueeze(1) - 1;
+    let a = attention_mask
+        .f_cumsum(-1, Kind::Float)
+        .unwrap()
+        .unsqueeze(1)
+        - 1;
     // debug("A", &A);
     let b = attention_mask.unsqueeze(1);
     // debug("B", &B);
@@ -945,6 +949,36 @@ pub mod tests {
         assert_eq!(
             Vec::<f64>::from(alibi.i(1)).into_iter().collect::<Vec<_>>(),
             vec![0., 0.83984375, 1.6796875, 2.515625, 3.359375, 4.21875, 5.03125]
+        );
+    }
+
+    #[test]
+    fn test_alibi4() {
+        // let config = Config::new();
+        let device = Device::Cuda(0);
+        let kind = Kind::BFloat16;
+        let n_head = 112;
+        let attention_mask = Tensor::of_slice(vec![1; 385].as_slice())
+            .view((1, 385))
+            .to_device(device);
+
+        assert_eq!(attention_mask.size(), vec![1, 385]);
+        let alibi = build_alibi_tensor(&attention_mask, n_head, kind, device);
+        assert_eq!(alibi.size(), vec![112, 1, 385]);
+        assert_eq!(
+            Vec::<f64>::from(alibi.i(0))
+                .into_iter()
+                .take(10)
+                .collect::<Vec<_>>(),
+            vec![0., 0.91796875, 1.8359375, 2.75, 3.671875, 4.59375, 5.5, 6.40625, 7.34375, 8.25]
+        );
+        // Still first row but towards the end
+        assert_eq!(
+            Vec::<f64>::from(alibi.i(0))
+                .into_iter()
+                .skip(375)
+                .collect::<Vec<_>>(),
+            vec![344., 344., 346., 346., 348., 348., 350., 350., 352., 352.]
         );
     }
 
