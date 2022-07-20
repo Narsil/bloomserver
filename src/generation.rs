@@ -2,7 +2,7 @@ use crate::model::{build_alibi_tensor, Config, Past};
 use serde::{Deserialize, Serialize};
 use tch::{kind, Device, IndexOp, Tensor};
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct Sampling {
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
@@ -10,7 +10,7 @@ pub struct Sampling {
     pub temperature: f64,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct BeamSearch {
     pub num_beams: usize,
 }
@@ -19,17 +19,17 @@ pub fn default_temperature() -> f64 {
     1.0
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct Greedy {}
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum GenerationMode {
     BeamSearch(BeamSearch),
     Sampling(Sampling),
     Greedy,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(try_from = "IntermediateParameters")]
 pub struct Parameters {
     pub generation_mode: GenerationMode,
@@ -284,8 +284,9 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
 
     let total = std::cmp::max(1, batch_size as usize * max_length as usize);
     println!(
-        "Running on batch of size {:?} - Fillrate {:?}%",
+        "Running on batch of size, seq_length[{:?}, {:?}] - Fillrate {:?}%",
         batch_size,
+        max_length,
         (total_ids * 100) / total
     );
     (all_input_ids, attention_mask, alibi, past_key_values)

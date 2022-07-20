@@ -301,6 +301,7 @@ dependencies = [
  "crossbeam-channel",
  "env_logger",
  "futures",
+ "log",
  "memmap",
  "once_cell",
  "safetensors",

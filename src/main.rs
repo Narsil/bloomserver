@@ -1,8 +1,10 @@
 use actix_web::middleware::Logger;
 use actix_web::{http::header::ContentType, post, web, App, HttpResponse, HttpServer};
 use crossbeam_channel::{bounded, unbounded, Sender};
+use log::info;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Instant;
 use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
@@ -24,6 +26,9 @@ async fn generate(
     payload: web::Json<Generation>,
     state: web::Data<AppState>,
 ) -> actix_web::Result<HttpResponse> {
+    let start = Instant::now();
+    let input_string = payload.inputs.clone();
+    let parameters = payload.parameters.clone();
     let string = actix_web::rt::task::spawn_blocking(move || -> Result<String, GenerationError> {
         let state = state.into_inner();
         let encoded = state
@@ -35,6 +40,14 @@ async fn generate(
         if ids.is_empty() {
             ids.push(0);
         }
+
+        if ids.len() > 128 {
+            return Err(GenerationError::InputTooLong);
+        }
+        if payload.parameters.max_new_tokens > 64 {
+            return Err(GenerationError::TooManyNewTokens);
+        }
+
         let (sx, rx) = bounded::<(Tensor, Past)>(2);
         let kind = (kind::Kind::Int64, Device::Cuda(0));
         let mut input_ids = Tensor::of_slice(ids.as_slice())
@@ -70,11 +83,22 @@ async fn generate(
             .unwrap()
             .map(|i| i as u32)
             .collect();
-        let string = state.tokenizer.decode(full_ids, false).unwrap();
+        let string = state.tokenizer.decode(full_ids, true).unwrap();
         Ok(string)
     })
     .await
     .unwrap()?;
+    info!(
+        r#"Ran query with:
+    input: {:?}
+    parameters {:?}
+    output {:?}
+    ran in {:?}"#,
+        input_string,
+        parameters,
+        string,
+        start.elapsed()
+    );
     Ok(HttpResponse::Ok()
         .content_type(ContentType::json())
         .json(json!([{ "generated_text": string }])))

@@ -23,14 +23,22 @@ pub struct Generation {
 
 #[derive(Error, Debug)]
 pub enum GenerationError {
-    #[error("Queue is full")]
+    #[error("{{\"error\": \"Queue is full\"}}")]
     QueueFull,
+    #[error(
+        "{{\"error\": \"Input is too long (128 tokens). We're disabling long prompts temporarily\"}}"
+    )]
+    InputTooLong,
+    #[error("{{\"error\": \"We can't generate more than 64 tokens at a time. We're disabling long generations temporarily\"}}")]
+    TooManyNewTokens,
 }
 
 impl ResponseError for GenerationError {
     fn status_code(&self) -> StatusCode {
         match self {
             GenerationError::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
+            GenerationError::InputTooLong => StatusCode::BAD_REQUEST,
+            GenerationError::TooManyNewTokens => StatusCode::BAD_REQUEST,
         }
     }
 }
