@@ -7,20 +7,13 @@ mod test;
 pub mod utils;
 
 use crate::model::{Config, Past};
-use actix_web::{
-    http::header::ContentType, http::StatusCode, post, web, HttpResponse, ResponseError,
-};
-use crossbeam_channel::{bounded, Sender};
+use actix_web::{http::StatusCode, ResponseError};
 use safetensors::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Arc;
-use tch::{kind, Device, IndexOp, Tensor};
+use tch::{kind, Device, Tensor};
 use thiserror::Error;
-use tokenizers::Tokenizer;
 
-use crate::generation::{add_next_id, Parameters};
-use crate::layout::Msg;
+use crate::generation::Parameters;
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Generation {
     pub inputs: String,

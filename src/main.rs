@@ -1,18 +1,12 @@
 use actix_web::middleware::Logger;
-use actix_web::{
-    http::header::ContentType, http::StatusCode, post, web, App, HttpResponse, HttpServer,
-    ResponseError,
-};
+use actix_web::{http::header::ContentType, post, web, App, HttpResponse, HttpServer};
 use crossbeam_channel::{bounded, unbounded, Sender};
-use safetensors::{Dtype, TensorView};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tch::{kind, Device, IndexOp, Tensor};
-use thiserror::Error;
 use tokenizers::Tokenizer;
 
-use bloomserver::generation::{add_next_id, Parameters};
+use bloomserver::generation::add_next_id;
 use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
 use bloomserver::model::{Config, Past};
 use bloomserver::{empty_past, Generation, GenerationError};

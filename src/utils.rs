@@ -36,7 +36,7 @@ pub fn debug(prefix: &str, x: &Tensor) {
 }
 pub fn save_layer_to_disk(tensor: &Tensor, filename: &str) {
     if SAVE {
-        let step = std::env::var("GENERATION_STEP").unwrap_or("nostep".to_string());
+        let step = std::env::var("GENERATION_STEP").unwrap_or_else(|_| "nostep".to_string());
         tensor
             .to_device(Device::Cpu)
             .to_kind(Kind::Float)

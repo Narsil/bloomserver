@@ -3,7 +3,8 @@ use crate::generation::padding;
 use crate::model::build_alibi_tensor;
 use crate::model::tests::{BLOOM_350M, BLOOM_TESTING};
 use crate::model::BloomForCausalLM;
-use tch::Tensor;
+use tch::{IndexOp, Tensor};
+use tokenizers::Tokenizer;
 
 pub fn assert_all_close(left: &Tensor, right: &Tensor) {
     if !left.allclose(right, 1e-7, 1e-7, false) {

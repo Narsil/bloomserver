@@ -76,6 +76,12 @@ impl LayoutConfig {
         }
     }
 }
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub fn padding_with_ack(
     config: &Config,
     items: Vec<(Tensor, Past, Ack)>,
@@ -259,7 +265,6 @@ pub fn thread2(
         //     start.elapsed()
         // );
 
-        let start = Instant::now();
         while let Ok(item) = rx.recv_timeout(Duration::from_millis(0)) {
             all_items.push(item);
         }
