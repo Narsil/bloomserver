@@ -167,19 +167,9 @@ pub fn thread1(
 
         let now = Instant::now();
         let deadline = std::cmp::max(
-            last_loop + Duration::from_millis(10),
+            last_loop + Duration::from_millis(20),
             now + Duration::from_millis(1),
         );
-        // let deadline = now + Duration::from_millis(1);
-        while let Ok(item) = prio_rx.recv_deadline(deadline) {
-            all_items.push(item);
-        }
-
-        if all_items.len() < max_batch_size {
-            while let Ok(item) = rx.recv_deadline(deadline) {
-                all_items.push(item);
-            }
-        }
 
         while let Ok(oper) = sel.select_deadline(deadline) {
             match oper.index() {
@@ -190,6 +180,9 @@ pub fn thread1(
                     all_items.push(oper.recv(&prio_rx).unwrap());
                 }
                 _ => unreachable!(),
+            }
+            if all_items.len() >= max_batch_size {
+                break;
             }
         }
         // let start = Instant::now();
@@ -261,16 +254,13 @@ pub fn thread2(
         // println!("start loop  thread {thread_number}");
         // let start = Instant::now();
         let mut all_items = vec![rx.recv().unwrap()];
-        // if start.elapsed() > Duration::from_millis(200) {
-        //     println!(
-        //         "Got stuck on RECEIVE thread {thread_number} for {:?}",
-        //         start.elapsed()
-        //     );
-        // }
+        // println!(
+        //     "Got stuck on RECEIVE thread {thread_number} for {:?}",
+        //     start.elapsed()
+        // );
 
         let start = Instant::now();
-        let deadline = start + Duration::from_millis(1);
-        while let Ok(item) = rx.recv_deadline(deadline) {
+        while let Ok(item) = rx.recv_timeout(Duration::from_millis(0)) {
             all_items.push(item);
         }
         all_items.sort_by(|a, b| {
@@ -298,15 +288,8 @@ pub fn thread2(
             //     start.elapsed(),
             //     hidden_states.size()[0]
             // );
-            let start = Instant::now();
             s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
                 .unwrap();
-            if start.elapsed() > Duration::from_millis(200) {
-                println!(
-                    "Got stuck on SEND thread {thread_number} for {:?}",
-                    start.elapsed()
-                );
-            }
         }
     }
 }

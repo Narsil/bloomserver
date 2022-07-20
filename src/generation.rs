@@ -232,13 +232,13 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let mut all_input_ids = Tensor::zeros(&[batch_size, max_length], kind2) + config.padding_idx;
     let mut attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
 
-    // let mut total_ids = 0;
+    let mut total_ids = 0;
 
     let mut current_batch = 0;
     for (input_ids, _past_key_values) in items {
         let seq_length = input_ids.size()[1];
         let mini_batch_size = input_ids.size()[0];
-        // total_ids += mini_batch_size as usize * seq_length as usize;
+        total_ids += mini_batch_size as usize * seq_length as usize;
         // all_input_ids[i:i+mini_batch_size, max_length - seq_length:seq_length] =
         // input_ids
 
@@ -282,14 +282,12 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
-    // let total = std::cmp::max(1, batch_size as usize * max_length as usize);
-    // if batch_size > 4 {
-    //     println!(
-    //         "Running on batch of size {:?} - Fillrate {:?}%",
-    //         batch_size,
-    //         (total_ids * 100) / total
-    //     );
-    // }
+    let total = std::cmp::max(1, batch_size as usize * max_length as usize);
+    println!(
+        "Running on batch of size {:?} - Fillrate {:?}%",
+        batch_size,
+        (total_ids * 100) / total
+    );
     (all_input_ids, attention_mask, alibi, past_key_values)
 }
 

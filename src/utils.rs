@@ -1,6 +1,7 @@
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 const DEBUG: bool = false;
+const SAVE: bool = false;
 
 pub fn debug_force(prefix: &str, x: &Tensor) {
     let size = x.size();
@@ -34,9 +35,12 @@ pub fn debug(prefix: &str, x: &Tensor) {
     }
 }
 pub fn save_layer_to_disk(tensor: &Tensor, filename: &str) {
-    tensor
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Float)
-        .write_npy(filename)
-        .unwrap();
+    if SAVE {
+        let step = std::env::var("GENERATION_STEP").unwrap_or("nostep".to_string());
+        tensor
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Float)
+            .write_npy(&format!("{}_{}", step, filename))
+            .unwrap();
+    }
 }

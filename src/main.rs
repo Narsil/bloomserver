@@ -1,12 +1,3 @@
-#![feature(async_closure)]
-mod generation;
-mod layout;
-pub mod model;
-#[cfg(test)]
-mod test;
-pub mod utils;
-
-use crate::model::{Config, Past};
 use actix_web::middleware::Logger;
 use actix_web::{
     http::header::ContentType, http::StatusCode, post, web, App, HttpResponse, HttpServer,
@@ -21,96 +12,10 @@ use tch::{kind, Device, IndexOp, Tensor};
 use thiserror::Error;
 use tokenizers::Tokenizer;
 
-use crate::generation::{add_next_id, Parameters};
-use crate::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-pub struct Generation {
-    inputs: String,
-    #[serde(default)]
-    parameters: Parameters,
-}
-
-#[derive(Error, Debug)]
-pub enum GenerationError {
-    #[error("Queue is full")]
-    QueueFull,
-}
-
-impl ResponseError for GenerationError {
-    fn status_code(&self) -> StatusCode {
-        match self {
-            GenerationError::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
-        }
-    }
-}
-
-pub fn empty_past(config: &Config) -> Past {
-    let kind = (config.kind, Device::Cuda(0));
-    let p = config.n_head;
-    let q = config.hidden_size / config.n_head;
-    let past_key = Tensor::zeros(&[1, 0, p, q], kind);
-    let past_value = Tensor::zeros(&[1, 0, p, q], kind);
-    let past_key_values: Vec<_> = (0..config.n_layer)
-        .map(|_| (past_key.copy(), past_value.copy()))
-        .collect();
-    past_key_values
-}
-
-#[post("/generate")]
-async fn generate(
-    payload: web::Json<Generation>,
-    state: web::Data<AppState>,
-) -> actix_web::Result<HttpResponse> {
-    let state = state.into_inner();
-    let encoded = state
-        .tokenizer
-        .encode(payload.inputs.clone(), false)
-        .unwrap();
-    let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
-    // TODO The model is not able to handle empty input ids
-    if ids.is_empty() {
-        ids.push(0);
-    }
-    let (sx, rx) = bounded::<(Tensor, Past)>(2);
-    let kind = (kind::Kind::Int64, Device::Cuda(0));
-    let mut input_ids = Tensor::of_slice(ids.as_slice())
-        .to_kind(kind.0)
-        .to_device(kind.1)
-        .view((1, -1));
-    let max_new_tokens = payload.parameters.max_new_tokens;
-
-    for i in 0..max_new_tokens {
-        // let start_loop = Instant::now();
-        let ack = (input_ids.size()[0], sx.clone());
-        let past_key_values = empty_past(&state.config);
-        if i == 0 {
-            state
-                .in_channel
-                .try_send((input_ids.copy(), past_key_values, ack))
-                .map_err(|_| {
-                    // println!("Queue was full {:?}", state.in_channel.len());
-                    GenerationError::QueueFull
-                })?;
-        } else {
-            state
-                .prio_channel
-                .send((input_ids.copy(), past_key_values, ack))
-                .expect("This send should always work");
-        }
-        let (logits, _r_past_key_values) = rx.recv().unwrap();
-        input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
-    }
-    let full_ids = input_ids
-        .i((0,))
-        .iter::<i64>()
-        .unwrap()
-        .map(|i| i as u32)
-        .collect();
-    let string = state.tokenizer.decode(full_ids, false).unwrap();
-    Ok(HttpResponse::Ok()
-        .content_type(ContentType::json())
-        .json(json!([{ "generated_text": string }])))
-}
+use bloomserver::generation::{add_next_id, Parameters};
+use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
+use bloomserver::model::{Config, Past};
+use bloomserver::{empty_past, Generation, GenerationError};
 
 #[derive(Clone)]
 struct AppState {
@@ -120,27 +25,66 @@ struct AppState {
     config: Config,
 }
 
-pub fn convert(view: TensorView, device: Device) -> Tensor {
-    let kind = match view.get_dtype() {
-        Dtype::F16 => kind::Kind::Half,
-        Dtype::BF16 => kind::Kind::BFloat16,
-        _ => {
-            todo!("Need to implement that");
+#[post("/generate")]
+async fn generate(
+    payload: web::Json<Generation>,
+    state: web::Data<AppState>,
+) -> actix_web::Result<HttpResponse> {
+    let string = actix_web::rt::task::spawn_blocking(move || -> Result<String, GenerationError> {
+        let state = state.into_inner();
+        let encoded = state
+            .tokenizer
+            .encode(payload.inputs.clone(), false)
+            .unwrap();
+        let mut ids: Vec<_> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+        // TODO The model is not able to handle empty input ids
+        if ids.is_empty() {
+            ids.push(0);
         }
-    };
-    let t = Tensor::of_data_size(
-        view.get_data(),
-        &view
-            .get_shape()
-            .iter()
-            .map(|i| *i as i64)
-            .collect::<Vec<_>>(),
-        kind,
-    )
-    .to_device(device);
-    t
-}
+        let (sx, rx) = bounded::<(Tensor, Past)>(2);
+        let kind = (kind::Kind::Int64, Device::Cuda(0));
+        let mut input_ids = Tensor::of_slice(ids.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1)
+            .view((1, -1));
+        let max_new_tokens = payload.parameters.max_new_tokens;
 
+        for i in 0..max_new_tokens {
+            // let start_loop = Instant::now();
+            let ack = (input_ids.size()[0], sx.clone());
+            let past_key_values = empty_past(&state.config);
+            if i == 0 {
+                state
+                    .in_channel
+                    .try_send((input_ids.copy(), past_key_values, ack))
+                    .map_err(|_| {
+                        // println!("Queue was full {:?}", state.in_channel.len());
+                        GenerationError::QueueFull
+                    })?;
+            } else {
+                state
+                    .prio_channel
+                    .send((input_ids.copy(), past_key_values, ack))
+                    .expect("This send should always work");
+            }
+            let (logits, _r_past_key_values) = rx.recv().unwrap();
+            input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
+        }
+        let full_ids = input_ids
+            .i((0,))
+            .iter::<i64>()
+            .unwrap()
+            .map(|i| i as u32)
+            .collect();
+        let string = state.tokenizer.decode(full_ids, false).unwrap();
+        Ok(string)
+    })
+    .await
+    .unwrap()?;
+    Ok(HttpResponse::Ok()
+        .content_type(ContentType::json())
+        .json(json!([{ "generated_text": string }])))
+}
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
