@@ -41,10 +41,10 @@ async fn generate(
             ids.push(0);
         }
 
-        if ids.len() > 128 {
+        if ids.len() > 512 {
             return Err(GenerationError::InputTooLong);
         }
-        if payload.parameters.max_new_tokens > 64 {
+        if payload.parameters.max_new_tokens > 384 {
             return Err(GenerationError::TooManyNewTokens);
         }
 
