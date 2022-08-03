@@ -237,20 +237,11 @@ fn attention_mask_func(
     let n_heads = attention_scores.size()[1];
 
     let a_attention_mask_bool = attention_mask_bool.unsqueeze(1).unsqueeze(-1);
-    let size = a_attention_mask_bool.size();
-    let a_attention_mask_bool = a_attention_mask_bool.i((
-        0..size[0],
-        0..size[1],
-        key_length - query_length..key_length,
-    ));
+    let a_attention_mask_bool =
+        a_attention_mask_bool.i((.., .., key_length - query_length..key_length));
     let b_causal_mask = causal_mask.f_logical_not().unwrap();
 
-    let size = b_causal_mask.size();
-    let b_causal_mask = b_causal_mask.i((
-        0..size[0],
-        0..size[1],
-        key_length - query_length..key_length,
-    ));
+    let b_causal_mask = b_causal_mask.i((.., .., key_length - query_length..key_length));
     debug("A attention_mask_bool", &a_attention_mask_bool);
     debug("b causal mask", &b_causal_mask);
     let mut padded_causal_mask = a_attention_mask_bool.f_logical_or(&b_causal_mask).unwrap();
@@ -380,7 +371,7 @@ impl BloomAttention {
         residual: &Tensor,
         attention_mask: &Tensor,
         alibi: &Tensor,
-        _layer_past: &mut PastLayer,
+        layer_past: &mut PastLayer,
     ) -> Tensor {
         let layer_number = self.layer_number;
         let mut mixed_x_layer = self.query_key_value.forward(hidden_states);
@@ -400,14 +391,16 @@ impl BloomAttention {
             [query, key, value] => (query, key, value),
             _ => unreachable!(),
         };
-        // let (past_key, past_value) = layer_past;
+        let (past_key, past_value) = layer_past;
 
-        // let mut key_layer = Tensor::f_cat(&[past_key.as_ref(), key], 1).unwrap();
-        // let mut value_layer = Tensor::f_cat(&[past_value.as_ref(), value], 1).unwrap();
-        let mut key_layer = key.copy();
+        let device = key.device();
+        let mut key_layer =
+            Tensor::f_cat(&[past_key.as_ref().to_device(device), key.copy()], 1).unwrap();
+        let value_layer =
+            Tensor::f_cat(&[past_value.as_ref().to_device(device), value.copy()], 1).unwrap();
 
         // Update past for next loops
-        // *layer_past = (key_layer.copy(), value_layer.copy());
+        *layer_past = (key_layer.copy(), value_layer.copy());
 
         let batch_size = query.size()[0];
         let n_head = query.size()[2];
@@ -424,8 +417,7 @@ impl BloomAttention {
             .reshape(&[key_length, batch_size * n_head, -1]);
 
         // let sliced_alibi = alibi[: output_size[0] * output_size[1], :, : output_size[3]]
-        let size = alibi.size();
-        let sliced_alibi = alibi.i((0..batch_size * n_head, 0..size[1], 0..key_length));
+        let sliced_alibi = alibi.i((0..batch_size * n_head, .., 0..key_length));
         let beta = 1.0 / (self.layer_number as f64);
         let alpha = 1.0 / self.norm_factor;
 
@@ -480,9 +472,10 @@ impl BloomAttention {
                 self.real_layer_number,
             ),
         );
-        let value_layer = value
-            .transpose(1, 0)
-            .reshape(&[key_length, batch_size * n_head, -1]);
+        let value_layer =
+            value_layer
+                .transpose(1, 0)
+                .reshape(&[key_length, batch_size * n_head, -1]);
         let attention_probs_reshaped = attention_probs
             .f_view((batch_size * n_head, query_length, -1))
             .unwrap();
@@ -992,8 +985,8 @@ pub mod tests {
         let q = config.hidden_size / config.n_head;
         let device = Device::Cuda(0);
         let kind = (config.kind, device);
-        let past_key = Tensor::zeros(&[1, 0, p, q], kind);
-        let past_value = Tensor::zeros(&[1, 0, p, q], kind);
+        let past_key = Tensor::zeros(&[2, 0, p, q], kind);
+        let past_value = Tensor::zeros(&[2, 0, p, q], kind);
         let mut past_key_values: Vec<_> = (0..config.n_layer)
             .map(|_| (past_key.copy(), past_value.copy()))
             .collect();

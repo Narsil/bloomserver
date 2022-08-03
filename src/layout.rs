@@ -255,6 +255,8 @@ pub fn thread2(
         std::time::Instant::now(),
         start.elapsed()
     );
+    let skip_past =
+        layout_config.layers_first_thread + layout_config.layers_per_thread * (thread_number - 1);
     loop {
         // Receive 1 item
         // println!("start loop  thread {thread_number}");
@@ -283,7 +285,10 @@ pub fn thread2(
             attention_mask = attention_mask.to_device(device);
             alibi = alibi.to_device(device);
 
-            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
+            for (layer, layer_past) in layers
+                .iter()
+                .zip(past_key_values.iter_mut().skip(skip_past))
+            {
                 debug("past_key thread2", &layer_past.0);
                 debug("past_values thread2", &layer_past.1);
                 hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
@@ -352,6 +357,9 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         start.elapsed()
     );
 
+    let skip_past = layout_config.layers_first_thread
+        + layout_config.layers_per_thread * layout_config.n_threads;
+
     loop {
         let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
             .recv()
@@ -360,7 +368,10 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
-        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
+        for (layer, layer_past) in layers
+            .iter()
+            .zip(past_key_values.iter_mut().skip(skip_past))
+        {
             debug("past_key thread3", &layer_past.0);
             debug("past_values thread3", &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
