@@ -6,7 +6,7 @@ pub mod model;
 mod test;
 pub mod utils;
 
-use crate::model::{Config, Past};
+pub use crate::model::{empty_past, non_empty_past};
 use actix_web::{http::StatusCode, ResponseError};
 use safetensors::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
@@ -41,18 +41,6 @@ impl ResponseError for GenerationError {
             GenerationError::TooManyNewTokens => StatusCode::BAD_REQUEST,
         }
     }
-}
-
-pub fn empty_past(config: &Config) -> Past {
-    let kind = (config.kind, Device::Cuda(0));
-    let p = config.n_head;
-    let q = config.hidden_size / config.n_head;
-    let past_key = Tensor::zeros(&[1, 0, p, q], kind);
-    let past_value = Tensor::zeros(&[1, 0, p, q], kind);
-    let past_key_values: Vec<_> = (0..config.n_layer)
-        .map(|_| (past_key.copy(), past_value.copy()))
-        .collect();
-    past_key_values
 }
 
 pub fn convert(view: TensorView, device: Device) -> Tensor {

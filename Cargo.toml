@@ -9,7 +9,7 @@ edition = "2021"
 actix-web = "4.1.0"
 env_logger = "0.9.0"
 serde = { version = "1.0.138", features = ["serde_derive"] }
-tch = { git = "https://github.com/Narsil/tch-rs", branch="support_optional_baddbmm_args" }
+tch = { git = "https://github.com/LaurentMazare/tch-rs" }
 tokenizers = { git = "https://github.com/huggingface/tokenizers" }
 tokio = { version = "1.19.2", features = ["sync"] }
 safetensors = { git = "https://github.com/Narsil/safetensors" }

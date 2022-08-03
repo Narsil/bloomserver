@@ -1,6 +1,7 @@
 use crate::model::{build_alibi_tensor, Config, Past};
+use crate::non_empty_past;
 use serde::{Deserialize, Serialize};
-use tch::{kind, Device, IndexOp, Tensor};
+use tch::{kind, IndexOp, Tensor};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct Sampling {
@@ -135,23 +136,20 @@ pub fn filter_top_p(scored_logits: &Tensor, top_p: f64) -> Tensor {
     // return scores
 }
 
-pub fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tensor {
+pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
     // TODO handle batching
     match &params.generation_mode {
         GenerationMode::Greedy => {
             let seq_length = logits.size()[1];
             let new_ids = logits
                 .i((0..1, seq_length - 1..seq_length))
-                .argmax(-1, false)
-                .to_device(input_ids.device());
-            Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
+                .argmax(-1, false);
+            new_ids
         }
         GenerationMode::Sampling(params) => {
             let seq_length = logits.size()[1];
             let filter_value = f64::NEG_INFINITY;
-            let last_logits = logits
-                .i((0, seq_length - 1..seq_length))
-                .to_device(input_ids.device());
+            let last_logits = logits.i((0, seq_length - 1..seq_length));
 
             let mut scored_logits = last_logits / params.temperature;
 
@@ -174,7 +172,7 @@ pub fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> 
 
             let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
             let new_ids = probs.f_multinomial(1, false).unwrap();
-            Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
+            new_ids
         }
         _ => todo!(),
         // Parameters::BeamSearch(params) => {
@@ -223,62 +221,104 @@ pub fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> 
 }
 
 pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
-    // TODO
-    let max_length = items.iter().map(|(ids, _)| ids.size()[1]).max().unwrap();
+    let (max_length_input_ids, max_length_past) = items
+        .iter()
+        .map(|(ids, past)| (ids.size()[1], past[0].seq_length()))
+        .max()
+        .unwrap();
+
+    match (max_length_input_ids, max_length_past){
+        (1, _) => (), // Past is used only 1 new input_id
+        (_, 0) => (), // No past is used
+        (n, m) => panic!("Padding can handle this situation but it's highly irregular so please fix your call input_ids length {n}, past_length {m}"),
+    }
+
+    let max_length = max_length_input_ids + max_length_past;
+
     let batch_size: i64 = items.iter().map(|(ids, _)| ids.size()[0]).sum::<i64>();
-    let kind = (kind::Kind::Int64, Device::Cuda(0));
     let device = items[0].0.device();
     let kind2 = (kind::Kind::Int64, device);
-    let mut all_input_ids = Tensor::zeros(&[batch_size, max_length], kind2) + config.padding_idx;
-    let mut attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
+    let all_input_ids =
+        Tensor::zeros(&[batch_size, max_length_input_ids], kind2) + config.padding_idx;
+
+    let mut all_past_key_values = non_empty_past(&config, batch_size, max_length_past, 0.0, 0.0);
+
+    let attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
 
     let mut total_ids = 0;
 
     let mut current_batch = 0;
-    for (input_ids, _past_key_values) in items {
+    for (input_ids, past_key_values) in items {
         let seq_length = input_ids.size()[1];
+        let past_seq_length = past_key_values[0].seq_length();
         let mini_batch_size = input_ids.size()[0];
-        total_ids += mini_batch_size as usize * seq_length as usize;
+        total_ids += mini_batch_size as usize * (seq_length + past_seq_length) as usize;
+
         // all_input_ids[i:i+mini_batch_size, max_length - seq_length:seq_length] =
         // input_ids
+        all_input_ids
+            .i((
+                current_batch..current_batch + mini_batch_size,
+                max_length_input_ids - seq_length..,
+            ))
+            .f_copy_(&input_ids)
+            .unwrap();
 
-        let mut batch_indices = vec![];
-        let mut id_indices = vec![];
-        for i in 0..mini_batch_size {
-            for j in 0..seq_length {
-                let batch_index = i + current_batch;
-                let id_index = j + max_length - seq_length;
-                batch_indices.push(batch_index);
-                id_indices.push(id_index);
+        _ = attention_mask
+            .i((
+                current_batch..current_batch + mini_batch_size,
+                max_length - seq_length..,
+            ))
+            .f_fill_(1)
+            .unwrap();
+
+        if max_length_past > 0 {
+            for (i, layer_past) in all_past_key_values.iter_mut().enumerate() {
+                let device = past_key_values[i].key.device();
+                if layer_past.key.device() != device {
+                    layer_past.key = layer_past.key.to_device(device);
+                    layer_past.value = layer_past.value.to_device(device);
+                }
+                // println!("layer past key {:?}", layer_past.key.size());
+                // println!("max past {:?}", max_length_past);
+                // println!("past_seq_length {:?}", past_seq_length);
+                // println!("key {:?}", past_key_values[i].key.size());
+                let start_batch_size_times_num_heads = current_batch * config.n_head;
+                let end_batch_size_times_num_heads = start_batch_size_times_num_heads + mini_batch_size * config.n_head;
+                layer_past
+                    .key
+                    .i((
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                        ..,
+                        max_length_past - past_seq_length..,
+                    ))
+                    .f_copy_(&past_key_values[i].key)
+                    .unwrap();
+
+                // println!("layer past value {:?}", layer_past.value.size());
+                // println!("max past {:?}", max_length_past);
+                // println!("past_seq_length {:?}", past_seq_length);
+                // println!("value {:?}", past_key_values[i].value.size());
+                layer_past
+                    .value
+                    .i((
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                        max_length_past - past_seq_length..,
+                    ))
+                    .f_copy_(&past_key_values[i].value)
+                    .unwrap();
             }
+            _ = attention_mask
+                .i((
+                    current_batch..current_batch + mini_batch_size,
+                    max_length_past - past_seq_length..max_length_past,
+                ))
+                .f_fill_(1)
+                .unwrap();
         }
-        let batch_index = Tensor::of_slice(batch_indices.as_slice())
-            .to_kind(kind.0)
-            .to_device(kind.1);
-        let id_index = Tensor::of_slice(id_indices.as_slice())
-            .to_kind(kind.0)
-            .to_device(kind.1);
 
-        // input_put requires 1-d tensor ?
-        let id_row = input_ids.view((-1,));
-        all_input_ids = all_input_ids
-            .f_index_put_(&[Some(&batch_index), Some(&id_index)], &id_row, false)
-            .unwrap();
-
-        let attn = input_ids.fill(1).view((-1,));
-        attention_mask = attention_mask
-            .f_index_put_(&[Some(&batch_index), Some(&id_index)], &attn, false)
-            .unwrap();
         current_batch += mini_batch_size;
     }
-
-    let p = config.n_head;
-    let q = config.hidden_size / config.n_head;
-    let past_key = Tensor::zeros(&[batch_size, 0, p, q], kind);
-    let past_value = Tensor::zeros(&[batch_size, 0, p, q], kind);
-    let past_key_values: Vec<_> = (0..config.n_layer)
-        .map(|_| (past_key.copy(), past_value.copy()))
-        .collect();
 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
@@ -289,12 +329,14 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
         max_length,
         (total_ids * 100) / total
     );
-    (all_input_ids, attention_mask, alibi, past_key_values)
+    (all_input_ids, attention_mask, alibi, all_past_key_values)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::empty_past;
+    use tch::Device;
 
     #[test]
     fn test_sampling_top_p() {
@@ -376,8 +418,8 @@ mod tests {
             .view((1, 6))
             .to_kind(kind::Kind::Int64)
             .to_device(device);
-        let past = vec![];
-        let past2 = vec![];
+        let past = empty_past(&config, 1);
+        let past2 = empty_past(&config, 1);
 
         let items = vec![(input_ids, past), (input_ids2, past2)];
 
@@ -387,6 +429,71 @@ mod tests {
         assert_eq!(
             Vec::<i64>::from(all_input_ids),
             vec![3, 3, 3, 3, 4, 5, 8, 1, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn test_padding_past() {
+        let config = Config::new350m();
+        let device = Device::Cuda(0);
+        let input_ids = Tensor::of_slice(&[3])
+            .view((1, 1))
+            .to_kind(kind::Kind::Int64)
+            .to_device(device);
+        let input_ids2 = Tensor::of_slice(&[8])
+            .view((1, 1))
+            .to_kind(kind::Kind::Int64)
+            .to_device(device);
+
+        // Batch_size=1, seq_length=4
+        let past = non_empty_past(&config, 1, 4, 3.0, 4.0);
+        let past2 = non_empty_past(&config, 1, 6, 5.0, 6.0);
+
+        let items = vec![(input_ids, past), (input_ids2, past2)];
+
+        let (all_input_ids, attention_mask, alibi, past_key_values) = padding(&config, items);
+
+        assert_eq!(all_input_ids.size(), vec![2, 1]);
+        assert_eq!(attention_mask.size(), vec![2, 7]);
+        assert_eq!(alibi.size(), vec![16 * 2, 1, 7]);
+        assert_eq!(past_key_values.len(), 24);
+        for i in 0..24 {
+            assert_eq!(
+                past_key_values[i].key.size(),
+                vec![2, 16, 64, 6],
+                "Layer {i}"
+            );
+            assert_eq!(
+                past_key_values[i].value.size(),
+                vec![2, 16, 6, 64],
+                "Layer {i}"
+            );
+        }
+
+        assert_eq!(Vec::<i64>::from(all_input_ids), vec![3, 8]);
+        assert_eq!(
+            Vec::<i64>::from(attention_mask.i(0)),
+            vec![0, 0, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            Vec::<i64>::from(attention_mask.i(1)),
+            vec![1, 1, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].key.i((0, ..1, ..1, ..))),
+            vec![0.0, 0.0, 3.0, 3.0, 3.0, 3.0]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].value.i((0, ..1, .., ..1))),
+            vec![0.0, 0.0, 4.0, 4.0, 4.0, 4.0]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].key.i((1, ..1, ..1, ..))),
+            vec![5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].value.i((1, ..1, .., ..1))),
+            vec![6.0, 6.0, 6.0, 6.0, 6.0, 6.0]
         );
     }
 }

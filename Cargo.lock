@@ -1995,7 +1995,7 @@ dependencies = [
 [[package]]
 name = "tch"
 version = "0.8.0"
-source = "git+https://github.com/Narsil/tch-rs?branch=support_optional_baddbmm_args#4a6d82a2cd553d59b35189ed6500c313d7b0b9eb"
+source = "git+https://github.com/LaurentMazare/tch-rs#2c2b4545966be04e8377ffa7f34fe01b9a20acd0"
 dependencies = [
  "half",
  "lazy_static",
@@ -2193,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "torch-sys"
 version = "0.8.0"
-source = "git+https://github.com/Narsil/tch-rs?branch=support_optional_baddbmm_args#4a6d82a2cd553d59b35189ed6500c313d7b0b9eb"
+source = "git+https://github.com/LaurentMazare/tch-rs#2c2b4545966be04e8377ffa7f34fe01b9a20acd0"
 dependencies = [
  "anyhow",
  "cc",

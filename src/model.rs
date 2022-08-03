@@ -3,7 +3,44 @@ use crate::utils::{debug, save_layer_to_disk};
 use safetensors::SafeTensors;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
-pub type PastLayer = (Tensor, Tensor);
+#[derive(Debug)]
+pub struct PastLayer {
+    pub key: Tensor,
+    pub value: Tensor,
+}
+
+impl PastLayer {
+    pub fn seq_length(&self) -> i64 {
+        return self.key.size()[2];
+    }
+}
+
+pub fn empty_past(config: &Config, batch_size: i64) -> Past {
+    non_empty_past(config, batch_size, 0, 0.0, 0.0)
+}
+
+pub fn non_empty_past(
+    config: &Config,
+    batch_size: i64,
+    length_past: i64,
+    key: f64,
+    value: f64,
+) -> Past {
+    let device = Device::Cuda(0);
+    let p = config.n_head;
+    let q = config.hidden_size / config.n_head;
+    let past_key_template =
+        Tensor::zeros(&[batch_size * p, q, length_past], (config.kind, device)) + key;
+    let past_value_template =
+        Tensor::zeros(&[batch_size * p, length_past, q], (config.kind, device)) + value;
+    let all_past_key_values = (0..config.n_layer as usize)
+        .map(|_| PastLayer {
+            key: past_key_template.copy(),
+            value: past_value_template.copy(),
+        })
+        .collect::<Vec<_>>();
+    all_past_key_values
+}
 pub type Past = Vec<PastLayer>;
 
 const PADDING_IDX: i64 = 3;
@@ -81,14 +118,10 @@ fn next_pow2(mut x: usize) -> usize {
 
 fn get_slopes(n: usize) -> Vec<f64> {
     let is_power_of_2 = n == 0 || n & (n - 1) == 0;
-    // println!("Slopes {:?}", n);
-    // println!("Is power {:?}", is_power_of_2);
-    // println!("Is power {:?}", n & (n - 1));
     if is_power_of_2 {
         get_slopes_power_of_2(n)
     } else {
         let closest_power_of_2 = next_pow2(n);
-        // println!("Closest power of 2 {:?}", closest_power_of_2);
         get_slopes_power_of_2(closest_power_of_2)
             .into_iter()
             .chain(
@@ -101,6 +134,107 @@ fn get_slopes(n: usize) -> Vec<f64> {
     }
 }
 
+/// Make causal mask used for self-attention.
+fn make_causal_mask(
+    input_ids_size: Vec<i64>,
+    device: Device,
+    past_key_values_length: i64,
+) -> Tensor {
+    // batch_size, target_length = input_ids_shape
+    let batch_size = input_ids_size[0];
+    let target_length = input_ids_size[1];
+    // mask = torch.empty((target_length, target_length + past_key_values_length), dtype=torch.bool, device=device)
+    let mask = Tensor::zeros(
+        &[target_length, target_length + past_key_values_length],
+        (Kind::Bool, device),
+    );
+    // # ONNX doesn't support `torch.Tensor.triu` properly, thus we use this workaround
+    // seq_ids = torch.arange(target_length, device=device)
+    let seq_ids = Tensor::arange(target_length, (Kind::Int, device));
+    // mask[:, past_key_values_length:] = seq_ids[:, None] < seq_ids[None, :]
+    let causal_mask = seq_ids
+        .unsqueeze(1)
+        .f_lt_tensor(&seq_ids.unsqueeze(0))
+        .unwrap();
+    _ = mask
+        .i((.., past_key_values_length..))
+        .f_copy_(&causal_mask)
+        .unwrap();
+
+    // if past_key_values_length > 0:
+    //     mask[:, :past_key_values_length] = False
+    if past_key_values_length > 0 {
+        _ = mask.i((.., ..past_key_values_length)).f_fill_(0).unwrap();
+    }
+
+    // expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
+    let expanded_mask = mask
+        .unsqueeze(0)
+        .f_expand(
+            &[
+                batch_size,
+                target_length,
+                target_length + past_key_values_length,
+            ],
+            true,
+        )
+        .unwrap();
+    // return expanded_mask
+    expanded_mask
+}
+
+/// Expands attention_mask from `[batch_size, src_length]` to `[batch_size, tgt_length, src_length]`.
+fn expand_mask(mask: &Tensor, tgt_length: i64) -> Tensor {
+    // batch_size, src_length = mask.shape
+    let batch_size = mask.size()[0];
+    let src_length = mask.size()[1];
+    // tgt_length = tgt_length if tgt_length is not None else src_length
+
+    // expanded_mask = ~(mask[:, None, :].to(torch.bool))
+    let expanded_mask = mask
+        .unsqueeze(1)
+        .to_kind(Kind::Bool)
+        // @TODO @thomas21: Make in-place
+        .f_logical_not()
+        .unwrap();
+    // return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
+    expanded_mask
+        .f_expand(&[batch_size, tgt_length, src_length], true)
+        .unwrap()
+}
+
+pub fn prepare_attn_mask(
+    attention_mask: &Tensor,
+    input_size: Vec<i64>,
+    past_key_values_length: i64,
+    num_attention_heads: i64,
+) -> Tensor {
+    let device = attention_mask.device();
+    // _, src_length = input_shape
+    let batch_size = input_size[0];
+    let src_length = input_size[1];
+
+    // [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
+    // expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
+    let expanded_attn_mask = expand_mask(attention_mask, src_length);
+    // combined_attention_mask = (
+    //     expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
+    // )
+    let combined_attention_mask = if src_length > 1 {
+        let causal_mask = make_causal_mask(input_size, device, past_key_values_length);
+        expanded_attn_mask.f_logical_or(&causal_mask).unwrap()
+    } else {
+        expanded_attn_mask
+    };
+
+    // [batch_size, seq_length] -> [batch_size * num_attention_heads, tgt_length, src_length]
+    let result = combined_attention_mask
+        .f_repeat_interleave_self_int(num_attention_heads, 0, batch_size * num_attention_heads)
+        .unwrap();
+
+    result
+}
+
 pub fn build_alibi_tensor(
     attention_mask: &Tensor,
     n_head: i64,
@@ -108,7 +242,6 @@ pub fn build_alibi_tensor(
     device: Device,
 ) -> Tensor {
     let slopes = get_slopes(n_head as usize);
-    //println!("Slopes {:?}", slopes);
 
     // IMPORTANT, use f32 for this tensor
     let slopes = Tensor::of_slice(&slopes)
@@ -142,6 +275,15 @@ pub fn build_alibi_tensor(
     alibi
 }
 
+fn finfo_min(kind: Kind) -> f64 {
+    match kind {
+        Kind::Float => f32::MIN as f64,
+        Kind::Half => -65504.0,
+        Kind::BFloat16 => -3.3028235e38, // TODO use real bfloat16 min if possible.
+        _ => todo!(),
+    }
+}
+
 pub struct LayerNorm {
     weight: Tensor,
     bias: Tensor,
@@ -172,12 +314,6 @@ impl LayerNorm {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Tensor {
-        // println!(
-        //     "Layer norm {:?} - {:?} - {:?}",
-        //     self.weight.size(),
-        //     self.bias.size(),
-        //     xs.size()
-        // );
         xs.f_layer_norm(
             &[self.hidden_size],
             Some(&self.weight),
@@ -189,6 +325,9 @@ impl LayerNorm {
     }
 }
 
+/// Different from usual Linear in order to remove transpose operation:
+/// weight: [in_features, out_features]
+/// bias: [out_features]
 pub struct Linear {
     weight: Tensor,
     bias: Tensor,
@@ -202,7 +341,7 @@ impl Linear {
                 .tensor(&tname)
                 .unwrap_or_else(|_| panic!("Could not find {tname}")),
             device,
-        );
+        ).f_transpose_copy(1,0).unwrap();
 
         let bias_name = format!("{name}.bias");
         let bias = convert(
@@ -216,114 +355,20 @@ impl Linear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Tensor {
-        xs.f_linear(&self.weight, Some(&self.bias)).unwrap()
-    }
-}
+        let in_features = self.weight.size()[0];
+        let out_features = self.weight.size()[1];
+        let mut out_size = xs.size();
+        if let Some(last) = out_size.last_mut() {
+            *last = out_features;
+        }
 
-fn attention_mask_func(
-    attention_scores: &mut Tensor,
-    attention_mask: &Tensor,
-    causal_mask: &Tensor,
-) -> (Tensor, Tensor) {
-    // TODO
-    debug("in attention_scores", attention_scores);
-    debug("in attention_mask", attention_mask);
-    debug("in causal_mask", causal_mask);
-    let attention_mask_bool = attention_mask.to_kind(Kind::Bool).f_logical_not().unwrap();
-    debug("not attention_mask", &attention_mask_bool);
+        let flatten_xs = xs.view((-1, in_features));
 
-    let query_length = attention_scores.size()[2];
-    let key_length = attention_scores.size()[3];
-    let n_heads = attention_scores.size()[1];
-
-    let a_attention_mask_bool = attention_mask_bool.unsqueeze(1).unsqueeze(-1);
-    let size = a_attention_mask_bool.size();
-    let a_attention_mask_bool = a_attention_mask_bool.i((
-        0..size[0],
-        0..size[1],
-        key_length - query_length..key_length,
-    ));
-    let b_causal_mask = causal_mask.f_logical_not().unwrap();
-
-    let size = b_causal_mask.size();
-    let b_causal_mask = b_causal_mask.i((
-        0..size[0],
-        0..size[1],
-        key_length - query_length..key_length,
-    ));
-    debug("A attention_mask_bool", &a_attention_mask_bool);
-    debug("b causal mask", &b_causal_mask);
-    let mut padded_causal_mask = a_attention_mask_bool.f_logical_or(&b_causal_mask).unwrap();
-    debug("padded causal_mask", &padded_causal_mask);
-    let size = attention_mask_bool.size();
-    let c_attention_mask_bool = &attention_mask_bool
-        .i((0..size[0], 0..key_length))
-        .unsqueeze(1)
-        .unsqueeze(1);
-    padded_causal_mask = padded_causal_mask
-        .f_logical_or(c_attention_mask_bool)
-        .unwrap();
-    // TODO
-    // padded_causal_mask = attention_mask_bool.logical_or(
-    //     attention_mask_bool[:, None, key_length - query_length : key_length, None],
-    //     ~causal_mask[:, :, key_length - query_length : key_length, :key_length].bool(),
-    // )
-    // padded_causal_mask = torch.logical_or(padded_causal_mask, attention_mask_bool[:, None, None, :key_length])
-    // (
-    //     attention_scores.masked_fill_(padded_causal_mask.expand(-1, n_heads, -1, -1), -10000.0),
-    //     padded_causal_mask,
-    // )
-    let masked_fill = &padded_causal_mask
-        .f_expand(&[-1, n_heads, -1, -1], true)
-        .unwrap();
-    debug("Masked fill", masked_fill);
-    let masked_output = attention_scores
-        .f_masked_fill_(masked_fill, -10000.0)
-        .unwrap();
-    debug("Masked output", &masked_output);
-    (masked_output, padded_causal_mask)
-}
-pub struct BloomScaledSoftmax {
-    scale: i64,
-    kind: Kind,
-}
-
-impl BloomScaledSoftmax {
-    pub fn new(scale: i64, kind: Kind) -> Self {
-        Self { scale, kind }
-    }
-
-    pub fn forward(&self, input: &Tensor, attention_mask: &Tensor, max_positions: i64) -> Tensor {
-        debug("input", input);
-        let mut scaled_input = self.scale * input;
-        debug("scaled input", &scaled_input);
-        let seq_ids = Tensor::f_arange(max_positions, (Kind::Int64, input.device())).unwrap();
-
-        let a = seq_ids.unsqueeze(0);
-        let b = seq_ids.unsqueeze(-1);
-        let causal_mask = a.f_le_tensor(&b).unwrap().to_kind(Kind::Bool).view((
-            1,
-            1,
-            max_positions,
-            max_positions,
-        ));
-
-        debug("Causal mask", &causal_mask);
-
-        // TODO Padded causal mask
-        let (mask_output, padded_causal_mask) =
-            attention_mask_func(&mut scaled_input, attention_mask, &causal_mask);
-        debug("mask output", &mask_output);
-
-        // TODO dtype float16 ?
-        let probs = mask_output.f_softmax(-1, Kind::Float).unwrap()
-            * padded_causal_mask.f_logical_not().unwrap();
-        debug("Probs", &probs);
-
-        let out_probs = probs.to_kind(self.kind);
-        debug("Out Probs", &out_probs);
-
-        out_probs
+        self.bias
+            .f_addmm(&flatten_xs, &self.weight)
+            .unwrap()
+            .f_view(out_size.as_slice())
+            .unwrap()
     }
 }
 
@@ -331,13 +376,10 @@ pub struct BloomAttention {
     dense: Linear,
     query_key_value: Linear,
     num_attention_heads: i64,
-    scaled_softmax: BloomScaledSoftmax,
     head_dim: i64,
     layer_number: usize,
     real_layer_number: usize,
     norm_factor: f64,
-    n_head: i64,
-    hidden_size: i64,
     pretraining_tp: i64,
     slow_but_exact: bool,
 }
@@ -356,8 +398,7 @@ impl BloomAttention {
         let num_attention_heads = config.n_head as i64;
         let real_layer_number = layer_number;
         let layer_number = std::cmp::max(1, layer_number);
-        let norm_factor = (head_dim as f64).sqrt() * layer_number as f64;
-        let scaled_softmax = BloomScaledSoftmax::new(layer_number as i64, config.kind);
+        let norm_factor = 1.0 / (head_dim as f64).sqrt();
         Self {
             dense,
             query_key_value,
@@ -366,9 +407,6 @@ impl BloomAttention {
             layer_number,
             real_layer_number,
             norm_factor,
-            scaled_softmax,
-            n_head: config.n_head as i64,
-            hidden_size: config.hidden_size as i64,
             slow_but_exact: config.slow_but_exact,
             pretraining_tp: config.pretraining_tp as i64,
         }
@@ -380,99 +418,99 @@ impl BloomAttention {
         residual: &Tensor,
         attention_mask: &Tensor,
         alibi: &Tensor,
-        _layer_past: &mut PastLayer,
+        layer_past: &mut PastLayer,
     ) -> Tensor {
         let layer_number = self.layer_number;
-        let mut mixed_x_layer = self.query_key_value.forward(hidden_states);
+        let mixed_x_layer = self.query_key_value.forward(hidden_states);
+        let (batch_size, q_length) = if let [batch_size, q_length,] = mixed_x_layer.size()[..2] { (batch_size, q_length) } else { todo!() };
         debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
-            mixed_x_layer.size()[0],
-            mixed_x_layer.size()[1],
+            batch_size,
+            q_length,
             self.num_attention_heads,
             3 * self.head_dim,
         ];
-        let layer_number = self.layer_number;
-        debug(&format!("Mixed x layer {layer_number}"), &mixed_x_layer);
-        mixed_x_layer = mixed_x_layer.f_view(new_tensor_shape).unwrap();
+        let mixed_x_layer_view = mixed_x_layer.f_view(new_tensor_shape).unwrap();
         // Split.
-        let tensor_list = mixed_x_layer.split(self.head_dim, 3);
+        let tensor_list = mixed_x_layer_view.split(self.head_dim, 3);
         let (query, key, value) = match &tensor_list[..] {
             [query, key, value] => (query, key, value),
             _ => unreachable!(),
         };
-        // let (past_key, past_value) = layer_past;
-
-        // let mut key_layer = Tensor::f_cat(&[past_key.as_ref(), key], 1).unwrap();
-        // let mut value_layer = Tensor::f_cat(&[past_value.as_ref(), value], 1).unwrap();
-        let mut key_layer = key.copy();
-
-        // Update past for next loops
-        // *layer_past = (key_layer.copy(), value_layer.copy());
-
-        let batch_size = query.size()[0];
-        let n_head = query.size()[2];
-        let query_length = query.size()[1];
-        let key_length = key_layer.size()[1];
-        let hidden_per_head = self.hidden_size / self.n_head;
-        let output_size = (batch_size, n_head, query_length, key_length);
 
         let query_layer = query
-            .transpose(1, 0)
-            .reshape(&[query_length, batch_size * n_head, -1]);
-        key_layer = key_layer
-            .transpose(1, 0)
-            .reshape(&[key_length, batch_size * n_head, -1]);
+            .transpose(1, 2)
+            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
+        let key_layer = key
+            .permute(&[0, 2, 3, 1])
+            .reshape(&[batch_size * self.num_attention_heads, self.head_dim, q_length]);
+        let value_layer = value
+            .transpose(1, 2)
+            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
 
-        // let sliced_alibi = alibi[: output_size[0] * output_size[1], :, : output_size[3]]
-        let size = alibi.size();
-        let sliced_alibi = alibi.i((0..batch_size * n_head, 0..size[1], 0..key_length));
-        let beta = 1.0 / (self.layer_number as f64);
-        let alpha = 1.0 / self.norm_factor;
-
-        let a = sliced_alibi;
-        let b = query_layer.transpose(1, 0);
-        let c = key_layer.transpose(1, 0).transpose(1, 2);
-        debug("Sliced alibi", &a);
-        debug("query layer", &b);
-        debug("key layer", &c);
+        // TODO @thomasw21: Figure out why we need to cast to device here.
+        let device = query_layer.device();
+        let key_layer = Tensor::f_cat(
+            &[&layer_past.key.to_device(device), &key_layer],
+            2,
+        )
+        .unwrap();
+        let value_layer = Tensor::f_cat(
+            &[&layer_past.value.to_device(device), &value_layer],
+            1,
+        )
+        .unwrap();
 
         save_layer_to_disk(
-            &a,
+            &alibi,
             &format!("rust_baddbmm_sliced_alibi_{}.npy", self.real_layer_number,),
         );
         save_layer_to_disk(
-            &b,
-            &format!("rust_baddbmm_query_layer_{}.npy", self.real_layer_number,),
-        );
-        save_layer_to_disk(
-            &c,
+            &key_layer,
             &format!("rust_baddbmm_key_layer_{}.npy", self.real_layer_number,),
         );
         save_layer_to_disk(
-            &Tensor::of_slice(&[beta]),
-            &format!("rust_baddbmm_beta_{}.npy", self.real_layer_number,),
+            &query_layer,
+            &format!("rust_baddbmm_query_layer_{}.npy", self.real_layer_number,),
         );
         save_layer_to_disk(
-            &Tensor::of_slice(&[alpha]),
-            &format!("rust_baddbmm_alpha_{}.npy", self.real_layer_number,),
+            &value_layer,
+            &format!("rust_baddbmm_value_layer_{}.npy", self.real_layer_number,),
         );
-        let matmul_result = a.f_baddbmm(&b, &c, beta, alpha).unwrap();
+
+        let mut attention_scores = alibi
+            .f_baddbmm_s(&query_layer, &key_layer, 1.0, self.norm_factor)
+            .unwrap();
 
         save_layer_to_disk(
-            &matmul_result,
+            &attention_scores,
             &format!("rust_baddbmm_matmul_result_{}.npy", self.real_layer_number,),
         );
 
-        let attention_scores = matmul_result.f_view(output_size).unwrap();
-        debug(
-            &format!("Attention baddbmm {layer_number}"),
+        // cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
+        let input_dtype = attention_scores.kind();
+        // `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
+        if input_dtype == Kind::Half {
+            attention_scores = attention_scores.to_kind(Kind::Float);
+        }
+
+        save_layer_to_disk(
             &attention_scores,
+            &format!(
+                "rust_softmax_attention_scores_{}.npy",
+                self.real_layer_number,
+            ),
         );
-        let shape = attention_scores.size();
-        let max_positions = std::cmp::max(shape[shape.len() - 1], shape[shape.len() - 2]);
-        let attention_probs =
-            self.scaled_softmax
-                .forward(&attention_scores, attention_mask, max_positions);
+        let attn_weights =
+            attention_scores.masked_fill_(&attention_mask, finfo_min(attention_scores.kind()));
+        save_layer_to_disk(
+            &attn_weights,
+            &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
+        );
+        let attention_probs = attn_weights
+            .f_softmax(-1, Kind::Float)
+            .unwrap()
+            .to_kind(input_dtype);
         save_layer_to_disk(
             &attention_probs,
             &format!(
@@ -480,28 +518,21 @@ impl BloomAttention {
                 self.real_layer_number,
             ),
         );
-        let value_layer = value
-            .transpose(1, 0)
-            .reshape(&[key_length, batch_size * n_head, -1]);
-        let attention_probs_reshaped = attention_probs
-            .f_view((batch_size * n_head, query_length, -1))
-            .unwrap();
-        let bmm = Tensor::bmm(&attention_probs_reshaped, &value_layer.transpose(0, 1));
+
         save_layer_to_disk(
-            &bmm,
-            &format!("rust_bmm_context_layer_{}.npy", self.real_layer_number,),
+            &value_layer,
+            &format!("rust_bmm_value_layer_{}.npy", self.real_layer_number,),
         );
-        debug("Bmm", &bmm);
-        let context_layer_r = bmm.f_view((batch_size, n_head, query_length, -1)).unwrap();
-        let context_layer_p = context_layer_r.permute(&[2, 0, 1, 3]).contiguous();
+        let context_layer = Tensor::f_bmm(&attention_probs, &value_layer).unwrap();
+
+        let context_layer_r = context_layer
+            .f_view((batch_size, self.num_attention_heads, q_length, self.head_dim))
+            .unwrap();
+        let context_layer_p = context_layer_r.permute(&[0, 2, 1, 3]).contiguous();
         let context = context_layer_p
-            .f_view((query_length, batch_size, n_head * hidden_per_head))
+            .f_view((batch_size, q_length, self.num_attention_heads * self.head_dim))
             .unwrap();
-        save_layer_to_disk(
-            &context,
-            &format!("rust_bmm_context_layer2_{}.npy", self.real_layer_number,),
-        );
-        let output_tensor = if self.slow_but_exact {
+        let mut output = if self.slow_but_exact {
             let slices = context.size().last().unwrap() / self.pretraining_tp;
             let mut output_tensor = Tensor::zeros_like(&context);
             for i in 0..self.pretraining_tp {
@@ -514,19 +545,25 @@ impl BloomAttention {
             self.dense.forward(&context)
         };
         save_layer_to_disk(
-            &output_tensor,
+            &output,
             &format!("rust_bmm_dense_{}.npy", self.real_layer_number,),
         );
         save_layer_to_disk(
             residual,
             &format!("rust_bmm_residual_{}.npy", self.real_layer_number,),
         );
-        let mut output = output_tensor.transpose(1, 0);
         output += residual;
         save_layer_to_disk(
             &output,
             &format!("rust_bmm_dropout_{}.npy", self.real_layer_number,),
         );
+
+        // update layer_past
+        *layer_past = PastLayer {
+            key: key_layer,
+            value: value_layer,
+        };
+
         output
     }
 }
@@ -539,6 +576,7 @@ pub struct BloomMlp {
     pretraining_tp: i64,
 }
 
+// TODO @thomasw21: Figure out how to compile this into a single operation.
 fn bloom_gelu(x: &Tensor) -> Tensor {
     let y: Tensor = 0.79788456 * x * (1.0 + 0.044715 * x * x);
     x * 0.5 * (1.0 + y.tanh())
@@ -578,7 +616,7 @@ impl BloomMlp {
             &format!("rust_mlp_gelu_{}.npy", self.real_layer_number,),
         );
         debug("hidden_states gelu", &hidden_states);
-        let hidden_states = if self.slow_but_exact {
+        let mut hidden_states = if self.slow_but_exact {
             let mut intermediate_output = Tensor::zeros_like(residual);
             let slices = self.dense_4h_to_h.weight.size().last().unwrap() / self.pretraining_tp;
             for i in 0..self.pretraining_tp {
@@ -595,7 +633,7 @@ impl BloomMlp {
             self.dense_4h_to_h.forward(&hidden_states)
         };
         debug("hidden_states 4h to h", &hidden_states);
-        let hidden_states = hidden_states + residual;
+        hidden_states += residual;
         debug("hidden_states residual", &hidden_states);
         save_layer_to_disk(
             &hidden_states,
@@ -727,6 +765,7 @@ pub struct BloomModel {
     pub word_embeddings_layernorm: LayerNorm,
     pub h: Vec<BloomBlock>,
     pub ln_f: LayerNorm,
+    num_heads: i64
 }
 
 impl BloomModel {
@@ -742,11 +781,13 @@ impl BloomModel {
         let h = (0..config.n_layer)
             .map(|i| BloomBlock::new(config, &format!("h.{i}"), model, i as usize, device))
             .collect();
+        let num_heads = config.n_head;
         Self {
             word_embeddings,
             word_embeddings_layernorm,
             h,
             ln_f,
+            num_heads
         }
     }
 
@@ -769,8 +810,15 @@ impl BloomModel {
 
         debug("Alibi", alibi);
 
+
+        let input_size = input_ids.size();
+        let past_key_values_length = past_key_values[0].seq_length();
+        let causal_mask = prepare_attn_mask(
+            &attention_mask, input_size, past_key_values_length, self.num_heads
+        );
+
         for (i, (block, layer_past)) in self.h.iter().zip(past_key_values.iter_mut()).enumerate() {
-            hidden_states = block.forward(&hidden_states, attention_mask, alibi, layer_past);
+            hidden_states = block.forward(&hidden_states, &causal_mask, alibi, layer_past);
             debug(&format!("Block {i}"), &hidden_states);
         }
         hidden_states = self.ln_f.forward(&hidden_states);
@@ -833,6 +881,7 @@ impl BloomForCausalLM {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::empty_past;
     use crate::test::assert_all_close;
     use memmap::MmapOptions;
     use once_cell::sync::Lazy;
@@ -845,7 +894,7 @@ pub mod tests {
 
     fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();
-        let file = std::fs::File::open("./bloom-350m.bin").unwrap();
+        let file = std::fs::File::open("./weights/bloom-350m.bin").unwrap();
         // SAFETY: This is actually unsafe.
         let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
         let model_file = SafeTensors::deserialize(&mmap).unwrap();
@@ -858,7 +907,7 @@ pub mod tests {
 
     fn bloom_testing() -> BloomForCausalLM {
         let config = Config::new_testing();
-        let file = std::fs::File::open("./bloom-testing.bin").unwrap();
+        let file = std::fs::File::open("./weights/bloom-testing.bin").unwrap();
         // SAFETY: This is actually unsafe.
         let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
         let model_file = SafeTensors::deserialize(&mmap).unwrap();
@@ -988,15 +1037,8 @@ pub mod tests {
         // First input is not full
         let model = BLOOM_350M.lock().unwrap();
         let config = Config::new350m();
-        let p = config.n_head;
-        let q = config.hidden_size / config.n_head;
         let device = Device::Cuda(0);
-        let kind = (config.kind, device);
-        let past_key = Tensor::zeros(&[1, 0, p, q], kind);
-        let past_value = Tensor::zeros(&[1, 0, p, q], kind);
-        let mut past_key_values: Vec<_> = (0..config.n_layer)
-            .map(|_| (past_key.copy(), past_value.copy()))
-            .collect();
+        let mut past_key_values = empty_past(&config, 2);
         let input_ids = Tensor::of_slice(&[2, 2, 34, 54, 132, 225, 532, 342])
             .view((2, 4))
             .to_device(Device::Cuda(0));
