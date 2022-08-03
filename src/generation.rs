@@ -135,23 +135,20 @@ pub fn filter_top_p(scored_logits: &Tensor, top_p: f64) -> Tensor {
     // return scores
 }
 
-pub fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> Tensor {
+pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
     // TODO handle batching
     match &params.generation_mode {
         GenerationMode::Greedy => {
             let seq_length = logits.size()[1];
             let new_ids = logits
                 .i((0..1, seq_length - 1..seq_length))
-                .argmax(-1, false)
-                .to_device(input_ids.device());
-            Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
+                .argmax(-1, false);
+            new_ids
         }
         GenerationMode::Sampling(params) => {
             let seq_length = logits.size()[1];
             let filter_value = f64::NEG_INFINITY;
-            let last_logits = logits
-                .i((0, seq_length - 1..seq_length))
-                .to_device(input_ids.device());
+            let last_logits = logits.i((0, seq_length - 1..seq_length));
 
             let mut scored_logits = last_logits / params.temperature;
 
@@ -174,7 +171,7 @@ pub fn add_next_id(input_ids: &Tensor, params: &Parameters, logits: &Tensor) -> 
 
             let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
             let new_ids = probs.f_multinomial(1, false).unwrap();
-            Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap()
+            new_ids
         }
         _ => todo!(),
         // Parameters::BeamSearch(params) => {

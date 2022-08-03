@@ -1,4 +1,4 @@
-use bloomserver::generation::{add_next_id, GenerationMode, Parameters};
+use bloomserver::generation::{next_ids, GenerationMode, Parameters};
 use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
 use bloomserver::model::{Config, Past};
 use bloomserver::{empty_past, Generation, GenerationError};
@@ -27,13 +27,15 @@ fn generate(
         .to_kind(kind.0)
         .to_device(kind.1)
         .view((1, -1));
+    let mut all_ids = input_ids.copy();
     let max_new_tokens = payload.parameters.max_new_tokens;
 
+    let mut past_key_values = empty_past(config);
     for i in 0..max_new_tokens {
         // let start_loop = Instant::now();
         let ack = (input_ids.size()[0], sx.clone());
-        let past_key_values = empty_past(config);
         std::env::set_var("GENERATION_STEP", i.to_string());
+        println!("Sending input_ids {:?}", input_ids);
         if i == 0 {
             in_channel
                 .try_send((input_ids.copy(), past_key_values, ack))
@@ -47,10 +49,15 @@ fn generate(
                 .send((input_ids.copy(), past_key_values, ack))
                 .expect("This send should always work");
         }
-        let (logits, _r_past_key_values) = rx.recv().unwrap();
-        input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
+        let received = rx.recv().unwrap();
+        let logits = received.0;
+        past_key_values = received.1;
+        let new_ids = next_ids(&payload.parameters, &logits).to_device(input_ids.device());
+        all_ids = Tensor::f_cat(&[all_ids, new_ids.copy()], 1).unwrap();
+        input_ids = new_ids;
+        println!("After loop input_ids {:?}", all_ids);
     }
-    let full_ids = input_ids
+    let full_ids = all_ids
         .i((0,))
         .iter::<i64>()
         .unwrap()

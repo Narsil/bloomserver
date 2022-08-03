@@ -8,7 +8,7 @@ use std::time::Instant;
 use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
-use bloomserver::generation::add_next_id;
+use bloomserver::generation::next_ids;
 use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
 use bloomserver::model::{Config, Past};
 use bloomserver::{empty_past, Generation, GenerationError};
@@ -56,10 +56,10 @@ async fn generate(
             .view((1, -1));
         let max_new_tokens = payload.parameters.max_new_tokens;
 
+        let mut past_key_values = empty_past(&state.config);
         for i in 0..max_new_tokens {
             // let start_loop = Instant::now();
             let ack = (input_ids.size()[0], sx.clone());
-            let past_key_values = empty_past(&state.config);
             if i == 0 {
                 state
                     .in_channel
@@ -74,10 +74,14 @@ async fn generate(
                     .send((input_ids.copy(), past_key_values, ack))
                     .expect("This send should always work");
             }
-            let (logits, _r_past_key_values) = rx.recv().unwrap();
-            input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
+            let received = rx.recv().unwrap();
+            let logits = received.0;
+            past_key_values = received.1;
+            let new_ids = next_ids(&payload.parameters, &logits).to_device(input_ids.device());
+            all_ids = Tensor::f_cat(&[all_ids, new_ids], 1).unwrap();
+            input_ids = new_ids;
         }
-        let full_ids = input_ids
+        let full_ids = all_ids
             .i((0,))
             .iter::<i64>()
             .unwrap()
