@@ -13,6 +13,7 @@ pub type Ack = (i64, Sender<(Tensor, Past)>);
 pub type Msg = (Tensor, Past, Ack);
 pub type Msg2 = ((Tensor, Tensor, Tensor, Past), Vec<Ack>);
 pub type RChan1 = Receiver<Msg>;
+pub type SChan1 = Sender<Msg>;
 pub type RChan = Receiver<Msg2>;
 pub type SChan = Sender<Msg2>;
 
@@ -34,9 +35,9 @@ impl LayoutConfig {
             layers_per_thread: 5,
             layers_last_thread: 0,
             n_threads: 14,
-            embeddings_filename: "./bloom-embedding.bin".to_string(),
-            final_filename: "./bloom-final.bin".to_string(),
-            layer_template_filename: "./bloom-h.{}.bin".to_string(),
+            embeddings_filename: "./weights/bloom-embedding.bin".to_string(),
+            final_filename: "./weights/bloom-final.bin".to_string(),
+            layer_template_filename: "./weights/bloom-h.{}.bin".to_string(),
         }
     }
 
@@ -46,9 +47,9 @@ impl LayoutConfig {
             layers_per_thread: 1,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-testing.bin".to_string(),
-            final_filename: "./bloom-testing.bin".to_string(),
-            layer_template_filename: "./bloom-testing.bin".to_string(),
+            embeddings_filename: "./weights/bloom-testing.bin".to_string(),
+            final_filename: "./weights/bloom-testing.bin".to_string(),
+            layer_template_filename: "./weights/bloom-testing.bin".to_string(),
         }
     }
 
@@ -58,9 +59,9 @@ impl LayoutConfig {
             layers_per_thread: 5,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-embedding.bin".to_string(),
-            final_filename: "./bloom-final.bin".to_string(),
-            layer_template_filename: "./bloom-h.1.bin".to_string(),
+            embeddings_filename: "./weights/bloom-embedding.bin".to_string(),
+            final_filename: "./weights/bloom-final.bin".to_string(),
+            layer_template_filename: "./weights/bloom-h.1.bin".to_string(),
         }
     }
 
@@ -70,9 +71,9 @@ impl LayoutConfig {
             layers_per_thread: 12,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-350m.bin".to_string(),
-            final_filename: "./bloom-350m.bin".to_string(),
-            layer_template_filename: "./bloom-350m.bin".to_string(),
+            embeddings_filename: "./weights/bloom-350m.bin".to_string(),
+            final_filename: "./weights/bloom-350m.bin".to_string(),
+            layer_template_filename: "./weights/bloom-350m.bin".to_string(),
         }
     }
 }
@@ -159,15 +160,17 @@ pub fn thread1(
         let oper1 = sel.recv(&rx);
         let oper2 = sel.recv(&prio_rx);
         let oper = sel.select();
-        let mut all_items = match oper.index() {
+        let (mut all_items, no_past) = match oper.index() {
             i if i == oper1 => {
-                vec![oper.recv(&rx).unwrap()]
+                (vec![oper.recv(&rx).unwrap()], true)
             }
             i if i == oper2 => {
-                vec![oper.recv(&prio_rx).unwrap()]
+                (vec![oper.recv(&prio_rx).unwrap()], false)
             }
             _ => unreachable!(),
         };
+
+        if no_past{
 
         let max_batch_size = 4;
 
@@ -190,6 +193,7 @@ pub fn thread1(
             if all_items.len() >= max_batch_size {
                 break;
             }
+        }
         }
         // let start = Instant::now();
         let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
@@ -255,8 +259,6 @@ pub fn thread2(
         std::time::Instant::now(),
         start.elapsed()
     );
-    let skip_past =
-        layout_config.layers_first_thread + layout_config.layers_per_thread * (thread_number - 1);
     loop {
         // Receive 1 item
         // println!("start loop  thread {thread_number}");
@@ -285,10 +287,7 @@ pub fn thread2(
             attention_mask = attention_mask.to_device(device);
             alibi = alibi.to_device(device);
 
-            for (layer, layer_past) in layers
-                .iter()
-                .zip(past_key_values.iter_mut().skip(skip_past))
-            {
+            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
                 debug("past_key thread2", &layer_past.0);
                 debug("past_values thread2", &layer_past.1);
                 hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
@@ -357,9 +356,6 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         start.elapsed()
     );
 
-    let skip_past = layout_config.layers_first_thread
-        + layout_config.layers_per_thread * layout_config.n_threads;
-
     loop {
         let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
             .recv()
@@ -368,10 +364,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
-        for (layer, layer_past) in layers
-            .iter()
-            .zip(past_key_values.iter_mut().skip(skip_past))
-        {
+        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             debug("past_key thread3", &layer_past.0);
             debug("past_values thread3", &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);

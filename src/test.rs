@@ -94,7 +94,7 @@ fn test_simple_generation() {
     assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
 
     let output = test_generate(&[input_sentence2], &config, &tokenizer, &model, 40);
-    // assert_eq!(output[0], "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good, very good, very good, very good, very good, very good, very good, very");
+    assert_eq!(output[0], "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good, very good, very good, very good, very good, very good, very good, very");
 
     let output = test_generate(
         &[input_sentence, input_sentence2],
@@ -109,7 +109,7 @@ fn test_simple_generation() {
     // This bug doesn't seem to exist on torch==1.11.0
     // **but** we need 1.12.0 for cumsum on bfloat16.
     // This bug is also present in `transformers` where the values where taken from.
-    // assert_eq!(output[1],  "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good and very good man, I am very good at my job, I am very good at my job, I am");
+    assert_eq!(output[1],  "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good and very good man, I am very good at my job, I am very good at my job, I am");
 }
 
 #[test]

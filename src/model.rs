@@ -838,7 +838,7 @@ pub mod tests {
 
     fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();
-        let file = std::fs::File::open("./bloom-350m.bin").unwrap();
+        let file = std::fs::File::open("./weights/bloom-350m.bin").unwrap();
         // SAFETY: This is actually unsafe.
         let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
         let model_file = SafeTensors::deserialize(&mmap).unwrap();
@@ -851,7 +851,7 @@ pub mod tests {
 
     fn bloom_testing() -> BloomForCausalLM {
         let config = Config::new_testing();
-        let file = std::fs::File::open("./bloom-testing.bin").unwrap();
+        let file = std::fs::File::open("./weights/bloom-testing.bin").unwrap();
         // SAFETY: This is actually unsafe.
         let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
         let model_file = SafeTensors::deserialize(&mmap).unwrap();
@@ -887,7 +887,8 @@ pub mod tests {
         let device = Device::Cuda(0);
         let kind = Kind::BFloat16;
         let n_head = 5;
-        let attention_mask = Tensor::of_slice(&[1, 1, 1]).view((1, 3)).to_device(device);
+        let attention_mask = Tensor::of_slice(&[1, 1, 1]).view((1, 3));
+        let attention_mask = attention_mask.f_to_device(device).unwrap();
 
         assert_eq!(attention_mask.size(), vec![1, 3]);
         let alibi = build_alibi_tensor(&attention_mask, n_head, kind, device);
