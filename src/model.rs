@@ -394,10 +394,13 @@ impl BloomAttention {
         let (past_key, past_value) = layer_past;
 
         let device = key.device();
+
+        println!("Key layer {:?}", key.size());
         let mut key_layer =
             Tensor::f_cat(&[past_key.as_ref().to_device(device), key.copy()], 1).unwrap();
         let value_layer =
             Tensor::f_cat(&[past_value.as_ref().to_device(device), value.copy()], 1).unwrap();
+        println!("Key layer after {:?}", key_layer.size());
 
         // Update past for next loops
         *layer_past = (key_layer.copy(), value_layer.copy());
@@ -417,6 +420,8 @@ impl BloomAttention {
             .reshape(&[key_length, batch_size * n_head, -1]);
 
         // let sliced_alibi = alibi[: output_size[0] * output_size[1], :, : output_size[3]]
+        println!("Alibi {:?}", alibi.size());
+        println!("Key length {:?}", key_length);
         let sliced_alibi = alibi.i((0..batch_size * n_head, .., 0..key_length));
         let beta = 1.0 / (self.layer_number as f64);
         let alpha = 1.0 / self.norm_factor;
@@ -887,8 +892,7 @@ pub mod tests {
         let device = Device::Cuda(0);
         let kind = Kind::BFloat16;
         let n_head = 5;
-        let attention_mask = Tensor::of_slice(&[1, 1, 1]).view((1, 3));
-        let attention_mask = attention_mask.f_to_device(device).unwrap();
+        let attention_mask = Tensor::of_slice(&[1, 1, 1]).view((1, 3)).to_device(device);
 
         assert_eq!(attention_mask.size(), vec![1, 3]);
         let alibi = build_alibi_tensor(&attention_mask, n_head, kind, device);

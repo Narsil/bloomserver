@@ -220,8 +220,12 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
 }
 
 pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
-    // TODO
-    let max_length = items.iter().map(|(ids, _)| ids.size()[1]).max().unwrap();
+    let max_length = items.iter().map(|(ids, past)| {
+        println!("Ids {:?}", ids.size());
+        println!("Past key {:?}", past[0].0.size());
+        println!("Past value {:?}", past[0].1.size());
+        ids.size()[1]
+    }).max().unwrap();
     let batch_size: i64 = items.iter().map(|(ids, _)| ids.size()[0]).sum::<i64>();
     let kind = (kind::Kind::Int64, Device::Cuda(0));
     let device = items[0].0.device();

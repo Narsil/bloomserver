@@ -199,9 +199,16 @@ mod tests{
             }))
             .service(generate)
             ).await;
-        let req = test::TestRequest::post().uri("/generate").to_request();
+        let req = test::TestRequest::post().uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "test"}))
+            .to_request();
         let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error());
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(bytes.unwrap(), web::Bytes::from_static(b"[{\"generated_text\":\"testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest\"}]"));
 
     }
 }
