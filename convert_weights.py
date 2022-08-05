@@ -1,8 +1,21 @@
 from safetensors.torch import save_file, load_file, load
-from huggingface_hub import hf_hub_download
+# from huggingface_hub import hf_hub_download
+from transformers.utils import hf_bucket_url, cached_path
 import torch
 import tqdm
 import os
+
+DIRECTORY = "weights"
+
+def hf_hub_download(model_id, filename):
+    shard_url = hf_bucket_url(
+            model_id,
+            filename=filename,
+        )
+    cached_filename = cached_path(
+            shard_url,
+    )
+    return cached_filename
 
 
 def convert_350m():
@@ -10,7 +23,7 @@ def convert_350m():
     data = torch.load(filename, map_location="cpu")
 
     # Need to copy since that call mutates the tensors to numpy
-    save_file(data.copy(), "bloom-350m.bin")
+    save_file(data.copy(), os.path.join(DIRECTORY, "bloom-350m.bin"))
 
 
 def convert_testing():
@@ -20,7 +33,7 @@ def convert_testing():
     data = torch.load(filename, map_location="cpu")
 
     # Need to copy since that call mutates the tensors to numpy
-    save_file(data.copy(), "bloom-testing.bin")
+    save_file(data.copy(), os.path.join(DIRECTORY, "bloom-testing.bin"))
 
 
 def convert_full():
@@ -41,11 +54,9 @@ def convert_full():
         filename = hf_hub_download(MODEL_ID, filename=filename)
         data = torch.load(filename, map_location="cpu")
 
-        # Need to copy since that call mutates the tensors to numpy
-        save_file(data.copy(), local)
-        # os.remove(filename)
-
+        save_file(data.copy(), os.path.join(DIRECTORY, local))
 
 if __name__ == "__main__":
-    convert_full()
+    convert_testing()
+    convert_350mtesting()
     raise Exception("Choose one of the weights to convert.")

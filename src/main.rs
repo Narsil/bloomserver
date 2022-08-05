@@ -9,7 +9,7 @@ use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 use bloomserver::generation::next_ids;
-use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
+use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2, SChan1};
 use bloomserver::model::{Config, Past};
 use bloomserver::{empty_past, Generation, GenerationError};
 
@@ -41,10 +41,10 @@ async fn generate(
             ids.push(0);
         }
 
-        if ids.len() > 512 {
+        if ids.len() > 128 {
             return Err(GenerationError::InputTooLong);
         }
-        if payload.parameters.max_new_tokens > 384 {
+        if payload.parameters.max_new_tokens > 64 {
             return Err(GenerationError::TooManyNewTokens);
         }
 
@@ -54,6 +54,8 @@ async fn generate(
             .to_kind(kind.0)
             .to_device(kind.1)
             .view((1, -1));
+
+        let mut all_ids = input_ids.copy();
         let max_new_tokens = payload.parameters.max_new_tokens;
 
         let mut past_key_values = empty_past(&state.config);
@@ -78,7 +80,7 @@ async fn generate(
             let logits = received.0;
             past_key_values = received.1;
             let new_ids = next_ids(&payload.parameters, &logits).to_device(input_ids.device());
-            all_ids = Tensor::f_cat(&[all_ids, new_ids], 1).unwrap();
+            all_ids = Tensor::f_cat(&[all_ids, new_ids.copy()], 1).unwrap();
             input_ids = new_ids;
         }
         let full_ids = all_ids
@@ -107,11 +109,10 @@ async fn generate(
         .content_type(ContentType::json())
         .json(json!([{ "generated_text": string }])))
 }
-#[actix_web::main] // or #[tokio::main]
-async fn main() -> std::io::Result<()> {
+
+fn init_threads() -> (Arc<Tokenizer>, SChan1, SChan1, Config){
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     tch::maybe_init_cuda();
-
     let start = std::time::Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
     println!("Loaded tokenizer in {:?}", start.elapsed());
@@ -157,14 +158,19 @@ async fn main() -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
         thread3(r, layout_config.n_threads + 1, config_, layout_config_);
     });
+    (tokenizer, tx, prio_tx, config)
+}
 
+#[actix_web::main] // or #[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let (tokenizer, in_channel, prio_channel, config) = init_threads();
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(AppState {
                 tokenizer: tokenizer.clone(),
-                in_channel: tx.clone(),
-                prio_channel: prio_tx.clone(),
+                in_channel: in_channel.clone(),
+                prio_channel: prio_channel.clone(),
                 config: config.clone(),
             }))
             .service(generate)
@@ -172,4 +178,30 @@ async fn main() -> std::io::Result<()> {
     .bind(("127.0.0.1", 8001))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    use actix_web::test;
+
+    #[actix_web::test]
+    async fn test_generation(){
+        let (tokenizer, in_channel, prio_channel, config) = init_threads();
+        let app = test::init_service(
+        App::new()
+            .wrap(Logger::default())
+            .app_data(web::Data::new(AppState {
+                tokenizer,
+                in_channel,
+                prio_channel,
+                config,
+            }))
+            .service(generate)
+            ).await;
+        let req = test::TestRequest::post().uri("/generate").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_client_error());
+
+    }
 }
