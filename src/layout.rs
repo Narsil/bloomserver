@@ -226,11 +226,11 @@ pub fn thread2(
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
+    let offset = layout_config.layers_first_thread
+                + layout_config.layers_per_thread * (thread_number - 1);
     let layers: Vec<BloomBlock> = (0..layout_config.layers_per_thread)
         .map(|i| {
-            let layer_number = i
-                + layout_config.layers_first_thread
-                + layout_config.layers_per_thread * (thread_number - 1);
+            let layer_number = i + offset;
             println!("Loading layer {layer_number} on thread2 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
@@ -287,7 +287,7 @@ pub fn thread2(
             attention_mask = attention_mask.to_device(device);
             alibi = alibi.to_device(device);
 
-            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
+            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
                 debug("past_key thread2", &layer_past.0);
                 debug("past_values thread2", &layer_past.1);
                 hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
@@ -321,11 +321,11 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let ln_f = LayerNorm::new(config.hidden_size, "ln_f", &final_model, device);
     let lm_head = InvertedEmbedding::new("word_embeddings", &embedding_model, device);
 
+    let offset = layout_config.layers_first_thread
+                + layout_config.layers_per_thread * layout_config.n_threads;
     let layers: Vec<BloomBlock> = (0..layout_config.layers_last_thread)
         .map(|i| {
-            let layer_number = layout_config.layers_first_thread
-                + layout_config.layers_per_thread * layout_config.n_threads
-                + i;
+            let layer_number = offset + i;
             println!("Loading layer {layer_number} on thread3 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
@@ -364,7 +364,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         hidden_states = hidden_states.to_device(device);
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
-        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
+        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
             debug("past_key thread3", &layer_past.0);
             debug("past_values thread3", &layer_past.1);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
