@@ -1,3 +1,4 @@
+#![feature(async_closure)]
 use actix_web::middleware::Logger;
 use actix_web::{http::header::ContentType, post, web, App, HttpResponse, HttpServer};
 use crossbeam_channel::{bounded, unbounded, Sender};
@@ -110,7 +111,7 @@ async fn generate(
         .json(json!([{ "generated_text": string }])))
 }
 
-fn init_threads() -> (Arc<Tokenizer>, SChan1, SChan1, Config){
+fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     tch::maybe_init_cuda();
     let start = std::time::Instant::now();
@@ -121,16 +122,12 @@ fn init_threads() -> (Arc<Tokenizer>, SChan1, SChan1, Config){
     let (tx, rx) = bounded::<Msg>(1);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
 
-    let (config, layout_config) = if let Ok(env) = std::env::var("BLOOM") {
-        match env.as_ref() {
-            "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
-            "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
-            "bloom" => (Config::new(), LayoutConfig::new()),
-            "bloom-dgx" => (Config::new(), LayoutConfig::new_dgx()),
-            other => panic!("Model {other} is not known"),
-        }
-    } else {
-        (Config::new(), LayoutConfig::new())
+    let (config, layout_config) = match model_name {
+        "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
+        "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
+        "bloom" => (Config::new(), LayoutConfig::new()),
+        "bloom-dgx" => (Config::new(), LayoutConfig::new_dgx()),
+        other => panic!("Model {other} is not known"),
     };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
@@ -163,7 +160,8 @@ fn init_threads() -> (Arc<Tokenizer>, SChan1, SChan1, Config){
 
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let (tokenizer, in_channel, prio_channel, config) = init_threads();
+    let model_name = std::env::var("BLOOM").unwrap_or("bloom".to_string());
+    let (tokenizer, in_channel, prio_channel, config) = init_threads(&model_name);
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
@@ -181,31 +179,34 @@ async fn main() -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
     use actix_web::test;
 
     #[actix_web::test]
-    async fn test_generation(){
-        let (tokenizer, in_channel, prio_channel, config) = init_threads();
+    async fn test_generation() {
+        let (tokenizer, in_channel, prio_channel, config) =
+            init_threads("bigscience-small-testing");
         let app = test::init_service(
-        App::new()
-            .wrap(Logger::default())
-            .app_data(web::Data::new(AppState {
-                tokenizer,
-                in_channel,
-                prio_channel,
-                config,
-            }))
-            .service(generate)
-            ).await;
-        let req = test::TestRequest::post().uri("/generate")
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState {
+                    tokenizer,
+                    in_channel,
+                    prio_channel,
+                    config,
+                }))
+                .service(generate),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate")
             .insert_header(ContentType::json())
             .set_json(serde_json::json!({"inputs": "test"}))
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
-        
+
         let body = resp.into_body();
         let bytes = actix_web::body::to_bytes(body).await;
         assert_eq!(bytes.unwrap(), web::Bytes::from_static(b"[{\"generated_text\":\"testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest\"}]"));

@@ -161,39 +161,34 @@ pub fn thread1(
         let oper2 = sel.recv(&prio_rx);
         let oper = sel.select();
         let (mut all_items, no_past) = match oper.index() {
-            i if i == oper1 => {
-                (vec![oper.recv(&rx).unwrap()], true)
-            }
-            i if i == oper2 => {
-                (vec![oper.recv(&prio_rx).unwrap()], false)
-            }
+            i if i == oper1 => (vec![oper.recv(&rx).unwrap()], true),
+            i if i == oper2 => (vec![oper.recv(&prio_rx).unwrap()], false),
             _ => unreachable!(),
         };
 
-        if no_past{
+        if no_past {
+            let max_batch_size = 4;
 
-        let max_batch_size = 4;
+            let now = Instant::now();
+            let deadline = std::cmp::max(
+                last_loop + Duration::from_millis(20),
+                now + Duration::from_millis(1),
+            );
 
-        let now = Instant::now();
-        let deadline = std::cmp::max(
-            last_loop + Duration::from_millis(20),
-            now + Duration::from_millis(1),
-        );
-
-        while let Ok(oper) = sel.select_deadline(deadline) {
-            match oper.index() {
-                i if i == oper1 => {
-                    all_items.push(oper.recv(&rx).unwrap());
+            while let Ok(oper) = sel.select_deadline(deadline) {
+                match oper.index() {
+                    i if i == oper1 => {
+                        all_items.push(oper.recv(&rx).unwrap());
+                    }
+                    i if i == oper2 => {
+                        all_items.push(oper.recv(&prio_rx).unwrap());
+                    }
+                    _ => unreachable!(),
                 }
-                i if i == oper2 => {
-                    all_items.push(oper.recv(&prio_rx).unwrap());
+                if all_items.len() >= max_batch_size {
+                    break;
                 }
-                _ => unreachable!(),
             }
-            if all_items.len() >= max_batch_size {
-                break;
-            }
-        }
         }
         // let start = Instant::now();
         let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
@@ -226,8 +221,8 @@ pub fn thread2(
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
-    let offset = layout_config.layers_first_thread
-                + layout_config.layers_per_thread * (thread_number - 1);
+    let offset =
+        layout_config.layers_first_thread + layout_config.layers_per_thread * (thread_number - 1);
     let layers: Vec<BloomBlock> = (0..layout_config.layers_per_thread)
         .map(|i| {
             let layer_number = i + offset;
@@ -288,8 +283,8 @@ pub fn thread2(
             alibi = alibi.to_device(device);
 
             for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
-                debug("past_key thread2", &layer_past.0);
-                debug("past_values thread2", &layer_past.1);
+                debug("past_key thread2", &layer_past.key);
+                debug("past_values thread2", &layer_past.value);
                 hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
             }
             // println!(
@@ -322,7 +317,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let lm_head = InvertedEmbedding::new("word_embeddings", &embedding_model, device);
 
     let offset = layout_config.layers_first_thread
-                + layout_config.layers_per_thread * layout_config.n_threads;
+        + layout_config.layers_per_thread * layout_config.n_threads;
     let layers: Vec<BloomBlock> = (0..layout_config.layers_last_thread)
         .map(|i| {
             let layer_number = offset + i;
@@ -365,8 +360,8 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         attention_mask = attention_mask.to_device(device);
         alibi = alibi.to_device(device);
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
-            debug("past_key thread3", &layer_past.0);
-            debug("past_values thread3", &layer_past.1);
+            debug("past_key thread3", &layer_past.key);
+            debug("past_values thread3", &layer_past.value);
             hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
         }
         debug("last_hidden_states", &hidden_states);
