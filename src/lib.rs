@@ -6,7 +6,7 @@ pub mod model;
 mod test;
 pub mod utils;
 
-use crate::model::{Config, Past};
+use crate::model::{Config, Past, PastLayer};
 use actix_web::{http::StatusCode, ResponseError};
 use safetensors::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ pub fn empty_past(config: &Config) -> Past {
     let past_key = Tensor::zeros(&[1, 0, p, q], kind);
     let past_value = Tensor::zeros(&[1, 0, p, q], kind);
     let past_key_values: Vec<_> = (0..config.n_layer)
-        .map(|_| (past_key.copy(), past_value.copy()))
+        .map(|_| PastLayer{key: past_key.copy(), value: past_value.copy()})
         .collect();
     past_key_values
 }

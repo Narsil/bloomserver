@@ -3,7 +3,10 @@ use crate::utils::{debug, save_layer_to_disk};
 use safetensors::SafeTensors;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
-pub type PastLayer = (Tensor, Tensor);
+pub struct PastLayer{
+    pub key: Tensor,
+    pub value: Tensor
+}
 pub type Past = Vec<PastLayer>;
 
 const PADDING_IDX: i64 = 3;
@@ -391,19 +394,15 @@ impl BloomAttention {
             [query, key, value] => (query, key, value),
             _ => unreachable!(),
         };
-        let (past_key, past_value) = layer_past;
-
         let device = key.device();
 
-        println!("Key layer {:?}", key.size());
         let mut key_layer =
-            Tensor::f_cat(&[past_key.as_ref().to_device(device), key.copy()], 1).unwrap();
+            Tensor::f_cat(&[layer_past.key.as_ref().to_device(device), key.copy()], 1).unwrap();
         let value_layer =
-            Tensor::f_cat(&[past_value.as_ref().to_device(device), value.copy()], 1).unwrap();
-        println!("Key layer after {:?}", key_layer.size());
+            Tensor::f_cat(&[layer_past.value.as_ref().to_device(device), value.copy()], 1).unwrap();
 
         // Update past for next loops
-        *layer_past = (key_layer.copy(), value_layer.copy());
+        *layer_past = PastLayer{key: key_layer.copy(), value: value_layer.copy()};
 
         let batch_size = query.size()[0];
         let n_head = query.size()[2];
@@ -420,8 +419,6 @@ impl BloomAttention {
             .reshape(&[key_length, batch_size * n_head, -1]);
 
         // let sliced_alibi = alibi[: output_size[0] * output_size[1], :, : output_size[3]]
-        println!("Alibi {:?}", alibi.size());
-        println!("Key length {:?}", key_length);
         let sliced_alibi = alibi.i((0..batch_size * n_head, .., 0..key_length));
         let beta = 1.0 / (self.layer_number as f64);
         let alpha = 1.0 / self.norm_factor;
@@ -993,7 +990,7 @@ pub mod tests {
         let past_key = Tensor::zeros(&[2, 0, p, q], kind);
         let past_value = Tensor::zeros(&[2, 0, p, q], kind);
         let mut past_key_values: Vec<_> = (0..config.n_layer)
-            .map(|_| (past_key.copy(), past_value.copy()))
+            .map(|_| PastLayer{key: past_key.copy(), value: past_value.copy()})
             .collect();
         let input_ids = Tensor::of_slice(&[2, 2, 34, 54, 132, 225, 532, 342])
             .view((2, 4))
