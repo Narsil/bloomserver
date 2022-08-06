@@ -29,6 +29,7 @@ async fn generate(
     let start = Instant::now();
     let input_string = payload.inputs.clone();
     let parameters = payload.parameters.clone();
+    let max_new_tokens = payload.parameters.max_new_tokens;
     let string = actix_web::rt::task::spawn_blocking(move || -> Result<String, GenerationError> {
         let state = state.into_inner();
         let encoded = state
@@ -41,7 +42,7 @@ async fn generate(
             ids.push(0);
         }
 
-        if ids.len() > 512 {
+        if ids.len() > 384 {
             return Err(GenerationError::InputTooLong);
         }
         if payload.parameters.max_new_tokens > 384 {
@@ -93,11 +94,12 @@ async fn generate(
     input: {:?}
     parameters {:?}
     output {:?}
-    ran in {:?}"#,
+    ran in {:?} ({:?}/token)"#,
         input_string,
         parameters,
         string,
-        start.elapsed()
+        start.elapsed(),
+        start.elapsed().div_f64(max_new_tokens as f64)
     );
     Ok(HttpResponse::Ok()
         .content_type(ContentType::json())
