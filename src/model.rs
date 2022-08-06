@@ -3,9 +3,10 @@ use crate::utils::{debug, save_layer_to_disk};
 use safetensors::SafeTensors;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
-pub struct PastLayer{
+#[derive(Debug)]
+pub struct PastLayer {
     pub key: Tensor,
-    pub value: Tensor
+    pub value: Tensor,
 }
 pub type Past = Vec<PastLayer>;
 
@@ -398,11 +399,17 @@ impl BloomAttention {
 
         let mut key_layer =
             Tensor::f_cat(&[layer_past.key.as_ref().to_device(device), key.copy()], 1).unwrap();
-        let value_layer =
-            Tensor::f_cat(&[layer_past.value.as_ref().to_device(device), value.copy()], 1).unwrap();
+        let value_layer = Tensor::f_cat(
+            &[layer_past.value.as_ref().to_device(device), value.copy()],
+            1,
+        )
+        .unwrap();
 
         // Update past for next loops
-        *layer_past = PastLayer{key: key_layer.copy(), value: value_layer.copy()};
+        *layer_past = PastLayer {
+            key: key_layer.copy(),
+            value: value_layer.copy(),
+        };
 
         let batch_size = query.size()[0];
         let n_head = query.size()[2];
@@ -990,7 +997,10 @@ pub mod tests {
         let past_key = Tensor::zeros(&[2, 0, p, q], kind);
         let past_value = Tensor::zeros(&[2, 0, p, q], kind);
         let mut past_key_values: Vec<_> = (0..config.n_layer)
-            .map(|_| PastLayer{key: past_key.copy(), value: past_value.copy()})
+            .map(|_| PastLayer {
+                key: past_key.copy(),
+                value: past_value.copy(),
+            })
             .collect();
         let input_ids = Tensor::of_slice(&[2, 2, 34, 54, 132, 225, 532, 342])
             .view((2, 4))

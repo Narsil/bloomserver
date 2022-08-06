@@ -1,4 +1,4 @@
-use crate::model::{build_alibi_tensor, Config, Past,PastLayer};
+use crate::model::{build_alibi_tensor, Config, Past, PastLayer};
 use serde::{Deserialize, Serialize};
 use tch::{kind, Device, IndexOp, Tensor};
 
@@ -220,44 +220,87 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
 }
 
 pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
-    let max_length = items
+    let (max_length_input_ids, max_length_past) = items
         .iter()
-        .map(|(ids, past)| {
-            ids.size()[1]
-        })
+        .map(|(ids, past)| (ids.size()[1], past[0].key.size()[1]))
         .max()
         .unwrap();
+
+    match (max_length_input_ids, max_length_past){
+        (1, _) => (), // Past is used only 1 new input_id
+        (_, 0) => (), // No past is used
+        (n, m) => panic!("Padding can handle this situation but it's highly irregular so please fix your call input_ids length {n}, past_length {m}"),
+    }
+
+    let max_length = max_length_input_ids + max_length_past;
+
     let batch_size: i64 = items.iter().map(|(ids, _)| ids.size()[0]).sum::<i64>();
     let kind = (kind::Kind::Int64, Device::Cuda(0));
     let device = items[0].0.device();
     let kind2 = (kind::Kind::Int64, device);
-    let mut all_input_ids = Tensor::zeros(&[batch_size, max_length], kind2) + config.padding_idx;
+    let mut all_input_ids =
+        Tensor::zeros(&[batch_size, max_length_input_ids], kind2) + config.padding_idx;
+
+    let p = config.n_head;
+    let q = config.hidden_size / config.n_head;
+    let past_template = Tensor::zeros(&[batch_size, max_length_past, p, q], (config.kind, device));
+    let mut all_past_key_values = (0..config.n_layer as usize)
+        .map(|_| PastLayer {
+            key: past_template.copy(),
+            value: past_template.copy(),
+        })
+        .collect::<Vec<_>>();
+
     let mut attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
 
     let mut total_ids = 0;
 
     let mut current_batch = 0;
-    for (input_ids, _past_key_values) in items {
+    for (input_ids, past_key_values) in items {
         let seq_length = input_ids.size()[1];
         let mini_batch_size = input_ids.size()[0];
         total_ids += mini_batch_size as usize * seq_length as usize;
         // all_input_ids[i:i+mini_batch_size, max_length - seq_length:seq_length] =
         // input_ids
-
         let mut batch_indices = vec![];
         let mut id_indices = vec![];
         for i in 0..mini_batch_size {
             for j in 0..seq_length {
                 let batch_index = i + current_batch;
-                let id_index = j + max_length - seq_length;
+                let id_index = j + max_length_input_ids - seq_length;
                 batch_indices.push(batch_index);
                 id_indices.push(id_index);
             }
         }
+
+        let seq_length = past_key_values[0].key.size()[1];
+        let mut batch_past_indices = vec![];
+        let mut batch_past_attn_indices = vec![];
+        let mut past_indices = vec![];
+        for i in 0..mini_batch_size {
+            for j in 0..seq_length {
+                let batch_index = i;
+                let batch_attn_index = i + current_batch;
+                let id_index = j + max_length_past - seq_length;
+                batch_past_indices.push(batch_index);
+                batch_past_attn_indices.push(batch_attn_index);
+                past_indices.push(id_index);
+            }
+        }
+
         let batch_index = Tensor::of_slice(batch_indices.as_slice())
             .to_kind(kind.0)
             .to_device(kind.1);
         let id_index = Tensor::of_slice(id_indices.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1);
+        let batch_past_index = Tensor::of_slice(batch_past_indices.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1);
+        let batch_past_attn_index = Tensor::of_slice(batch_past_attn_indices.as_slice())
+            .to_kind(kind.0)
+            .to_device(kind.1);
+        let past_index = Tensor::of_slice(past_indices.as_slice())
             .to_kind(kind.0)
             .to_device(kind.1);
 
@@ -269,18 +312,51 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
 
         let attn = input_ids.fill(1).view((-1,));
         attention_mask = attention_mask
-            .f_index_put_(&[Some(&batch_index), Some(&id_index)], &attn, false)
+            .f_index_put_(
+                &[Some(&batch_index), Some(&(id_index + max_length_past))],
+                &attn,
+                false,
+            )
             .unwrap();
+
+        if max_length_past > 0 {
+            for (i, layer_past) in all_past_key_values.iter_mut().enumerate() {
+                let past_key = &past_key_values[i].key;
+                let layer_key = &layer_past.key;
+                println!("batch_past_index {batch_past_index:?}");
+                println!("past_index {past_index:?}");
+                println!("past {past_key:?}");
+                println!("layer_past {layer_key:?}");
+                _ = layer_past
+                    .key
+                    .i(current_batch..current_batch + mini_batch_size)
+                    .f_index_put_(
+                        &[Some(&batch_past_index), Some(&past_index)],
+                        &past_key_values[i].key.i(0),
+                        false,
+                    )
+                    .unwrap();
+                _ = layer_past
+                    .value
+                    .i(current_batch..current_batch + mini_batch_size)
+                    .f_index_put_(
+                        &[Some(&batch_past_index), Some(&past_index)],
+                        &past_key_values[i].value.i(0),
+                        false,
+                    )
+                    .unwrap();
+            }
+            attention_mask = attention_mask
+                .f_index_put_(
+                    &[Some(&batch_past_attn_index), Some(&(past_index))],
+                    &attn,
+                    false,
+                )
+                .unwrap();
+        }
+
         current_batch += mini_batch_size;
     }
-
-    let p = config.n_head;
-    let q = config.hidden_size / config.n_head;
-    let past_key = Tensor::zeros(&[batch_size, 0, p, q], kind);
-    let past_value = Tensor::zeros(&[batch_size, 0, p, q], kind);
-    let past_key_values: Vec<_> = (0..config.n_layer)
-        .map(|_| PastLayer{key: past_key.copy(), value: past_value.copy()})
-        .collect();
 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
@@ -291,12 +367,13 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
         max_length,
         (total_ids * 100) / total
     );
-    (all_input_ids, attention_mask, alibi, past_key_values)
+    (all_input_ids, attention_mask, alibi, all_past_key_values)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::empty_past;
 
     #[test]
     fn test_sampling_top_p() {
@@ -378,8 +455,8 @@ mod tests {
             .view((1, 6))
             .to_kind(kind::Kind::Int64)
             .to_device(device);
-        let past = vec![];
-        let past2 = vec![];
+        let past = empty_past(&config);
+        let past2 = empty_past(&config);
 
         let items = vec![(input_ids, past), (input_ids2, past2)];
 
@@ -389,6 +466,89 @@ mod tests {
         assert_eq!(
             Vec::<i64>::from(all_input_ids),
             vec![3, 3, 3, 3, 4, 5, 8, 1, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn test_padding_past() {
+        let config = Config::new350m();
+        let device = Device::Cuda(0);
+        let input_ids = Tensor::of_slice(&[3])
+            .view((1, 1))
+            .to_kind(kind::Kind::Int64)
+            .to_device(device);
+        let input_ids2 = Tensor::of_slice(&[8])
+            .view((1, 1))
+            .to_kind(kind::Kind::Int64)
+            .to_device(device);
+
+        let kind = (config.kind, device);
+
+        let p = config.n_head;
+        let q = config.hidden_size / config.n_head;
+        let key = Tensor::zeros(&[1, 4, p, q], kind) + 3;
+        let value = Tensor::zeros(&[1, 4, p, q], kind) + 4;
+        let past = (0..config.n_layer as usize)
+            .map(|_| PastLayer {
+                key: key.copy(),
+                value: value.copy(),
+            })
+            .collect::<Vec<_>>();
+
+        let key2 = Tensor::zeros(&[1, 6, p, q], kind) + 5;
+        let value2 = Tensor::zeros(&[1, 6, p, q], kind) + 6;
+        let past2 = (0..config.n_layer as usize)
+            .map(|_| PastLayer {
+                key: key2.copy(),
+                value: value2.copy(),
+            })
+            .collect::<Vec<_>>();
+
+        let items = vec![(input_ids, past), (input_ids2, past2)];
+
+        let (all_input_ids, attention_mask, alibi, past_key_values) = padding(&config, items);
+
+        assert_eq!(all_input_ids.size(), vec![2, 1]);
+        assert_eq!(attention_mask.size(), vec![2, 7]);
+        assert_eq!(alibi.size(), vec![16 * 2, 1, 7]);
+        assert_eq!(past_key_values.len(), 24);
+        for i in 0..24 {
+            assert_eq!(
+                past_key_values[i].key.size(),
+                vec![2, 6, 16, 64],
+                "Layer {i}"
+            );
+            assert_eq!(
+                past_key_values[i].value.size(),
+                vec![2, 6, 16, 64],
+                "Layer {i}"
+            );
+        }
+
+        assert_eq!(Vec::<i64>::from(all_input_ids), vec![3, 8]);
+        assert_eq!(
+            Vec::<i64>::from(attention_mask.i(0)),
+            vec![0, 0, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            Vec::<i64>::from(attention_mask.i(1)),
+            vec![1, 1, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].key.i((0, .., ..1, ..1))),
+            vec![0.0, 0.0, 3.0, 3.0, 3.0, 3.0]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].value.i((0, .., ..1, ..1))),
+            vec![0.0, 0.0, 4.0, 4.0, 4.0, 4.0]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].key.i((1, .., ..1, ..1))),
+            vec![5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+        );
+        assert_eq!(
+            Vec::<f64>::from(past_key_values[0].value.i((1, .., ..1, ..1))),
+            vec![6.0, 6.0, 6.0, 6.0, 6.0, 6.0]
         );
     }
 }
