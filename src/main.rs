@@ -12,6 +12,7 @@ use tokenizers::Tokenizer;
 use bloomserver::generation::next_ids;
 use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2, SChan1};
 use bloomserver::model::{Config, Past};
+use bloomserver::utils::SAVE;
 use bloomserver::{empty_past, Generation, GenerationError};
 
 #[derive(Clone)]
@@ -29,6 +30,7 @@ async fn generate(
 ) -> actix_web::Result<HttpResponse> {
     let start = Instant::now();
     let input_string = payload.inputs.clone();
+    let max_new_tokens = payload.parameters.max_new_tokens;
     let parameters = payload.parameters.clone();
     let string = actix_web::rt::task::spawn_blocking(move || -> Result<String, GenerationError> {
         let state = state.into_inner();
@@ -59,9 +61,12 @@ async fn generate(
         let mut all_ids = input_ids.copy();
         let max_new_tokens = payload.parameters.max_new_tokens;
 
-        let mut past_key_values = empty_past(&state.config);
+        let mut past_key_values = empty_past(&state.config, 1);
         for i in 0..max_new_tokens {
             // let start_loop = Instant::now();
+            if SAVE {
+                std::env::set_var("GENERATION_STEP", &format!("{}", i));
+            }
             let ack = (input_ids.size()[0], sx.clone());
             if i == 0 {
                 state
@@ -100,11 +105,12 @@ async fn generate(
     input: {:?}
     parameters {:?}
     output {:?}
-    ran in {:?}"#,
+    ran in {:?} ({:?}/token)"#,
         input_string,
         parameters,
         string,
-        start.elapsed()
+        start.elapsed(),
+        start.elapsed().div_f64(max_new_tokens as f64)
     );
     Ok(HttpResponse::Ok()
         .content_type(ContentType::json())
@@ -184,7 +190,7 @@ mod tests {
     use actix_web::test;
 
     #[actix_web::test]
-    async fn test_generation() {
+    async fn test_generation_testing() {
         let (tokenizer, in_channel, prio_channel, config) =
             init_threads("bigscience-small-testing");
         let app = test::init_service(
@@ -202,14 +208,107 @@ mod tests {
         let req = test::TestRequest::post()
             .uri("/generate")
             .insert_header(ContentType::json())
-            .set_json(serde_json::json!({"inputs": "test"}))
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog"}))
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
 
         let body = resp.into_body();
         let bytes = actix_web::body::to_bytes(body).await;
-        assert_eq!(bytes.unwrap(), web::Bytes::from_static(b"[{\"generated_text\":\"testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest\"}]"));
+        assert_eq!(bytes.unwrap(), web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog\"}]"));
+    }
 
+    #[actix_web::test]
+    async fn test_generation_350m() {
+        let (tokenizer, in_channel, prio_channel, config) = init_threads("bloom-350m");
+        println!("Started");
+        let app = test::init_service(
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState {
+                    tokenizer,
+                    in_channel,
+                    prio_channel,
+                    config,
+                }))
+                .service(generate),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_generation_full() {
+        if std::env::var("RUN_SLOW") != Ok("1".to_string()) {
+            return;
+        }
+        let (tokenizer, in_channel, prio_channel, config) = init_threads("bloom");
+        let app = test::init_service(
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState {
+                    tokenizer,
+                    in_channel,
+                    prio_channel,
+                    config,
+                }))
+                .service(generate),
+        )
+        .await;
+
+        // let req = test::TestRequest::post()
+        //     .uri("/generate")
+        //     .insert_header(ContentType::json())
+        //     .set_json(serde_json::json!({"inputs": "test", "parameters": {"max_new_tokens": 20}}))
+        //     .to_request();
+        // let resp = test::call_service(&app, req).await;
+        // assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        // let body = resp.into_body();
+        // let bytes = actix_web::body::to_bytes(body).await;
+        // assert_eq!(
+        //     bytes.unwrap(),
+        //     web::Bytes::from_static(b"[{\"generated_text\":\"test.mark.parametrize('stdin, stdout', [\\n    ({'username': 'foo'\"}]")
+        // );
+
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, reading, and spending time with my family. I am a member of the American Association of University\"}]")
+        );
+
+        // let req = test::TestRequest::post()
+        //     .uri("/generate")
+        //     .insert_header(ContentType::json())
+        //     .set_json(serde_json::json!({"inputs": "Math exercise - answers:\n34+10=44\n54+20=", "parameters": {"max_new_tokens": 20}}))
+        //     .to_request();
+        // let resp = test::call_service(&app, req).await;
+        // assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        // let body = resp.into_body();
+        // let bytes = actix_web::body::to_bytes(body).await;
+        // assert_eq!(
+        //     bytes.unwrap(),
+        //     web::Bytes::from_static(b"[{\"generated_text\":\"Math exercise - answers:\\n34+10=44\\n54+20=74\\n74+20=94\\n94+20=114\n114+20=134\\n\"}]")
+        // );
     }
 }

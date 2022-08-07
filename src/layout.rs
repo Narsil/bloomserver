@@ -1,6 +1,5 @@
-use crate::empty_past;
 use crate::generation::padding;
-use crate::model::{BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm, Past};
+use crate::model::{BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm, Past, PastLayer};
 use crate::utils::debug;
 use crossbeam_channel::{Receiver, Select, Sender};
 use memmap::MmapOptions;
@@ -68,9 +67,9 @@ impl LayoutConfig {
     pub fn new350m() -> Self {
         Self {
             layers_first_thread: 0,
-            layers_per_thread: 12,
+            layers_per_thread: 3,
             layers_last_thread: 0,
-            n_threads: 2,
+            n_threads: 8,
             embeddings_filename: "./weights/bloom-350m.bin".to_string(),
             final_filename: "./weights/bloom-350m.bin".to_string(),
             layer_template_filename: "./weights/bloom-350m.bin".to_string(),
@@ -283,8 +282,6 @@ pub fn thread2(
             alibi = alibi.to_device(device);
 
             for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
-                debug("past_key thread2", &layer_past.key);
-                debug("past_values thread2", &layer_past.value);
                 hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
             }
             // println!(
@@ -371,8 +368,18 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
 
         let mut current_batch = 0;
         for (mini_batch_size, rq) in rqs {
+            let past: Vec<_> = past_key_values
+                .iter()
+                .map(|layer_past| PastLayer {
+                    key: layer_past
+                        .key
+                        .i(current_batch..current_batch + mini_batch_size),
+                    value: layer_past
+                        .value
+                        .i(current_batch..current_batch + mini_batch_size),
+                })
+                .collect();
             let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
-            let past = empty_past(&config);
             rq.send((simple_logits, past)).unwrap();
             current_batch += mini_batch_size;
         }
