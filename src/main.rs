@@ -44,10 +44,10 @@ async fn generate(
             ids.push(0);
         }
 
-        if ids.len() > 128 {
+        if ids.len() > 512 {
             return Err(GenerationError::InputTooLong);
         }
-        if payload.parameters.max_new_tokens > 64 {
+        if payload.parameters.max_new_tokens > 364 {
             return Err(GenerationError::TooManyNewTokens);
         }
 
@@ -234,20 +234,20 @@ mod tests {
                 .service(generate),
         )
         .await;
-        // let req = test::TestRequest::post()
-        //     .uri("/generate")
-        //     .insert_header(ContentType::json())
-        //     .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
-        //     .to_request();
-        // let resp = test::call_service(&app, req).await;
-        // assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
 
-        // let body = resp.into_body();
-        // let bytes = actix_web::body::to_bytes(body).await;
-        // assert_eq!(
-        //     bytes.unwrap(),
-        //     web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
-        // );
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
+        );
 
         let req = test::TestRequest::post()
             .uri("/generate")

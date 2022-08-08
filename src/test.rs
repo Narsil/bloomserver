@@ -83,11 +83,11 @@ fn test_simple_generation() {
     let model = BLOOM_350M.lock().unwrap();
     let tokenizer = Tokenizer::from_file("./tokenizer.json").unwrap();
 
-    let input_sentence = "I enjoy walking with my cute dog";
+    let input_sentence = "I enjoy walking my cute dog";
     let input_sentence2 = "Hello my name is";
 
-    let out1 =  "I enjoy walking with my cute dog, and I love to watch the kids play with the kids. I am a very active person, and I enjoy working out, and I am a very active person. I am a very active person, and I";
-    let out2 =  "Hello my name is Nate and I am a professional photographer and I am looking for a job in the field of photography. I am looking for a job in the field of photography. I am looking for a job in the field";
+    let out1 = "I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love to be active. I am a very good listener and I am very good at listening to people. I am very";
+    let out2 =  "Hello my name is Nate and I am a professional photographer in the area of the city of New York. I am a professional photographer who loves to capture the moment and to capture the best moments in the life";
 
     let output = test_generate(&[input_sentence], &config, &tokenizer, &model, 43);
     assert_eq!(output, vec![out1]);
