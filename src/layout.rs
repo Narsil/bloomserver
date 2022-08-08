@@ -368,15 +368,25 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
 
         let mut current_batch = 0;
         for (mini_batch_size, rq) in rqs {
+            // TODO actually clean the past of padded values so that subsequent
+            // calls can get a chance to have their follow up mask better.
+            // let seq_length = Vec::<i64>::from(attention_mask.i(current_batch).sum())
+            //     .next()
+            //     .unwrap();
             let past: Vec<_> = past_key_values
                 .iter()
                 .map(|layer_past| PastLayer {
-                    key: layer_past
-                        .key
-                        .i(current_batch..current_batch + mini_batch_size),
-                    value: layer_past
-                        .value
-                        .i(current_batch..current_batch + mini_batch_size),
+                    key: layer_past.key.i(
+                        current_batch..current_batch + mini_batch_size,
+                        // ..,
+                        // ..,
+                        // seq_length..,
+                    ),
+                    value: layer_past.value.i(
+                        current_batch..current_batch + mini_batch_size,
+                        // ..,
+                        // seq_length..,
+                    ),
                 })
                 .collect();
             let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);

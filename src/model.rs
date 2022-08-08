@@ -272,7 +272,8 @@ pub fn build_alibi_tensor(
 fn finfo_min(kind: Kind) -> f64 {
     match kind {
         Kind::Float => f32::MIN as f64,
-        Kind::BFloat16 => -3.4028235e37, // TODO use real bfloat16 min if possible.
+        Kind::Half => -65504.0,
+        Kind::BFloat16 => -3.3028235e38, // TODO use real bfloat16 min if possible.
         _ => todo!(),
     }
 }
@@ -485,7 +486,7 @@ impl BloomAttention {
             &format!("rust_baddbmm_value_layer_{}.npy", self.real_layer_number,),
         );
         let matmul_result = alibi
-            .f_baddbmm(&query_layer, &key_layer, beta, alpha)
+            .f_baddbmm_s(&query_layer, &key_layer, beta, alpha)
             .unwrap();
 
         save_layer_to_disk(
@@ -513,12 +514,30 @@ impl BloomAttention {
             &causal_mask,
             &format!("rust_softmax_attention_mask_{}.npy", self.real_layer_number,),
         );
+        save_layer_to_disk(
+            &attention_scores,
+            &format!(
+                "rust_softmax_attention_scores_{}.npy",
+                self.real_layer_number,
+            ),
+        );
         let attn_weights =
             attention_scores.masked_fill(&causal_mask, finfo_min(attention_scores.kind()));
+        save_layer_to_disk(
+            &attn_weights,
+            &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
+        );
         let attention_probs = attn_weights
             .f_softmax(-1, Kind::Float)
             .unwrap()
             .to_kind(input_dtype);
+        save_layer_to_disk(
+            &attention_probs,
+            &format!(
+                "rust_softmax_attention_probs_{}.npy",
+                self.real_layer_number,
+            ),
+        );
 
         let attention_probs_reshaped = attention_probs
             .f_view((batch_size * n_head, q_length, kv_length))
@@ -545,6 +564,16 @@ impl BloomAttention {
             &context_layer,
             &format!("rust_bmm_context_layer_{}.npy", self.real_layer_number,),
         );
+        let context_layer2 = Tensor::f_bmm(&attention_probs_reshaped, &value_layer).unwrap();
+        save_layer_to_disk(
+            &context_layer2,
+            &format!("rust_bmm_context_layer2_{}.npy", self.real_layer_number,),
+        );
+        let context_layer3 = Tensor::f_bmm(&attention_probs_reshaped, &value_layer).unwrap();
+        save_layer_to_disk(
+            &context_layer3,
+            &format!("rust_bmm_context_layer3_{}.npy", self.real_layer_number,),
+        );
         let context_layer_r = context_layer
             .f_view((batch_size, n_head, q_length, head_dim))
             .unwrap();
@@ -552,10 +581,6 @@ impl BloomAttention {
         let context = context_layer_p
             .f_view((batch_size, q_length, n_head * head_dim))
             .unwrap();
-        save_layer_to_disk(
-            &context,
-            &format!("rust_bmm_context_layer2_{}.npy", self.real_layer_number,),
-        );
         let mut output = if self.slow_but_exact {
             let slices = context.size().last().unwrap() / self.pretraining_tp;
             let mut output_tensor = Tensor::zeros_like(&context);

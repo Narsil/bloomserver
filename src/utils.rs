@@ -1,7 +1,7 @@
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 const DEBUG: bool = false;
-pub const SAVE: bool = true;
+pub const SAVE: bool = false;
 
 pub fn debug_force(prefix: &str, x: &Tensor) {
     let size = x.size();

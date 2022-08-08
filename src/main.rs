@@ -234,10 +234,25 @@ mod tests {
                 .service(generate),
         )
         .await;
+        // let req = test::TestRequest::post()
+        //     .uri("/generate")
+        //     .insert_header(ContentType::json())
+        //     .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+        //     .to_request();
+        // let resp = test::call_service(&app, req).await;
+        // assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        // let body = resp.into_body();
+        // let bytes = actix_web::body::to_bytes(body).await;
+        // assert_eq!(
+        //     bytes.unwrap(),
+        //     web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
+        // );
+
         let req = test::TestRequest::post()
             .uri("/generate")
             .insert_header(ContentType::json())
-            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .set_json(serde_json::json!({"inputs": "A \"whatpu\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \"farduddle\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is:", "parameters": {"max_new_tokens": 20}}))
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
@@ -246,7 +261,7 @@ mod tests {
         let bytes = actix_web::body::to_bytes(body).await;
         assert_eq!(
             bytes.unwrap(),
-            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
+            web::Bytes::from_static(b"[{\"generated_text\":\"A \\\"whatpu\\\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"farduddle\\\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"fardudd\"}]")
         );
     }
 
@@ -269,19 +284,19 @@ mod tests {
         )
         .await;
 
-        // let req = test::TestRequest::post()
-        //     .uri("/generate")
-        //     .insert_header(ContentType::json())
-        //     .set_json(serde_json::json!({"inputs": "test", "parameters": {"max_new_tokens": 20}}))
-        //     .to_request();
-        // let resp = test::call_service(&app, req).await;
-        // assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
-        // let body = resp.into_body();
-        // let bytes = actix_web::body::to_bytes(body).await;
-        // assert_eq!(
-        //     bytes.unwrap(),
-        //     web::Bytes::from_static(b"[{\"generated_text\":\"test.mark.parametrize('stdin, stdout', [\\n    ({'username': 'foo'\"}]")
-        // );
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "test", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"test.mark.parametrize('stdin, stdout', [\\n    ({'username': 'foo'\"}]")
+        );
 
         let req = test::TestRequest::post()
             .uri("/generate")
@@ -294,21 +309,35 @@ mod tests {
         let bytes = actix_web::body::to_bytes(body).await;
         assert_eq!(
             bytes.unwrap(),
-            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, reading, and spending time with my family. I am a member of the American Association of University\"}]")
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, reading, and spending time with my family. I am a very active person and love to be\"}]")
         );
 
-        // let req = test::TestRequest::post()
-        //     .uri("/generate")
-        //     .insert_header(ContentType::json())
-        //     .set_json(serde_json::json!({"inputs": "Math exercise - answers:\n34+10=44\n54+20=", "parameters": {"max_new_tokens": 20}}))
-        //     .to_request();
-        // let resp = test::call_service(&app, req).await;
-        // assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
-        // let body = resp.into_body();
-        // let bytes = actix_web::body::to_bytes(body).await;
-        // assert_eq!(
-        //     bytes.unwrap(),
-        //     web::Bytes::from_static(b"[{\"generated_text\":\"Math exercise - answers:\\n34+10=44\\n54+20=74\\n74+20=94\\n94+20=114\n114+20=134\\n\"}]")
-        // );
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "Math exercise - answers:\n34+10=44\n54+20=", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"Math exercise - answers:\\n34+10=44\\n54+20=74\\n74+20=94\\n94+20=114\\n114+20=134\\n\"}]")
+        );
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "A \"whatpu\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \"farduddle\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is:", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"A \\\"whatpu\\\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"farduddle\\\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is: The kids were jumping up and down on the trampoline and doing a farduddle. To\"}]")
+        );
     }
 }
