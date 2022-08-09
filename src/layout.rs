@@ -34,9 +34,9 @@ impl LayoutConfig {
             layers_per_thread: 5,
             layers_last_thread: 0,
             n_threads: 14,
-            embeddings_filename: "./bloom-embedding.bin".to_string(),
-            final_filename: "./bloom-final.bin".to_string(),
-            layer_template_filename: "./bloom-h.{}.bin".to_string(),
+            embeddings_filename: "./weights/bloom-embedding.bin".to_string(),
+            final_filename: "./weights/bloom-final.bin".to_string(),
+            layer_template_filename: "./weights/bloom-h.{}.bin".to_string(),
         }
     }
 
@@ -46,9 +46,9 @@ impl LayoutConfig {
             layers_per_thread: 1,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-testing.bin".to_string(),
-            final_filename: "./bloom-testing.bin".to_string(),
-            layer_template_filename: "./bloom-testing.bin".to_string(),
+            embeddings_filename: "./weights/bloom-testing.bin".to_string(),
+            final_filename: "./weights/bloom-testing.bin".to_string(),
+            layer_template_filename: "./weights/bloom-testing.bin".to_string(),
         }
     }
 
@@ -58,9 +58,9 @@ impl LayoutConfig {
             layers_per_thread: 5,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-embedding.bin".to_string(),
-            final_filename: "./bloom-final.bin".to_string(),
-            layer_template_filename: "./bloom-h.1.bin".to_string(),
+            embeddings_filename: "./weights/bloom-embedding.bin".to_string(),
+            final_filename: "./weights/bloom-final.bin".to_string(),
+            layer_template_filename: "./weights/bloom-h.1.bin".to_string(),
         }
     }
 
@@ -70,9 +70,9 @@ impl LayoutConfig {
             layers_per_thread: 12,
             layers_last_thread: 0,
             n_threads: 2,
-            embeddings_filename: "./bloom-350m.bin".to_string(),
-            final_filename: "./bloom-350m.bin".to_string(),
-            layer_template_filename: "./bloom-350m.bin".to_string(),
+            embeddings_filename: "./weights/bloom-350m.bin".to_string(),
+            final_filename: "./weights/bloom-350m.bin".to_string(),
+            layer_template_filename: "./weights/bloom-350m.bin".to_string(),
         }
     }
 }
