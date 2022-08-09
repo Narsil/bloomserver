@@ -19,7 +19,7 @@ def hf_hub_download(model_id, filename):
 
 
 def convert_350m():
-    filename = hf_hub_download("bigscience/bloom-350m", filename="pytorch_model.bin")
+    filename = hf_hub_download("bigscience/bloom-560m", filename="pytorch_model.bin")
     data = torch.load(filename, map_location="cpu")
 
     # Need to copy since that call mutates the tensors to numpy
@@ -58,5 +58,5 @@ def convert_full():
 
 if __name__ == "__main__":
     convert_testing()
-    convert_350mtesting()
-    raise Exception("Choose one of the weights to convert.")
+    convert_350m()
+    convert_full()
