@@ -543,11 +543,6 @@ impl BloomAttention {
             .f_view((batch_size * n_head, q_length, kv_length))
             .unwrap();
 
-        let attention_probs_reshaped2 = attention_probs_reshaped.to_device(Device::Cpu);
-        let attention_probs_reshaped =
-            attention_probs_reshaped2.to_device(attention_scores.device());
-        let value_layer2 = value_layer.to_device(Device::Cpu);
-        let value_layer = value_layer2.to_device(attention_scores.device());
         save_layer_to_disk(
             &attention_probs_reshaped,
             &format!(
