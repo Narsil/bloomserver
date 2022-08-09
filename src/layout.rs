@@ -371,6 +371,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
             // XXX actually clean the padded values of past so that subsequent
             // calls can get a chance to have a better padding (+ correct attention mask).
             let seq_length = Vec::<i64>::from(attention_mask.i(current_batch).sum(Kind::Int))[0];
+            let total_seq_length = attention_mask.size()[1];
             let past: Vec<_> = past_key_values
                 .iter()
                 .map(|layer_past| PastLayer {
@@ -378,12 +379,12 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
                         current_batch..current_batch + mini_batch_size,
                         ..,
                         ..,
-                        seq_length..,
+                        total_seq_length - seq_length..,
                     )),
                     value: layer_past.value.i((
                         current_batch..current_batch + mini_batch_size,
                         ..,
-                        seq_length..,
+                        total_seq_length - seq_length..,
                     )),
                 })
                 .collect();
