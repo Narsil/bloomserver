@@ -295,7 +295,9 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                         max_length_past - past_seq_length..,
                     ))
                     .f_copy_(&past_key_values[i].key)
-                    .unwrap()
+                    .unwrap();
+                layer_past
+                    .key
                     .view((mini_batch_size * config.n_head, config.hidden_size / config.n_head, past_seq_length));
 
 
@@ -315,7 +317,9 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                         ..,
                     ))
                     .f_copy_(&past_key_values[i].value)
-                    .unwrap()
+                    .unwrap();
+                layer_past
+                    .value
                     .view((mini_batch_size * config.n_head, past_seq_length, config.hidden_size / config.n_head));
             }
             _ = attention_mask
