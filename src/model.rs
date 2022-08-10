@@ -365,7 +365,7 @@ impl Linear {
         let flatten_xs = xs.view((-1, in_features));
 
         self.bias
-            .f_addbmm(&flatten_xs, &self.weight)
+            .f_addmm(&flatten_xs, &self.weight)
             .unwrap()
             .f_view(out_size.as_slice())
             .unwrap()
