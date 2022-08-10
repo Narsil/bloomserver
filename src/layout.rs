@@ -376,7 +376,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         debug("After ln_f", &hidden_states);
         let lm_logits = lm_head.forward(&hidden_states);
 
-        let mut current_batch = 0;
+        let mut current_batch = 0 as i64;
         for (mini_batch_size, rq) in rqs {
             // XXX actually clean the padded values of past so that subsequent
             // calls can get a chance to have a better padding (+ correct attention mask).
