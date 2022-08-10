@@ -196,12 +196,18 @@ pub fn thread1(
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
 
+        let input_size = input_ids.size();
+        let past_key_values_length = past_key_values[0].seq_length();
+        let causal_mask = prepare_attn_mask(
+            &attention_mask, input_size, past_key_values_length, config.n_head
+        );
+
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
-            hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+            hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
         // println!("Thread1 took {:?}", start.elapsed());
         s2.send((
-            (hidden_states, attention_mask, alibi, past_key_values),
+            (hidden_states, causal_mask, alibi, past_key_values),
             acks,
         ))
         .unwrap();
@@ -275,21 +281,21 @@ pub fn thread2(
         });
 
         for item in all_items {
-            let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) =
+            let ((mut hidden_states, mut causal_mask, mut alibi, mut past_key_values), rq) =
                 item;
             hidden_states = hidden_states.to_device(device);
-            attention_mask = attention_mask.to_device(device);
+            causal_mask = causal_mask.to_device(device);
             alibi = alibi.to_device(device);
 
             for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
-                hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+                hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
             }
             // println!(
             //     "Thread2 {thread_number} took {:?} on batch size {:?}",
             //     start.elapsed(),
             //     hidden_states.size()[0]
             // );
-            s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
+            s.send(((hidden_states, causal_mask, alibi, past_key_values), rq))
                 .unwrap();
         }
     }
@@ -349,17 +355,17 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     );
 
     loop {
-        let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
+        let ((mut hidden_states, mut causal_mask, mut alibi, mut past_key_values), rqs) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
 
         hidden_states = hidden_states.to_device(device);
-        attention_mask = attention_mask.to_device(device);
+        causal_mask = causal_mask.to_device(device);
         alibi = alibi.to_device(device);
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
             debug("past_key thread3", &layer_past.key);
             debug("past_values thread3", &layer_past.value);
-            hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+            hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
         debug("last_hidden_states", &hidden_states);
         hidden_states = ln_f.forward(&hidden_states);
