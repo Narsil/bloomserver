@@ -228,7 +228,7 @@ fn prepare_attn_mask(
         expanded_attn_mask
     };
     let result = combined_attention_mask
-        .f_repeat(&[num_attention_heads, 1 , 1])
+        .f_repeat(&[num_attention_heads, 1 , 1, 1])
         .unwrap();
     result
 }
