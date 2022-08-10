@@ -357,25 +357,17 @@ impl Linear {
     pub fn forward(&self, xs: &Tensor) -> Tensor {
         let in_features = self.weight.size()[0];
         let out_features = self.weight.size()[1];
-        let out_size = xs.size();
+        let mut out_size = xs.size();
         if let Some(last) = out_size.last_mut() {
             *last = out_features;
         }
-        let flatten_xs_view = xs
-            .view((-1, in_features));
 
-        let result;
-        if let Some(bias) = &self.bias {
-            result = flatten_xs_view
-                .f_addbmm(&self.weight, bias)
-                .unwrap();
-        } else {
-            result = flatten_xs_view
-                .f_mm(&self.weight)
-                .unwrap();
-        };
-
-        result.f_view(out_size).unwrap()
+        xs
+            .view((-1, in_features))
+            .f_addbmm(&self.weight, bias)
+            .unwrap()
+            .f_view(out_size)
+            .unwrap()
     }
 }
 
