@@ -35,8 +35,8 @@ pub fn non_empty_past(
         Tensor::zeros(&[batch_size * p, length_past, q], (config.kind, device)) + value;
     let all_past_key_values = (0..config.n_layer as usize)
         .map(|_| PastLayer {
-            key: past_key_template.copy(),
-            value: past_value_template.copy(),
+            key: past_key_template,
+            value: past_value_template,
         })
         .collect::<Vec<_>>();
     all_past_key_values
@@ -183,17 +183,18 @@ fn make_causal_mask(
     expanded_mask
 }
 
-/// Expands attention_mask from `[batch_size, src_length]` to `[batch_size, 1, tgt_length, src_length]`.
+/// Expands attention_mask from `[batch_size, src_length]` to `[batch_size, tgt_length, src_length]`.
 fn expand_mask(mask: &Tensor, tgt_length: i64) -> Tensor {
     // batch_size, src_length = mask.shape
     let batch_size = mask.size()[0];
     let src_length = mask.size()[1];
     // tgt_length = tgt_length if tgt_length is not None else src_length
 
-    // expanded_mask = ~(mask[:, None, None, :].to(torch.bool))
+    // expanded_mask = ~(mask[:, None, :].to(torch.bool))
     let expanded_mask = mask
         .unsqueeze(1)
         .to_kind(Kind::Bool)
+        // @TODO @thomas21: Make in-place
         .f_logical_not()
         .unwrap();
     // return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
@@ -210,9 +211,10 @@ pub fn prepare_attn_mask(
 ) -> Tensor {
     let device = attention_mask.device();
     // _, src_length = input_shape
+    let batch_size = input_size[0];
     let src_length = input_size[1];
 
-    // [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+    // [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
     // expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
     let expanded_attn_mask = expand_mask(attention_mask, src_length);
     // combined_attention_mask = (
@@ -225,8 +227,12 @@ pub fn prepare_attn_mask(
         expanded_attn_mask
     };
     let result = combined_attention_mask
-        .f_repeat(&[num_attention_heads, 1 , 1])
-        .unwrap();
+        .unsqueeze(1)
+        .f_repeat(&[1,num_attention_heads, 1 , 1])
+        .unwrap()
+        .view((batch_size * num_attention_heads, src_length, past_key_values_length));
+
+    println!("Causal mask: {:?}", result);
     result
 }
 
