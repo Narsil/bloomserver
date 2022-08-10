@@ -404,7 +404,7 @@ impl BloomAttention {
     ) -> Tensor {
         let layer_number = self.layer_number;
         let mixed_x_layer = self.query_key_value.forward(hidden_states);
-        let (batch_size, q_length, _) = mixed_x_layer.size();
+        let (batch_size, q_length) = if let [batch_size, q_length,] = mixed_x_layer.size()[..2] { (batch_size, q_length) } else { todo!() };
         debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
             batch_size,
@@ -431,24 +431,18 @@ impl BloomAttention {
             .reshape(&[batch_size, self.num_attention_heads, q_length, self.head_dim]);
 
         let key_layer = Tensor::f_cat(
-            &[&layer_past.key, key_layer.copy()],
+            &[&layer_past.key, &key_layer],
             3,
         )
         .unwrap();
         let value_layer = Tensor::f_cat(
-            &[&layer_past.value, value_layer.copy(), ],
+            &[&layer_past.value, &value_layer],
             2,
         )
         .unwrap();
 
-        let kv_length = key_layer.size()[3];
-
         // Update past for next loops
         let past_key_values_length = layer_past.seq_length();
-        *layer_past = PastLayer {
-            key: key_layer,
-            value: value_layer,
-        };
 
         let beta = 1.0;
         let alpha = self.norm_factor;
@@ -558,6 +552,13 @@ impl BloomAttention {
             &output,
             &format!("rust_bmm_dropout_{}.npy", self.real_layer_number,),
         );
+
+        // update layer_past
+        *layer_past = PastLayer {
+            key: key_layer,
+            value: value_layer,
+        };
+
         output
     }
 }
@@ -758,6 +759,7 @@ pub struct BloomModel {
     pub word_embeddings_layernorm: LayerNorm,
     pub h: Vec<BloomBlock>,
     pub ln_f: LayerNorm,
+    num_heads: i64
 }
 
 impl BloomModel {
@@ -773,11 +775,13 @@ impl BloomModel {
         let h = (0..config.n_layer)
             .map(|i| BloomBlock::new(config, &format!("h.{i}"), model, i as usize, device))
             .collect();
+        let num_heads = config.n_head;
         Self {
             word_embeddings,
             word_embeddings_layernorm,
             h,
             ln_f,
+            num_heads
         }
     }
 
@@ -800,8 +804,15 @@ impl BloomModel {
 
         debug("Alibi", alibi);
 
+
+        let input_size = input_ids.size();
+        let past_key_values_length = past_key_values[0].key.size()[-1];
+        let causal_mask = prepare_attn_mask(
+            &attention_mask, input_size, past_key_values_length, self.num_heads
+        );
+
         for (i, (block, layer_past)) in self.h.iter().zip(past_key_values.iter_mut()).enumerate() {
-            hidden_states = block.forward(&hidden_states, attention_mask, alibi, layer_past);
+            hidden_states = block.forward(&hidden_states, &causal_mask, alibi, layer_past);
             debug(&format!("Block {i}"), &hidden_states);
         }
         hidden_states = self.ln_f.forward(&hidden_states);
