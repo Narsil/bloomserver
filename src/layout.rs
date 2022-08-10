@@ -203,7 +203,7 @@ pub fn thread1(
         );
 
         let seq_lengths = Vec::<i64>::from(
-            attention_mask.sum_dim_intlist(&[-1], False,Kind::Int)
+            attention_mask.sum_dim_intlist(&[-1], false, Kind::Int)
         );
 
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
@@ -383,27 +383,22 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
 
             let seq_length = seq_lengths[current_batch];
             let total_seq_length = causal_mask.size()[1];
+            let start_batch_size_times_num_heads = current_batch * config.n_head;
+            let end_batch_size_times_num_heads = start_batch_size_times_num_heads + mini_batch_size * config.n_head;
             let past: Vec<_> = past_key_values
                 .iter()
                 .map(|layer_past| PastLayer {
                     key: layer_past
                         .key
-                        .view(
-                            (batch_size, config.n_head, config.hidden_size / config.n_head, max_length_past)
-                        )
                         .i((
-                            current_batch..current_batch + mini_batch_size,
-                            ..,
+                            start_batch_size_times_num_heads..end_batch_size_times_num_heads,
                             ..,
                             total_seq_length - seq_length..,
                         )),
                     value: layer_past
                         .value
-                        .view(
-                            (batch_size, config.n_head, max_length_past, config.hidden_size / config.n_head)
-                        )
                         .i((
-                        current_batch..current_batch + mini_batch_size,
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
                         ..,
                         total_seq_length - seq_length..,
                     )),
