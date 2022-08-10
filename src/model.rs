@@ -325,6 +325,9 @@ impl LayerNorm {
     }
 }
 
+/// Different from usual Linear in order to remove transpose operation:
+/// weight: [in_features, out_features]
+/// bias: [out_features]
 pub struct Linear {
     weight: Tensor,
     bias: Tensor,
@@ -338,7 +341,7 @@ impl Linear {
                 .tensor(&tname)
                 .unwrap_or_else(|_| panic!("Could not find {tname}")),
             device,
-        );
+        ).f_transpose_copy(1,0).unwrap();
 
         let bias_name = format!("{name}.bias");
         let bias = convert(
@@ -352,7 +355,27 @@ impl Linear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Tensor {
-        xs.f_linear(&self.weight, Some(&self.bias)).unwrap()
+        let in_features = self.weight.size()[0];
+        let out_features = self.weight.size()[1];
+        let out_size = xs.size();
+        if let Some(last) = out_size.last_mut() {
+            *last = out_features;
+        }
+        let flatten_xs_view = xs
+            .view((-1, in_features));
+
+        let result;
+        if let Some(bias) = &self.bias {
+            result = flatten_xs_view
+                .f_addbmm(&self.weight, bias)
+                .unwrap();
+        } else {
+            result = flatten_xs_view
+                .f_mm(&self.weight)
+                .unwrap();
+        };
+
+        result.f_view(out_size).unwrap()
     }
 }
 
