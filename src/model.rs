@@ -35,8 +35,8 @@ pub fn non_empty_past(
         Tensor::zeros(&[batch_size * p, length_past, q], (config.kind, device)) + value;
     let all_past_key_values = (0..config.n_layer as usize)
         .map(|_| PastLayer {
-            key: past_key_template,
-            value: past_value_template,
+            key: past_key_template.copy(),
+            value: past_value_template.copy(),
         })
         .collect::<Vec<_>>();
     all_past_key_values
