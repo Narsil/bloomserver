@@ -422,13 +422,13 @@ impl BloomAttention {
 
         let query_layer = query
             .transpose(1, 2)
-            .reshape(&[batch_size, self.num_attention_heads, q_length, self.head_dim]);
+            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
         let key_layer = key
             .permute(&[0, 2, 3, 1])
-            .reshape(&[batch_size, self.num_attention_heads, self.head_dim, q_length]);
+            .reshape(&[batch_size * self.num_attention_heads, self.head_dim, q_length]);
         let value_layer = value
             .transpose(1, 2)
-            .reshape(&[batch_size, self.num_attention_heads, q_length, self.head_dim]);
+            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
 
         let device = query_layer.device();
         let key_layer = Tensor::f_cat(
