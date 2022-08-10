@@ -202,7 +202,7 @@ fn expand_mask(mask: &Tensor, tgt_length: i64) -> Tensor {
         .unwrap()
 }
 
-fn prepare_attn_mask(
+pub fn prepare_attn_mask(
     attention_mask: &Tensor,
     input_size: Vec<i64>,
     past_key_values_length: i64,

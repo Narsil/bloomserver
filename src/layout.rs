@@ -1,5 +1,5 @@
 use crate::generation::padding;
-use crate::model::{BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm, Past, PastLayer};
+use crate::model::{BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm, Past, PastLayer, prepare_attn_mask};
 use crate::utils::debug;
 use crossbeam_channel::{Receiver, Select, Sender};
 use memmap::MmapOptions;
@@ -10,7 +10,7 @@ use tch::{kind::Kind, Device, IndexOp, Tensor};
 /// Size of batch and response channel
 pub type Ack = (i64, Sender<(Tensor, Past)>);
 pub type Msg = (Tensor, Past, Ack);
-pub type Msg2 = ((Tensor, Tensor, Tensor, Past), Vec<Ack>);
+pub type Msg2 = ((Tensor, Tensor, Tensor, Past, Vec<i64>), Vec<Ack>);
 pub type RChan1 = Receiver<Msg>;
 pub type SChan1 = Sender<Msg>;
 pub type RChan = Receiver<Msg2>;
@@ -202,12 +202,16 @@ pub fn thread1(
             &attention_mask, input_size, past_key_values_length, config.n_head
         );
 
+        let seq_lengths = Vec::<i64>::from(
+            attention_mask.sum_dim_intlist(&[-1], False,Kind::Int)
+        );
+
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
         // println!("Thread1 took {:?}", start.elapsed());
         s2.send((
-            (hidden_states, causal_mask, alibi, past_key_values),
+            (hidden_states, causal_mask, alibi, past_key_values, seq_lengths),
             acks,
         ))
         .unwrap();
@@ -281,7 +285,7 @@ pub fn thread2(
         });
 
         for item in all_items {
-            let ((mut hidden_states, mut causal_mask, mut alibi, mut past_key_values), rq) =
+            let ((mut hidden_states, mut causal_mask, mut alibi, mut past_key_values, seq_lengths), rq) =
                 item;
             hidden_states = hidden_states.to_device(device);
             causal_mask = causal_mask.to_device(device);
@@ -295,7 +299,7 @@ pub fn thread2(
             //     start.elapsed(),
             //     hidden_states.size()[0]
             // );
-            s.send(((hidden_states, causal_mask, alibi, past_key_values), rq))
+            s.send(((hidden_states, causal_mask, alibi, past_key_values, seq_lengths), rq))
                 .unwrap();
         }
     }
@@ -355,7 +359,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     );
 
     loop {
-        let ((mut hidden_states, mut causal_mask, mut alibi, mut past_key_values), rqs) = rx
+        let ((mut hidden_states, mut causal_mask, mut alibi, mut past_key_values, seq_lengths), rqs) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
 
@@ -376,18 +380,29 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         for (mini_batch_size, rq) in rqs {
             // XXX actually clean the padded values of past so that subsequent
             // calls can get a chance to have a better padding (+ correct attention mask).
-            let seq_length = Vec::<i64>::from(attention_mask.i(current_batch).sum(Kind::Int))[0];
-            let total_seq_length = attention_mask.size()[1];
+
+            let seq_length = seq_lengths[current_batch];
+            let total_seq_length = causal_mask.size()[1];
             let past: Vec<_> = past_key_values
                 .iter()
                 .map(|layer_past| PastLayer {
-                    key: layer_past.key.i((
-                        current_batch..current_batch + mini_batch_size,
-                        ..,
-                        ..,
-                        total_seq_length - seq_length..,
-                    )),
-                    value: layer_past.value.i((
+                    key: layer_past
+                        .key
+                        .view(
+                            (batch_size, config.n_head, config.hidden_size / config.n_head, max_length_past)
+                        )
+                        .i((
+                            current_batch..current_batch + mini_batch_size,
+                            ..,
+                            ..,
+                            total_seq_length - seq_length..,
+                        )),
+                    value: layer_past
+                        .value
+                        .view(
+                            (batch_size, config.n_head, max_length_past, config.hidden_size / config.n_head)
+                        )
+                        .i((
                         current_batch..current_batch + mini_batch_size,
                         ..,
                         total_seq_length - seq_length..,
