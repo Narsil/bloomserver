@@ -226,13 +226,12 @@ pub fn prepare_attn_mask(
     } else {
         expanded_attn_mask
     };
-    let result = combined_attention_mask
-        .unsqueeze(1)
-        .f_repeat(&[1,num_attention_heads, 1 , 1])
-        .unwrap()
-        .view((batch_size * num_attention_heads, src_length, past_key_values_length));
 
-    println!("Causal mask: {:?}", result);
+    // [batch_size, seq_length] -> [batch_size * num_attention_heads, tgt_length, src_length]
+    let result = combined_attention_mask
+        .f_repeat_interleave_self_int(num_attention_heads, 0, batch_size * num_attention_heads)
+        .unwrap();
+
     result
 }
 
