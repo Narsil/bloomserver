@@ -11,7 +11,7 @@ pub struct PastLayer {
 
 impl PastLayer {
     pub fn seq_length(&self) -> i64 {
-        return self.key.size()[3];
+        return self.key.size()[2];
     }
 }
 
@@ -807,7 +807,7 @@ impl BloomModel {
 
 
         let input_size = input_ids.size();
-        let past_key_values_length = past_key_values[0].value.size()[1];
+        let past_key_values_length = past_key_values[0].seq_length();
         let causal_mask = prepare_attn_mask(
             &attention_mask, input_size, past_key_values_length, self.num_heads
         );
