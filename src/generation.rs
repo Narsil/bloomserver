@@ -283,22 +283,17 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                 // println!("max past {:?}", max_length_past);
                 // println!("past_seq_length {:?}", past_seq_length);
                 // println!("key {:?}", past_key_values[i].key.size());
+                let start_batch_size_times_num_heads = current_batch * config.n_head;
+                let end_batch_size_times_num_heads = start_batch_size_times_num_heads + mini_batch_size * config.n_head;
                 layer_past
                     .key
-                    .view(
-                        (batch_size, config.n_head, config.hidden_size / config.n_head, max_length_past)
-                    )
                     .i((
-                        current_batch..current_batch + mini_batch_size,
-                        ..,
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
                         ..,
                         max_length_past - past_seq_length..,
                     ))
                     .f_copy_(&past_key_values[i].key)
                     .unwrap();
-                layer_past.key = layer_past.key
-                    .view((mini_batch_size * config.n_head, config.hidden_size / config.n_head, past_seq_length));
-
 
                 // println!("layer past value {:?}", layer_past.value.size());
                 // println!("max past {:?}", max_length_past);
@@ -306,19 +301,12 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                 // println!("value {:?}", past_key_values[i].value.size());
                 layer_past
                     .value
-                    .view(
-                        (batch_size, config.n_head, max_length_past, config.hidden_size / config.n_head)
-                    )
                     .i((
-                        current_batch..current_batch + mini_batch_size,
-                        ..,
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
                         max_length_past - past_seq_length..,
-                        ..,
                     ))
                     .f_copy_(&past_key_values[i].value)
                     .unwrap();
-                layer_past.value = layer_past.value
-                    .view((mini_batch_size * config.n_head, past_seq_length, config.hidden_size / config.n_head));
             }
             _ = attention_mask
                 .i((
