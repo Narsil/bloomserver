@@ -203,7 +203,7 @@ pub fn thread1(
         );
 
         let seq_lengths = Vec::<i64>::from(
-            attention_mask.sum_dim_intlist(&[-1], false, Kind::Int)
+            attention_mask.f_sum_dim_intlist(&[-1], false, Kind::Int).unwrap()
         );
 
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
