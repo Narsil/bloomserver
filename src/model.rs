@@ -30,9 +30,9 @@ pub fn non_empty_past(
     let p = config.n_head;
     let q = config.hidden_size / config.n_head;
     let past_key_template =
-        Tensor::zeros(&[batch_size, p, q, length_past], (config.kind, device)) + key;
+        Tensor::zeros(&[batch_size * p, q, length_past], (config.kind, device)) + key;
     let past_value_template =
-        Tensor::zeros(&[batch_size, p, length_past, q], (config.kind, device)) + value;
+        Tensor::zeros(&[batch_size * p, length_past, q], (config.kind, device)) + value;
     let all_past_key_values = (0..config.n_layer as usize)
         .map(|_| PastLayer {
             key: past_key_template.copy(),

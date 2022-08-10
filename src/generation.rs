@@ -285,6 +285,9 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                 // println!("key {:?}", past_key_values[i].key.size());
                 layer_past
                     .key
+                    .view(
+                        &[batch_size, config.n_head, config.hidden_size / config.n_head, max_length_past]
+                    )
                     .i((
                         current_batch..current_batch + mini_batch_size,
                         ..,
@@ -300,6 +303,9 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                 // println!("value {:?}", past_key_values[i].value.size());
                 layer_past
                     .value
+                    .view(
+                        &[batch_size, config.n_head, max_length_past, config.hidden_size / config.n_head]
+                    )
                     .i((
                         current_batch..current_batch + mini_batch_size,
                         ..,
