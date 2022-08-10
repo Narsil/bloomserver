@@ -430,13 +430,14 @@ impl BloomAttention {
             .transpose(1, 2)
             .reshape(&[batch_size, self.num_attention_heads, q_length, self.head_dim]);
 
+        let device = query_layer.device();
         let key_layer = Tensor::f_cat(
-            &[&layer_past.key, &key_layer],
+            &[&layer_past.key.to_device(device), &key_layer],
             3,
         )
         .unwrap();
         let value_layer = Tensor::f_cat(
-            &[&layer_past.value, &value_layer],
+            &[&layer_past.value.to_device(device), &value_layer],
             2,
         )
         .unwrap();
