@@ -381,7 +381,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
             // XXX actually clean the padded values of past so that subsequent
             // calls can get a chance to have a better padding (+ correct attention mask).
             let seq_length = seq_lengths[current_batch as usize];
-            let total_seq_length = causal_mask.size()[1];
+            let total_seq_length = causal_mask.size()[2];
             let start_batch_size_times_num_heads = current_batch * config.n_head;
             let end_batch_size_times_num_heads = start_batch_size_times_num_heads + mini_batch_size * config.n_head;
             let past: Vec<_> = past_key_values
@@ -397,10 +397,9 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
                     value: layer_past
                         .value
                         .i((
-                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
-                        total_seq_length - seq_length..,
-                        ..,
-                    )),
+                            start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                            total_seq_length - seq_length..,
+                        )),
                 })
                 .collect();
             let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
