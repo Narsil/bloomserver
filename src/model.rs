@@ -461,12 +461,6 @@ impl BloomAttention {
         )
         .unwrap();
 
-        // Update past for next loops
-        let past_key_values_length = layer_past.seq_length();
-
-        let beta = 1.0;
-        let alpha = self.norm_factor;
-
         save_layer_to_disk(
             &alibi,
             &format!("rust_baddbmm_sliced_alibi_{}.npy", self.real_layer_number,),
@@ -483,8 +477,9 @@ impl BloomAttention {
             &value_layer,
             &format!("rust_baddbmm_value_layer_{}.npy", self.real_layer_number,),
         );
+
         let mut attention_scores = alibi
-            .f_baddbmm_s(&query_layer, &key_layer, beta, alpha)
+            .f_baddbmm_s(&query_layer, &key_layer, 1.0, self.norm_factor)
             .unwrap();
 
         save_layer_to_disk(
@@ -507,7 +502,7 @@ impl BloomAttention {
             ),
         );
         let attn_weights =
-            attention_scores.masked_fill(&attention_mask, finfo_min(attention_scores.kind()));
+            attention_scores.masked_fill_(&attention_mask, finfo_min(attention_scores.kind()));
         save_layer_to_disk(
             &attn_weights,
             &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
@@ -621,7 +616,7 @@ impl BloomMlp {
             &format!("rust_mlp_gelu_{}.npy", self.real_layer_number,),
         );
         debug("hidden_states gelu", &hidden_states);
-        let hidden_states = if self.slow_but_exact {
+        let mut hidden_states = if self.slow_but_exact {
             let mut intermediate_output = Tensor::zeros_like(residual);
             let slices = self.dense_4h_to_h.weight.size().last().unwrap() / self.pretraining_tp;
             for i in 0..self.pretraining_tp {
@@ -638,7 +633,7 @@ impl BloomMlp {
             self.dense_4h_to_h.forward(&hidden_states)
         };
         debug("hidden_states 4h to h", &hidden_states);
-        let hidden_states = hidden_states + residual;
+        hidden_states += residual;
         debug("hidden_states residual", &hidden_states);
         save_layer_to_disk(
             &hidden_states,
