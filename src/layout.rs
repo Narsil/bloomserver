@@ -398,8 +398,8 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
                         .value
                         .i((
                         start_batch_size_times_num_heads..end_batch_size_times_num_heads,
-                        ..,
                         total_seq_length - seq_length..,
+                        ..,
                     )),
                 })
                 .collect();
