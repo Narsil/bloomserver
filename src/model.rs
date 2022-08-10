@@ -433,12 +433,12 @@ impl BloomAttention {
         let device = query_layer.device();
         let key_layer = Tensor::f_cat(
             &[&layer_past.key.to_device(device), &key_layer],
-            3,
+            2,
         )
         .unwrap();
         let value_layer = Tensor::f_cat(
             &[&layer_past.value.to_device(device), &value_layer],
-            2,
+            1,
         )
         .unwrap();
 
