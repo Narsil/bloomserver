@@ -499,16 +499,6 @@ impl BloomAttention {
             attention_scores = attention_scores.to_kind(Kind::Float);
         }
 
-        // let causal_mask = prepare_attn_mask(
-        //     &attention_mask,
-        //     hidden_states.size(),
-        //     past_key_values_length,
-        //     self.num_attention_heads
-        // );
-        // save_layer_to_disk(
-        //     &causal_mask,
-        //     &format!("rust_softmax_attention_mask_{}.npy", self.real_layer_number,),
-        // );
         save_layer_to_disk(
             &attention_scores,
             &format!(
@@ -591,6 +581,7 @@ pub struct BloomMlp {
     pretraining_tp: i64,
 }
 
+// TODO @thomasw21: Figure out how to compile this into a single operation.
 fn bloom_gelu(x: &Tensor) -> Tensor {
     let y: Tensor = 0.79788456 * x * (1.0 + 0.044715 * x * x);
     x * 0.5 * (1.0 + y.tanh())
