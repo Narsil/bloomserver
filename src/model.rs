@@ -364,9 +364,9 @@ impl Linear {
 
         xs
             .view((-1, in_features))
-            .f_addbmm(&self.weight, bias)
+            .f_addbmm(&self.weight, &self.bias)
             .unwrap()
-            .f_view(out_size)
+            .f_view(out_size.as_slice())
             .unwrap()
     }
 }
