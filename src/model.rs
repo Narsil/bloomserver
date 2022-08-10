@@ -209,6 +209,7 @@ fn prepare_attn_mask(
     attention_mask: &Tensor,
     input_size: Vec<i64>,
     past_key_values_length: i64,
+    num_attention_heads: i64,
 ) -> Tensor {
     let device = attention_mask.device();
     // _, src_length = input_shape
@@ -226,7 +227,10 @@ fn prepare_attn_mask(
     } else {
         expanded_attn_mask
     };
-    combined_attention_mask
+    let result = combined_attention_mask
+        .f_repeat(&[num_attention_heads, 1 , 1])
+        .unwrap();
+    result
 }
 
 pub fn build_alibi_tensor(
@@ -399,50 +403,40 @@ impl BloomAttention {
         layer_past: &mut PastLayer,
     ) -> Tensor {
         let layer_number = self.layer_number;
-        let mut mixed_x_layer = self.query_key_value.forward(hidden_states);
+        let mixed_x_layer = self.query_key_value.forward(hidden_states);
+        let (batch_size, q_length, _) = mixed_x_layer.size();
         debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
-            mixed_x_layer.size()[0],
-            mixed_x_layer.size()[1],
+            batch_size,
+            q_length,
             self.num_attention_heads,
             3 * self.head_dim,
         ];
-        let layer_number = self.layer_number;
-        debug(&format!("Mixed x layer {layer_number}"), &mixed_x_layer);
-        mixed_x_layer = mixed_x_layer.f_view(new_tensor_shape).unwrap();
+        let mixed_x_layer_view = mixed_x_layer.f_view(new_tensor_shape).unwrap();
         // Split.
-        let tensor_list = mixed_x_layer.split(self.head_dim, 3);
+        let tensor_list = mixed_x_layer_view.split(self.head_dim, 3);
         let (query, key, value) = match &tensor_list[..] {
             [query, key, value] => (query, key, value),
             _ => unreachable!(),
         };
-        let device = key.device();
-
-        let batch_size = query.size()[0];
-        let q_length = query.size()[1];
-        let n_head = query.size()[2];
-        let head_dim = query.size()[3];
 
         let query_layer = query
             .transpose(1, 2)
-            .reshape(&[batch_size, n_head, q_length, head_dim]);
+            .reshape(&[batch_size, self.num_attention_heads, q_length, self.head_dim]);
         let key_layer = key
             .permute(&[0, 2, 3, 1])
-            .reshape(&[batch_size, n_head, head_dim, q_length]);
+            .reshape(&[batch_size, self.num_attention_heads, self.head_dim, q_length]);
         let value_layer = value
             .transpose(1, 2)
-            .reshape(&[batch_size, n_head, q_length, head_dim]);
+            .reshape(&[batch_size, self.num_attention_heads, q_length, self.head_dim]);
 
         let key_layer = Tensor::f_cat(
-            &[layer_past.key.as_ref().to_device(device), key_layer.copy()],
+            &[&layer_past.key, key_layer.copy()],
             3,
         )
         .unwrap();
         let value_layer = Tensor::f_cat(
-            &[
-                layer_past.value.as_ref().to_device(device),
-                value_layer.copy(),
-            ],
+            &[&layer_past.value, value_layer.copy(), ],
             2,
         )
         .unwrap();
@@ -452,19 +446,9 @@ impl BloomAttention {
         // Update past for next loops
         let past_key_values_length = layer_past.seq_length();
         *layer_past = PastLayer {
-            key: key_layer.copy(),
-            value: value_layer.copy(),
+            key: key_layer,
+            value: value_layer,
         };
-
-        let query_layer = query_layer
-            .f_reshape(&[-1, query_layer.size()[2], query_layer.size()[3]])
-            .unwrap();
-        let key_layer = key_layer
-            .f_reshape(&[-1, key_layer.size()[2], key_layer.size()[3]])
-            .unwrap();
-        let value_layer = value_layer
-            .f_reshape(&[-1, value_layer.size()[2], value_layer.size()[3]])
-            .unwrap();
 
         let beta = 1.0;
         let alpha = self.norm_factor;
@@ -485,18 +469,14 @@ impl BloomAttention {
             &value_layer,
             &format!("rust_baddbmm_value_layer_{}.npy", self.real_layer_number,),
         );
-        let matmul_result = alibi
+        let mut attention_scores = alibi
             .f_baddbmm_s(&query_layer, &key_layer, beta, alpha)
             .unwrap();
 
         save_layer_to_disk(
-            &matmul_result,
+            &attention_scores,
             &format!("rust_baddbmm_matmul_result_{}.npy", self.real_layer_number,),
         );
-
-        let mut attention_scores = matmul_result
-            .f_view((batch_size, n_head, q_length, kv_length))
-            .unwrap();
 
         // cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
         let input_dtype = attention_scores.kind();
@@ -509,6 +489,7 @@ impl BloomAttention {
             &attention_mask,
             hidden_states.size(),
             past_key_values_length,
+            self.num_attention_heads
         );
         save_layer_to_disk(
             &causal_mask,
@@ -539,42 +520,18 @@ impl BloomAttention {
             ),
         );
 
-        let attention_probs_reshaped = attention_probs
-            .f_view((batch_size * n_head, q_length, kv_length))
-            .unwrap();
-
-        save_layer_to_disk(
-            &attention_probs_reshaped,
-            &format!(
-                "rust_bmm_attention_probs_reshaped_{}.npy",
-                self.real_layer_number,
-            ),
-        );
         save_layer_to_disk(
             &value_layer,
             &format!("rust_bmm_value_layer_{}.npy", self.real_layer_number,),
         );
-        let context_layer = Tensor::f_bmm(&attention_probs_reshaped, &value_layer).unwrap();
-        save_layer_to_disk(
-            &context_layer,
-            &format!("rust_bmm_context_layer_{}.npy", self.real_layer_number,),
-        );
-        let context_layer2 = Tensor::f_bmm(&attention_probs_reshaped, &value_layer).unwrap();
-        save_layer_to_disk(
-            &context_layer2,
-            &format!("rust_bmm_context_layer2_{}.npy", self.real_layer_number,),
-        );
-        let context_layer3 = Tensor::f_bmm(&attention_probs_reshaped, &value_layer).unwrap();
-        save_layer_to_disk(
-            &context_layer3,
-            &format!("rust_bmm_context_layer3_{}.npy", self.real_layer_number,),
-        );
+        let context_layer = Tensor::f_bmm(&attention_probs, &value_layer).unwrap();
+
         let context_layer_r = context_layer
-            .f_view((batch_size, n_head, q_length, head_dim))
+            .f_view((batch_size, self.num_attention_heads, q_length, self.head_dim))
             .unwrap();
         let context_layer_p = context_layer_r.permute(&[0, 2, 1, 3]).contiguous();
         let context = context_layer_p
-            .f_view((batch_size, q_length, n_head * head_dim))
+            .f_view((batch_size, q_length, self.num_attention_heads * self.head_dim))
             .unwrap();
         let mut output = if self.slow_but_exact {
             let slices = context.size().last().unwrap() / self.pretraining_tp;
