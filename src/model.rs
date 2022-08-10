@@ -477,16 +477,16 @@ impl BloomAttention {
             attention_scores = attention_scores.to_kind(Kind::Float);
         }
 
-        let causal_mask = prepare_attn_mask(
-            &attention_mask,
-            hidden_states.size(),
-            past_key_values_length,
-            self.num_attention_heads
-        );
-        save_layer_to_disk(
-            &causal_mask,
-            &format!("rust_softmax_attention_mask_{}.npy", self.real_layer_number,),
-        );
+        // let causal_mask = prepare_attn_mask(
+        //     &attention_mask,
+        //     hidden_states.size(),
+        //     past_key_values_length,
+        //     self.num_attention_heads
+        // );
+        // save_layer_to_disk(
+        //     &causal_mask,
+        //     &format!("rust_softmax_attention_mask_{}.npy", self.real_layer_number,),
+        // );
         save_layer_to_disk(
             &attention_scores,
             &format!(
@@ -495,7 +495,7 @@ impl BloomAttention {
             ),
         );
         let attn_weights =
-            attention_scores.masked_fill(&causal_mask, finfo_min(attention_scores.kind()));
+            attention_scores.masked_fill(&attention_mask, finfo_min(attention_scores.kind()));
         save_layer_to_disk(
             &attn_weights,
             &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
