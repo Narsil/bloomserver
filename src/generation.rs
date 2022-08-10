@@ -301,7 +301,7 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
 
 
                 // println!("layer past value {:?}", layer_past.value.size());
-                // println!("max pxast {:?}", max_length_past);
+                // println!("max past {:?}", max_length_past);
                 // println!("past_seq_length {:?}", past_seq_length);
                 // println!("value {:?}", past_key_values[i].value.size());
                 layer_past
