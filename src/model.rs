@@ -170,11 +170,9 @@ fn make_causal_mask(
     // expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
     let expanded_mask = mask
         .unsqueeze(0)
-        .unsqueeze(0)
         .f_expand(
             &[
                 batch_size,
-                1,
                 target_length,
                 target_length + past_key_values_length,
             ],
@@ -195,13 +193,12 @@ fn expand_mask(mask: &Tensor, tgt_length: i64) -> Tensor {
     // expanded_mask = ~(mask[:, None, None, :].to(torch.bool))
     let expanded_mask = mask
         .unsqueeze(1)
-        .unsqueeze(1)
         .to_kind(Kind::Bool)
         .f_logical_not()
         .unwrap();
     // return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
     expanded_mask
-        .f_expand(&[batch_size, 1, tgt_length, src_length], true)
+        .f_expand(&[batch_size, tgt_length, src_length], true)
         .unwrap()
 }
 
@@ -228,7 +225,7 @@ fn prepare_attn_mask(
         expanded_attn_mask
     };
     let result = combined_attention_mask
-        .f_repeat(&[num_attention_heads, 1 , 1, 1])
+        .f_repeat(&[num_attention_heads, num_attention_heads , 1, 1])
         .unwrap();
     result
 }
