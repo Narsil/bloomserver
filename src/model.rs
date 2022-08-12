@@ -341,7 +341,9 @@ impl Linear {
                 .tensor(&tname)
                 .unwrap_or_else(|_| panic!("Could not find {tname}")),
             device,
-        ).f_transpose_copy(1,0).unwrap();
+        )
+        .f_transpose_copy(1, 0)
+        .unwrap();
 
         let bias_name = format!("{name}.bias");
         let bias = convert(
@@ -422,7 +424,11 @@ impl BloomAttention {
     ) -> Tensor {
         let layer_number = self.layer_number;
         let mixed_x_layer = self.query_key_value.forward(hidden_states);
-        let (batch_size, q_length) = if let [batch_size, q_length,] = mixed_x_layer.size()[..2] { (batch_size, q_length) } else { todo!() };
+        let (batch_size, q_length) = if let [batch_size, q_length] = mixed_x_layer.size()[..2] {
+            (batch_size, q_length)
+        } else {
+            todo!()
+        };
         debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
             batch_size,
@@ -438,28 +444,27 @@ impl BloomAttention {
             _ => unreachable!(),
         };
 
-        let query_layer = query
-            .transpose(1, 2)
-            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
-        let key_layer = key
-            .permute(&[0, 2, 3, 1])
-            .reshape(&[batch_size * self.num_attention_heads, self.head_dim, q_length]);
-        let value_layer = value
-            .transpose(1, 2)
-            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
+        let query_layer = query.transpose(1, 2).reshape(&[
+            batch_size * self.num_attention_heads,
+            q_length,
+            self.head_dim,
+        ]);
+        let key_layer = key.permute(&[0, 2, 3, 1]).reshape(&[
+            batch_size * self.num_attention_heads,
+            self.head_dim,
+            q_length,
+        ]);
+        let value_layer = value.transpose(1, 2).reshape(&[
+            batch_size * self.num_attention_heads,
+            q_length,
+            self.head_dim,
+        ]);
 
         // TODO @thomasw21: Figure out why we need to cast to device here.
         let device = query_layer.device();
-        let key_layer = Tensor::f_cat(
-            &[&layer_past.key.to_device(device), &key_layer],
-            2,
-        )
-        .unwrap();
-        let value_layer = Tensor::f_cat(
-            &[&layer_past.value.to_device(device), &value_layer],
-            1,
-        )
-        .unwrap();
+        let key_layer = Tensor::f_cat(&[&layer_past.key.to_device(device), &key_layer], 2).unwrap();
+        let value_layer =
+            Tensor::f_cat(&[&layer_past.value.to_device(device), &value_layer], 1).unwrap();
 
         save_layer_to_disk(
             &alibi,
@@ -526,11 +531,20 @@ impl BloomAttention {
         let context_layer = Tensor::f_bmm(&attention_probs, &value_layer).unwrap();
 
         let context_layer_r = context_layer
-            .f_view((batch_size, self.num_attention_heads, q_length, self.head_dim))
+            .f_view((
+                batch_size,
+                self.num_attention_heads,
+                q_length,
+                self.head_dim,
+            ))
             .unwrap();
         let context_layer_p = context_layer_r.permute(&[0, 2, 1, 3]).contiguous();
         let context = context_layer_p
-            .f_view((batch_size, q_length, self.num_attention_heads * self.head_dim))
+            .f_view((
+                batch_size,
+                q_length,
+                self.num_attention_heads * self.head_dim,
+            ))
             .unwrap();
         let mut output = if self.slow_but_exact {
             let slices = context.size().last().unwrap() / self.pretraining_tp;
@@ -765,7 +779,7 @@ pub struct BloomModel {
     pub word_embeddings_layernorm: LayerNorm,
     pub h: Vec<BloomBlock>,
     pub ln_f: LayerNorm,
-    num_heads: i64
+    num_heads: i64,
 }
 
 impl BloomModel {
@@ -787,7 +801,7 @@ impl BloomModel {
             word_embeddings_layernorm,
             h,
             ln_f,
-            num_heads
+            num_heads,
         }
     }
 
@@ -810,11 +824,13 @@ impl BloomModel {
 
         debug("Alibi", alibi);
 
-
         let input_size = input_ids.size();
         let past_key_values_length = past_key_values[0].seq_length();
         let causal_mask = prepare_attn_mask(
-            &attention_mask, input_size, past_key_values_length, self.num_heads
+            &attention_mask,
+            input_size,
+            past_key_values_length,
+            self.num_heads,
         );
 
         for (i, (block, layer_past)) in self.h.iter().zip(past_key_values.iter_mut()).enumerate() {

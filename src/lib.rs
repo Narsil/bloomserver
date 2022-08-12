@@ -4,6 +4,7 @@ pub mod layout;
 pub mod model;
 #[cfg(test)]
 mod test;
+pub mod tp_layout;
 pub mod utils;
 
 pub use crate::model::{empty_past, non_empty_past};

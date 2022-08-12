@@ -3,15 +3,17 @@ use actix_web::middleware::Logger;
 use actix_web::{http::header::ContentType, post, web, App, HttpResponse, HttpServer};
 use crossbeam_channel::{bounded, unbounded, Sender};
 use log::info;
+use nccl_rs::ThreadGroup;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
-use tch::{kind, Device, IndexOp, Tensor};
+use tch::{kind, Cuda, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 use bloomserver::generation::next_ids;
 use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2, SChan1};
 use bloomserver::model::{Config, Past};
+use bloomserver::tp_layout::thread as tp_thread;
 use bloomserver::utils::SAVE;
 use bloomserver::{empty_past, Generation, GenerationError};
 
@@ -116,6 +118,44 @@ async fn generate(
     Ok(HttpResponse::Ok()
         .content_type(ContentType::json())
         .json(json!([{ "generated_text": string }])))
+}
+
+fn init_threads_tp(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    tch::maybe_init_cuda();
+    let start = std::time::Instant::now();
+    let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
+    println!("Loaded tokenizer in {:?}", start.elapsed());
+    println!("Starting threads {:?}", std::time::Instant::now());
+
+    let (tx, rx) = bounded::<Msg>(1);
+    let (prio_tx, prio_rx) = unbounded::<Msg>();
+
+    let world_size = Cuda::device_count() as i32;
+
+    let config = match model_name {
+        "bigscience-small-testing" => Config::new_testing(),
+        "bloom-350m" => Config::new350m(),
+        "bloom" => Config::new(),
+        "bloom-dgx" => Config::new(),
+        other => panic!("Model {other} is not known"),
+    };
+
+    let id = ThreadGroup::new_id().unwrap();
+    let config_ = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let group = ThreadGroup::new(world_size, 0, id).unwrap();
+        tp_thread(group, config_, Some((rx, prio_rx)));
+    });
+    for rank in 1..world_size {
+        let config_ = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let group = ThreadGroup::new(world_size, rank, id).unwrap();
+            tp_thread(group, config_, None);
+        });
+    }
+
+    (tokenizer, tx, prio_tx, config)
 }
 
 fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {

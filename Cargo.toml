@@ -19,6 +19,7 @@ thiserror = "1.0.31"
 futures = "0.3.21"
 crossbeam-channel = "0.5.5"
 log = "0.4.17"
+nccl-rs = { git = "https://github.com/Narsil/nccl-rs" }
 
 [dev-dependencies]
 once_cell = "1.13"

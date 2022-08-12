@@ -284,7 +284,8 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                 // println!("past_seq_length {:?}", past_seq_length);
                 // println!("key {:?}", past_key_values[i].key.size());
                 let start_batch_size_times_num_heads = current_batch * config.n_head;
-                let end_batch_size_times_num_heads = start_batch_size_times_num_heads + mini_batch_size * config.n_head;
+                let end_batch_size_times_num_heads =
+                    start_batch_size_times_num_heads + mini_batch_size * config.n_head;
                 layer_past
                     .key
                     .i((
@@ -458,14 +459,10 @@ mod tests {
         assert_eq!(alibi.size(), vec![16 * 2, 1, 7]);
         assert_eq!(past_key_values.len(), 24);
         for i in 0..24 {
-            assert_eq!(
-                past_key_values[i].key.size(),
-                vec![2, 16, 64, 6],
-                "Layer {i}"
-            );
+            assert_eq!(past_key_values[i].key.size(), vec![32, 64, 6], "Layer {i}");
             assert_eq!(
                 past_key_values[i].value.size(),
-                vec![2, 16, 6, 64],
+                vec![32, 6, 64],
                 "Layer {i}"
             );
         }
@@ -480,19 +477,19 @@ mod tests {
             vec![1, 1, 1, 1, 1, 1, 1]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].key.i((0, ..1, ..1, ..))),
+            Vec::<f64>::from(past_key_values[0].key.i((0..1, ..1, ..))),
             vec![0.0, 0.0, 3.0, 3.0, 3.0, 3.0]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].value.i((0, ..1, .., ..1))),
+            Vec::<f64>::from(past_key_values[0].value.i((0..1, .., ..1))),
             vec![0.0, 0.0, 4.0, 4.0, 4.0, 4.0]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].key.i((1, ..1, ..1, ..))),
+            Vec::<f64>::from(past_key_values[0].key.i((16..17, ..1, ..))),
             vec![5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].value.i((1, ..1, .., ..1))),
+            Vec::<f64>::from(past_key_values[0].value.i((16..17, .., ..1))),
             vec![6.0, 6.0, 6.0, 6.0, 6.0, 6.0]
         );
     }
