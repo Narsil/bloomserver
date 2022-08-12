@@ -1,3 +1,4 @@
+#![feature(async_closure)]
 use actix_web::middleware::Logger;
 use actix_web::{http::header::ContentType, post, web, App, HttpResponse, HttpServer};
 use crossbeam_channel::{bounded, unbounded, Sender};
@@ -8,9 +9,10 @@ use std::time::Instant;
 use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
-use bloomserver::generation::add_next_id;
-use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2};
+use bloomserver::generation::next_ids;
+use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2, SChan1};
 use bloomserver::model::{Config, Past};
+use bloomserver::utils::SAVE;
 use bloomserver::{empty_past, Generation, GenerationError};
 
 #[derive(Clone)]
@@ -28,6 +30,7 @@ async fn generate(
 ) -> actix_web::Result<HttpResponse> {
     let start = Instant::now();
     let input_string = payload.inputs.clone();
+    let max_new_tokens = payload.parameters.max_new_tokens;
     let parameters = payload.parameters.clone();
     let max_new_tokens = payload.parameters.max_new_tokens;
     let string = actix_web::rt::task::spawn_blocking(move || -> Result<String, GenerationError> {
@@ -45,7 +48,7 @@ async fn generate(
         if ids.len() > 384 {
             return Err(GenerationError::InputTooLong);
         }
-        if payload.parameters.max_new_tokens > 384 {
+        if payload.parameters.max_new_tokens > 364 {
             return Err(GenerationError::TooManyNewTokens);
         }
 
@@ -55,12 +58,17 @@ async fn generate(
             .to_kind(kind.0)
             .to_device(kind.1)
             .view((1, -1));
+
+        let mut all_ids = input_ids.copy();
         let max_new_tokens = payload.parameters.max_new_tokens;
 
+        let mut past_key_values = empty_past(&state.config, 1);
         for i in 0..max_new_tokens {
             // let start_loop = Instant::now();
+            if SAVE {
+                std::env::set_var("GENERATION_STEP", &format!("{}", i));
+            }
             let ack = (input_ids.size()[0], sx.clone());
-            let past_key_values = empty_past(&state.config);
             if i == 0 {
                 state
                     .in_channel
@@ -75,10 +83,14 @@ async fn generate(
                     .send((input_ids.copy(), past_key_values, ack))
                     .expect("This send should always work");
             }
-            let (logits, _r_past_key_values) = rx.recv().unwrap();
-            input_ids = add_next_id(&input_ids, &payload.parameters, &logits);
+            let received = rx.recv().unwrap();
+            let logits = received.0;
+            past_key_values = received.1;
+            let new_ids = next_ids(&payload.parameters, &logits).to_device(input_ids.device());
+            all_ids = Tensor::f_cat(&[all_ids, new_ids.copy()], 1).unwrap();
+            input_ids = new_ids;
         }
-        let full_ids = input_ids
+        let full_ids = all_ids
             .i((0,))
             .iter::<i64>()
             .unwrap()
@@ -105,11 +117,10 @@ async fn generate(
         .content_type(ContentType::json())
         .json(json!([{ "generated_text": string }])))
 }
-#[actix_web::main] // or #[tokio::main]
-async fn main() -> std::io::Result<()> {
+
+fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     tch::maybe_init_cuda();
-
     let start = std::time::Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
     println!("Loaded tokenizer in {:?}", start.elapsed());
@@ -118,16 +129,12 @@ async fn main() -> std::io::Result<()> {
     let (tx, rx) = bounded::<Msg>(1);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
 
-    let (config, layout_config) = if let Ok(env) = std::env::var("BLOOM") {
-        match env.as_ref() {
-            "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
-            "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
-            "bloom" => (Config::new(), LayoutConfig::new()),
-            "bloom-dgx" => (Config::new(), LayoutConfig::new_dgx()),
-            other => panic!("Model {other} is not known"),
-        }
-    } else {
-        (Config::new(), LayoutConfig::new())
+    let (config, layout_config) = match model_name {
+        "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
+        "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
+        "bloom" => (Config::new(), LayoutConfig::new()),
+        "bloom-dgx" => (Config::new(), LayoutConfig::new_dgx()),
+        other => panic!("Model {other} is not known"),
     };
 
     let channels: Vec<_> = (0..layout_config.n_threads + 1)
@@ -155,14 +162,20 @@ async fn main() -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
         thread3(r, layout_config.n_threads + 1, config_, layout_config_);
     });
+    (tokenizer, tx, prio_tx, config)
+}
 
+#[actix_web::main] // or #[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let model_name = std::env::var("BLOOM").unwrap_or("bloom".to_string());
+    let (tokenizer, in_channel, prio_channel, config) = init_threads(&model_name);
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(AppState {
                 tokenizer: tokenizer.clone(),
-                in_channel: tx.clone(),
-                prio_channel: prio_tx.clone(),
+                in_channel: in_channel.clone(),
+                prio_channel: prio_channel.clone(),
                 config: config.clone(),
             }))
             .service(generate)
@@ -170,4 +183,162 @@ async fn main() -> std::io::Result<()> {
     .bind(("127.0.0.1", 8001))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test;
+
+    #[actix_web::test]
+    async fn test_generation_testing() {
+        let (tokenizer, in_channel, prio_channel, config) =
+            init_threads("bigscience-small-testing");
+        let app = test::init_service(
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState {
+                    tokenizer,
+                    in_channel,
+                    prio_channel,
+                    config,
+                }))
+                .service(generate),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog"}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(bytes.unwrap(), web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog\"}]"));
+    }
+
+    #[actix_web::test]
+    async fn test_generation_350m() {
+        let (tokenizer, in_channel, prio_channel, config) = init_threads("bloom-350m");
+        println!("Started");
+        let app = test::init_service(
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState {
+                    tokenizer,
+                    in_channel,
+                    prio_channel,
+                    config,
+                }))
+                .service(generate),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
+        );
+
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "A \"whatpu\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \"farduddle\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is:", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"A \\\"whatpu\\\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"farduddle\\\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"fardudd\"}]")
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_generation_full() {
+        if std::env::var("RUN_SLOW") != Ok("1".to_string()) {
+            return;
+        }
+        let (tokenizer, in_channel, prio_channel, config) = init_threads("bloom");
+        let app = test::init_service(
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState {
+                    tokenizer,
+                    in_channel,
+                    prio_channel,
+                    config,
+                }))
+                .service(generate),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "test", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"test.mark.parametrize('stdin, stdout', [\\n    ({'username': 'foo'\"}]")
+        );
+
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, reading, and spending time with my family. I am a very active person and love to be\"}]")
+        );
+
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "Math exercise - answers:\n34+10=44\n54+20=", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"Math exercise - answers:\\n34+10=44\\n54+20=74\\n74+20=94\\n94+20=114\\n114+20=134\\n\"}]")
+        );
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "A \"whatpu\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \"farduddle\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is:", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"A \\\"whatpu\\\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"farduddle\\\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is: The kids were jumping up and down on the trampoline and doing a farduddle. To\"}]")
+        );
+    }
 }

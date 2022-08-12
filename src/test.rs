@@ -3,6 +3,7 @@ use crate::generation::padding;
 use crate::model::build_alibi_tensor;
 use crate::model::tests::{BLOOM_350M, BLOOM_TESTING};
 use crate::model::BloomForCausalLM;
+use crate::model::Config;
 use tch::{IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
@@ -30,7 +31,7 @@ fn test_generate(
             .to_kind(kind::Kind::Int64)
             .to_device(Device::Cuda(0))
             .view((1, -1));
-        let past = empty_past(&config);
+        let past = empty_past(&config, 1);
 
         // Not necessary, but want to reuse the real code
         let item = (input_ids, past);
@@ -40,26 +41,29 @@ fn test_generate(
     let (mut input_ids, mut attention_mask, mut alibi, mut past_key_values) =
         padding(&config, all_items);
 
+    let mut all_ids = input_ids.copy();
+
     for _ in 0..max_new_tokens {
         let logits = model.forward(&input_ids, &attention_mask, &alibi, &mut past_key_values);
-        let size = logits.size();
-        let new_ids = logits
-            .i((0..size[0], size[1] - 1..size[1]))
-            .argmax(-1, false);
+        let seq_len = logits.size()[1];
+        let new_ids = logits.i((.., seq_len - 1..seq_len)).argmax(-1, false);
         let ones = new_ids.ones_like();
-        input_ids = Tensor::cat(&[input_ids, new_ids], 1);
-        attention_mask = Tensor::cat(&[attention_mask, ones], 1);
+
+        attention_mask = Tensor::cat(&[attention_mask, ones.copy()], 1);
         alibi = build_alibi_tensor(
             &attention_mask,
             config.n_head,
             config.kind,
             attention_mask.device(),
         );
+
+        all_ids = Tensor::cat(&[all_ids, new_ids.copy()], 1);
+        input_ids = new_ids;
     }
 
     let mut all_strings = vec![];
     for i in 0..input.len() {
-        let output_ids: Vec<_> = input_ids
+        let output_ids: Vec<_> = all_ids
             .i(i as i64)
             .reshape(&[-1])
             .iter::<i64>()
@@ -79,14 +83,25 @@ fn test_simple_generation() {
     let model = BLOOM_350M.lock().unwrap();
     let tokenizer = Tokenizer::from_file("./tokenizer.json").unwrap();
 
-    let input_sentence = "I enjoy walking with my cute dog";
+    let input_sentence = "I enjoy walking my cute dog";
     let input_sentence2 = "Hello my name is";
 
+    let out1 = "I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love to be active. I am a very good listener and I am very good at listening to people. I am very";
+    let out2 =  "Hello my name is Nate and I am a professional photographer in the area of the city of New York. I am a professional photographer who loves to capture the moment and to capture the best moments in the life";
+
     let output = test_generate(&[input_sentence], &config, &tokenizer, &model, 43);
-    assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
+    assert_eq!(output, vec![out1]);
+    let output = test_generate(
+        &[input_sentence, input_sentence],
+        &config,
+        &tokenizer,
+        &model,
+        43,
+    );
+    assert_eq!(output, vec![out1, out1]);
 
     let output = test_generate(&[input_sentence2], &config, &tokenizer, &model, 40);
-    assert_eq!(output[0], "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good, very good, very good, very good, very good, very good, very good, very");
+    assert_eq!(output, vec![out2]);
 
     let output = test_generate(
         &[input_sentence, input_sentence2],
@@ -94,14 +109,8 @@ fn test_simple_generation() {
         &tokenizer,
         &model,
         43,
-        // 21,
     );
-    assert_eq!(output[0], "I enjoy walking with my cute dog, and I love to watch the kids play. I am a very active person, and I am very active. I am a very good listener, and I am very good at listening. I am a very good");
-    // TODO This is different from the single generation for some reason
-    // This bug doesn't seem to exist on torch==1.11.0
-    // **but** we need 1.12.0 for cumsum on bfloat16.
-    // This bug is also present in `transformers` where the values where taken from.
-    assert_eq!(output[1],  "Hello my name is Aya, I am a beautiful, sexy, and very hot girl. I am a very good and very good man, I am very good at my job, I am very good at my job, I am");
+    assert_eq!(output, vec![out1, out2]);
 }
 
 #[test]
@@ -118,7 +127,7 @@ fn test_logits_testing() {
         .view((1, -1))
         .to_kind(kind::Kind::Int64)
         .to_device(device);
-    let past = empty_past(&config);
+    let past = empty_past(&config, 1);
     let (input_ids, attention_mask, alibi, mut past_key_values) =
         padding(&config, vec![(tensor_ids, past)]);
 
@@ -155,7 +164,7 @@ fn test_embeddings_testing() {
         .view((1, -1))
         .to_kind(kind::Kind::Int64)
         .to_device(device);
-    let past = empty_past(&config);
+    let past = empty_past(&config, 1);
     let (input_ids, _attention_mask, _alibi, _past_key_values) =
         padding(&config, vec![(tensor_ids, past)]);
 

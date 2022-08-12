@@ -1,18 +1,20 @@
-use crate::empty_past;
 use crate::generation::padding;
-use crate::model::{BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm, Past};
+use crate::model::{
+    prepare_attn_mask, BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm, Past, PastLayer,
+};
 use crate::utils::debug;
 use crossbeam_channel::{Receiver, Select, Sender};
 use memmap::MmapOptions;
 use safetensors::SafeTensors;
 use std::time::{Duration, Instant};
-use tch::{Device, IndexOp, Tensor};
+use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 /// Size of batch and response channel
 pub type Ack = (i64, Sender<(Tensor, Past)>);
 pub type Msg = (Tensor, Past, Ack);
-pub type Msg2 = ((Tensor, Tensor, Tensor, Past), Vec<Ack>);
+pub type Msg2 = ((Tensor, Tensor, Tensor, Past, Vec<i64>), Vec<Ack>);
 pub type RChan1 = Receiver<Msg>;
+pub type SChan1 = Sender<Msg>;
 pub type RChan = Receiver<Msg2>;
 pub type SChan = Sender<Msg2>;
 
@@ -67,9 +69,9 @@ impl LayoutConfig {
     pub fn new350m() -> Self {
         Self {
             layers_first_thread: 0,
-            layers_per_thread: 12,
+            layers_per_thread: 3,
             layers_last_thread: 0,
-            n_threads: 2,
+            n_threads: 8,
             embeddings_filename: "./weights/bloom-350m.bin".to_string(),
             final_filename: "./weights/bloom-350m.bin".to_string(),
             layer_template_filename: "./weights/bloom-350m.bin".to_string(),
@@ -159,36 +161,34 @@ pub fn thread1(
         let oper1 = sel.recv(&rx);
         let oper2 = sel.recv(&prio_rx);
         let oper = sel.select();
-        let mut all_items = match oper.index() {
-            i if i == oper1 => {
-                vec![oper.recv(&rx).unwrap()]
-            }
-            i if i == oper2 => {
-                vec![oper.recv(&prio_rx).unwrap()]
-            }
+        let (mut all_items, no_past) = match oper.index() {
+            i if i == oper1 => (vec![oper.recv(&rx).unwrap()], true),
+            i if i == oper2 => (vec![oper.recv(&prio_rx).unwrap()], false),
             _ => unreachable!(),
         };
 
-        let max_batch_size = 4;
+        if no_past {
+            let max_batch_size = 4;
 
-        let now = Instant::now();
-        let deadline = std::cmp::max(
-            last_loop + Duration::from_millis(20),
-            now + Duration::from_millis(1),
-        );
+            let now = Instant::now();
+            let deadline = std::cmp::max(
+                last_loop + Duration::from_millis(20),
+                now + Duration::from_millis(1),
+            );
 
-        while let Ok(oper) = sel.select_deadline(deadline) {
-            match oper.index() {
-                i if i == oper1 => {
-                    all_items.push(oper.recv(&rx).unwrap());
+            while let Ok(oper) = sel.select_deadline(deadline) {
+                match oper.index() {
+                    i if i == oper1 => {
+                        all_items.push(oper.recv(&rx).unwrap());
+                    }
+                    i if i == oper2 => {
+                        all_items.push(oper.recv(&prio_rx).unwrap());
+                    }
+                    _ => unreachable!(),
                 }
-                i if i == oper2 => {
-                    all_items.push(oper.recv(&prio_rx).unwrap());
+                if all_items.len() >= max_batch_size {
+                    break;
                 }
-                _ => unreachable!(),
-            }
-            if all_items.len() >= max_batch_size {
-                break;
             }
         }
         // let start = Instant::now();
@@ -198,12 +198,33 @@ pub fn thread1(
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
 
+        let input_size = input_ids.size();
+        let past_key_values_length = past_key_values[0].seq_length();
+        let causal_mask = prepare_attn_mask(
+            &attention_mask,
+            input_size,
+            past_key_values_length,
+            config.n_head,
+        );
+
+        let seq_lengths = Vec::<i64>::from(
+            attention_mask
+                .f_sum_dim_intlist(&[-1], false, Kind::Int)
+                .unwrap(),
+        );
+
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
-            hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+            hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
         // println!("Thread1 took {:?}", start.elapsed());
         s2.send((
-            (hidden_states, attention_mask, alibi, past_key_values),
+            (
+                hidden_states,
+                causal_mask,
+                alibi,
+                past_key_values,
+                seq_lengths,
+            ),
             acks,
         ))
         .unwrap();
@@ -222,11 +243,11 @@ pub fn thread2(
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
+    let offset =
+        layout_config.layers_first_thread + layout_config.layers_per_thread * (thread_number - 1);
     let layers: Vec<BloomBlock> = (0..layout_config.layers_per_thread)
         .map(|i| {
-            let layer_number = i
-                + layout_config.layers_first_thread
-                + layout_config.layers_per_thread * (thread_number - 1);
+            let layer_number = i + offset;
             println!("Loading layer {layer_number} on thread2 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
@@ -277,24 +298,33 @@ pub fn thread2(
         });
 
         for item in all_items {
-            let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rq) =
-                item;
+            let (
+                (mut hidden_states, mut causal_mask, mut alibi, mut past_key_values, seq_lengths),
+                rq,
+            ) = item;
             hidden_states = hidden_states.to_device(device);
-            attention_mask = attention_mask.to_device(device);
+            causal_mask = causal_mask.to_device(device);
             alibi = alibi.to_device(device);
 
-            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
-                debug("past_key thread2", &layer_past.0);
-                debug("past_values thread2", &layer_past.1);
-                hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+            for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
+                hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
             }
             // println!(
             //     "Thread2 {thread_number} took {:?} on batch size {:?}",
             //     start.elapsed(),
             //     hidden_states.size()[0]
             // );
-            s.send(((hidden_states, attention_mask, alibi, past_key_values), rq))
-                .unwrap();
+            s.send((
+                (
+                    hidden_states,
+                    causal_mask,
+                    alibi,
+                    past_key_values,
+                    seq_lengths,
+                ),
+                rq,
+            ))
+            .unwrap();
         }
     }
 }
@@ -317,11 +347,11 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let ln_f = LayerNorm::new(config.hidden_size, "ln_f", &final_model, device);
     let lm_head = InvertedEmbedding::new("word_embeddings", &embedding_model, device);
 
+    let offset = layout_config.layers_first_thread
+        + layout_config.layers_per_thread * layout_config.n_threads;
     let layers: Vec<BloomBlock> = (0..layout_config.layers_last_thread)
         .map(|i| {
-            let layer_number = layout_config.layers_first_thread
-                + layout_config.layers_per_thread * layout_config.n_threads
-                + i;
+            let layer_number = offset + i;
             println!("Loading layer {layer_number} on thread3 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
@@ -353,27 +383,50 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     );
 
     loop {
-        let ((mut hidden_states, mut attention_mask, mut alibi, mut past_key_values), rqs) = rx
+        let (
+            (mut hidden_states, mut causal_mask, mut alibi, mut past_key_values, seq_lengths),
+            rqs,
+        ) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
 
         hidden_states = hidden_states.to_device(device);
-        attention_mask = attention_mask.to_device(device);
+        causal_mask = causal_mask.to_device(device);
         alibi = alibi.to_device(device);
-        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
-            debug("past_key thread3", &layer_past.0);
-            debug("past_values thread3", &layer_past.1);
-            hidden_states = layer.forward(&hidden_states, &attention_mask, &alibi, layer_past);
+        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
+            debug("past_key thread3", &layer_past.key);
+            debug("past_values thread3", &layer_past.value);
+            hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
         debug("last_hidden_states", &hidden_states);
         hidden_states = ln_f.forward(&hidden_states);
         debug("After ln_f", &hidden_states);
         let lm_logits = lm_head.forward(&hidden_states);
 
-        let mut current_batch = 0;
+        let mut current_batch = 0 as i64;
         for (mini_batch_size, rq) in rqs {
+            // XXX actually clean the padded values of past so that subsequent
+            // calls can get a chance to have a better padding (+ correct attention mask).
+            let seq_length = seq_lengths[current_batch as usize];
+            let total_seq_length = causal_mask.size()[2];
+            let start_batch_size_times_num_heads = current_batch * config.n_head;
+            let end_batch_size_times_num_heads =
+                start_batch_size_times_num_heads + mini_batch_size * config.n_head;
+            let past: Vec<_> = past_key_values
+                .iter()
+                .map(|layer_past| PastLayer {
+                    key: layer_past.key.i((
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                        ..,
+                        total_seq_length - seq_length..,
+                    )),
+                    value: layer_past.value.i((
+                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                        total_seq_length - seq_length..,
+                    )),
+                })
+                .collect();
             let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
-            let past = empty_past(&config);
             rq.send((simple_logits, past)).unwrap();
             current_batch += mini_batch_size;
         }
