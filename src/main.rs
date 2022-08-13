@@ -75,10 +75,7 @@ async fn generate(
                 state
                     .in_channel
                     .try_send((input_ids.copy(), past_key_values, ack))
-                    .map_err(|_| {
-                        // println!("Queue was full {:?}", state.in_channel.len());
-                        GenerationError::QueueFull
-                    })?;
+                    .map_err(|_| GenerationError::QueueFull)?;
             } else {
                 state
                     .prio_channel
@@ -125,8 +122,8 @@ fn init_threads_tp(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config)
     tch::maybe_init_cuda();
     let start = std::time::Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
-    println!("Loaded tokenizer in {:?}", start.elapsed());
-    println!("Starting threads {:?}", std::time::Instant::now());
+    info!("Loaded tokenizer in {:?}", start.elapsed());
+    info!("Starting threads {:?}", std::time::Instant::now());
 
     let (tx, rx) = bounded::<Msg>(1);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
@@ -163,8 +160,8 @@ fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
     tch::maybe_init_cuda();
     let start = std::time::Instant::now();
     let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
-    println!("Loaded tokenizer in {:?}", start.elapsed());
-    println!("Starting threads {:?}", std::time::Instant::now());
+    info!("Loaded tokenizer in {:?}", start.elapsed());
+    info!("Starting threads {:?}", std::time::Instant::now());
 
     let (tx, rx) = bounded::<Msg>(1);
     let (prio_tx, prio_rx) = unbounded::<Msg>();
@@ -262,7 +259,7 @@ mod tests {
     #[actix_web::test]
     async fn test_generation_350m() {
         let (tokenizer, in_channel, prio_channel, config) = init_threads("bloom-350m");
-        println!("Started");
+        info!("Started");
         let app = test::init_service(
             App::new()
                 .wrap(Logger::default())

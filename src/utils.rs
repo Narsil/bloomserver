@@ -1,3 +1,4 @@
+use log::debug as log_debug;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 const DEBUG: bool = false;
@@ -7,7 +8,7 @@ pub fn debug_force(prefix: &str, x: &Tensor) {
     let size = x.size();
     let batch_size = size[0];
     let second_size = if size.len() > 1 { size[1] } else { batch_size };
-    println!(
+    log_debug!(
         "{prefix} - {:?} - Values: {:?}",
         size,
         x.reshape(&[-1,])
@@ -17,7 +18,7 @@ pub fn debug_force(prefix: &str, x: &Tensor) {
             .collect::<Vec<_>>()
     );
     if batch_size > 1 {
-        println!(
+        log_debug!(
             "                          {:?}",
             x.i(1)
                 .reshape(&[-1,])

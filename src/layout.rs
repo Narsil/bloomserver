@@ -4,6 +4,7 @@ use crate::model::{
 };
 use crate::utils::debug;
 use crossbeam_channel::{Receiver, Select, Sender};
+use log::info;
 use memmap::MmapOptions;
 use safetensors::SafeTensors;
 use std::time::{Duration, Instant};
@@ -105,7 +106,7 @@ pub fn thread1(
     config: Config,
     layout_config: LayoutConfig,
 ) {
-    println!("Starting thread {thread_number}");
+    info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -113,9 +114,6 @@ pub fn thread1(
     // SAFETY: This is actually unsafe.
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
-
-    // println!("Embedding {:?}", embedding_model.names());
-    // println!("Layer {:?}", model.names());
 
     let word_embeddings = Embedding::new("word_embeddings", &embedding_model, device);
     let word_embeddings_layernorm = LayerNorm::new(
@@ -149,7 +147,7 @@ pub fn thread1(
             )
         })
         .collect();
-    println!(
+    info!(
         "{:?} : Loaded thread {thread_number} in {:?}",
         std::time::Instant::now(),
         start.elapsed()
@@ -194,7 +192,6 @@ pub fn thread1(
         // let start = Instant::now();
         let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
             padding_with_ack(&config, all_items);
-        // println!("Padding took {:?}", start.elapsed());
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
 
@@ -216,7 +213,6 @@ pub fn thread1(
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
-        // println!("Thread1 took {:?}", start.elapsed());
         s2.send((
             (
                 hidden_states,
@@ -239,7 +235,7 @@ pub fn thread2(
     config: Config,
     layout_config: LayoutConfig,
 ) {
-    println!("Starting thread {thread_number}");
+    info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -248,7 +244,7 @@ pub fn thread2(
     let layers: Vec<BloomBlock> = (0..layout_config.layers_per_thread)
         .map(|i| {
             let layer_number = i + offset;
-            println!("Loading layer {layer_number} on thread2 ({thread_number})");
+            info!("Loading layer {layer_number} on thread2 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
@@ -271,20 +267,14 @@ pub fn thread2(
             )
         })
         .collect();
-    println!(
+    info!(
         "{:?} : Loaded thread {thread_number} in {:?}",
         std::time::Instant::now(),
         start.elapsed()
     );
     loop {
         // Receive 1 item
-        // println!("start loop  thread {thread_number}");
-        // let start = Instant::now();
         let mut all_items = vec![rx.recv().unwrap()];
-        // println!(
-        //     "Got stuck on RECEIVE thread {thread_number} for {:?}",
-        //     start.elapsed()
-        // );
 
         while let Ok(item) = rx.recv_timeout(Duration::from_millis(0)) {
             all_items.push(item);
@@ -309,11 +299,6 @@ pub fn thread2(
             for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
                 hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
             }
-            // println!(
-            //     "Thread2 {thread_number} took {:?} on batch size {:?}",
-            //     start.elapsed(),
-            //     hidden_states.size()[0]
-            // );
             s.send((
                 (
                     hidden_states,
@@ -330,7 +315,7 @@ pub fn thread2(
 }
 
 pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: LayoutConfig) {
-    println!("Starting thread {thread_number}");
+    info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -352,7 +337,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let layers: Vec<BloomBlock> = (0..layout_config.layers_last_thread)
         .map(|i| {
             let layer_number = offset + i;
-            println!("Loading layer {layer_number} on thread3 ({thread_number})");
+            info!("Loading layer {layer_number} on thread3 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
@@ -376,7 +361,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         })
         .collect();
 
-    println!(
+    info!(
         "{:?} : Loaded thread {thread_number} in {:?}",
         std::time::Instant::now(),
         start.elapsed()

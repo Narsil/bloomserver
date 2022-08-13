@@ -1,2 +1,3 @@
 setuptools_rust
 -e  git+https://github.com/Narsil/safetensors.git@main#egg=safetensors&subdirectory=bindings/python
+transformers

@@ -1,5 +1,6 @@
 use crate::model::{build_alibi_tensor, Config, Past};
 use crate::non_empty_past;
+use log::info;
 use serde::{Deserialize, Serialize};
 use tch::{kind, IndexOp, Tensor};
 
@@ -197,15 +198,9 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
         //         // input_ids is of shape [num_beams, seq_length]
         //         // So transposing to we can concatenate the indices within input_ids
         //         let new_ids = new_ids.transpose(1, 0);
-        //         println!("Input ids {:?}", input_ids);
-        //         println!("New ids {:?}", new_ids);
         //         self.input_ids = Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap();
         //         // Save the current scores in logits form.
         //         self.beam_scores = Some(values);
-        //         println!(
-        //             "After beam search first step we have input_ids {:?}",
-        //             self.input_ids
-        //         );
         //     } else {
         //         // Now the tricky part.
         //         let size = logits.size();
@@ -279,10 +274,6 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                     layer_past.key = layer_past.key.to_device(device);
                     layer_past.value = layer_past.value.to_device(device);
                 }
-                // println!("layer past key {:?}", layer_past.key.size());
-                // println!("max past {:?}", max_length_past);
-                // println!("past_seq_length {:?}", past_seq_length);
-                // println!("key {:?}", past_key_values[i].key.size());
                 let start_batch_size_times_num_heads = current_batch * config.n_head;
                 let end_batch_size_times_num_heads =
                     start_batch_size_times_num_heads + mini_batch_size * config.n_head;
@@ -296,10 +287,6 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                     .f_copy_(&past_key_values[i].key)
                     .unwrap();
 
-                // println!("layer past value {:?}", layer_past.value.size());
-                // println!("max past {:?}", max_length_past);
-                // println!("past_seq_length {:?}", past_seq_length);
-                // println!("value {:?}", past_key_values[i].value.size());
                 layer_past
                     .value
                     .i((
@@ -324,7 +311,7 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
     let total = std::cmp::max(1, batch_size as usize * max_length as usize);
-    println!(
+    info!(
         "Running on batch of size, seq_length[{:?}, {:?}] - Fillrate {:?}%",
         batch_size,
         max_length,

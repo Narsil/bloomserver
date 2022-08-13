@@ -632,15 +632,20 @@ impl BloomMlp {
         debug("hidden_states gelu", &hidden_states);
         let mut hidden_states = if self.slow_but_exact {
             let mut intermediate_output = Tensor::zeros_like(residual);
-            let slices = self.dense_4h_to_h.weight.size().last().unwrap() / self.pretraining_tp;
-            for i in 0..self.pretraining_tp {
-                let i = i as i64;
-                let tp = hidden_states.i((.., .., i * slices..(i + 1) * slices));
-                let dense_tp = self
-                    .dense_4h_to_h
-                    .weight
+            let total = self.dense_4h_to_h.weight.size()[0];
+            let slices = total / self.pretraining_tp;
+            for i in 0..self.pretraining_tp as i64 {
+                let hsize = hidden_states.size();
+                let tp = hidden_states
+                    .view((-1, total))
                     .i((.., i * slices..(i + 1) * slices));
-                intermediate_output += tp.linear::<Tensor>(&dense_tp, None);
+                let dense_tp = self.dense_4h_to_h.weight.i((i * slices..(i + 1) * slices));
+
+                intermediate_output += tp
+                    .f_mm(&dense_tp)
+                    .unwrap()
+                    .f_view(intermediate_output.size().as_slice())
+                    .unwrap();
             }
             intermediate_output
         } else {
