@@ -1,5 +1,7 @@
 use crate::convert;
+use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
+use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
@@ -414,6 +416,37 @@ impl BloomAttention {
         }
     }
 
+    pub fn new_tp(
+        config: &Config,
+        name: &str,
+        model: &SafeTensors<'_>,
+        layer_number: usize,
+        device: Device,
+        group: &ThreadGroup,
+    ) -> Self {
+        // let query_key_value =
+        //     TensorParallelColumnLinear::new(&format!("{name}.query_key_value"), model, device);
+        // let dense = TensorParallelRowLinear::new(&format!("{name}.dense"), model, device, group);
+        let query_key_value = Linear::new(&format!("{name}.query_key_value"), model, device);
+        let dense = Linear::new(&format!("{name}.dense"), model, device);
+        let head_dim = (config.hidden_size / config.n_head) as i64;
+        let num_attention_heads = config.n_head as i64;
+        let real_layer_number = layer_number;
+        let layer_number = std::cmp::max(1, layer_number);
+        let norm_factor = 1.0 / (head_dim as f64).sqrt();
+        Self {
+            dense,
+            query_key_value,
+            num_attention_heads,
+            head_dim,
+            layer_number,
+            real_layer_number,
+            norm_factor,
+            slow_but_exact: config.slow_but_exact,
+            pretraining_tp: config.pretraining_tp as i64,
+        }
+    }
+
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -615,6 +648,29 @@ impl BloomMlp {
         }
     }
 
+    pub fn new_tp(
+        config: &Config,
+        name: &str,
+        model: &SafeTensors<'_>,
+        device: Device,
+        real_layer_number: usize,
+        group: &ThreadGroup,
+    ) -> Self {
+        // let dense_h_to_4h =
+        //     TensorParallelColumnLinear::new(&format!("{name}.dense_h_to_4h"), model, device);
+        // let dense_4h_to_h =
+        //     TensorParallelRowLinear::new(&format!("{name}.dense_4h_to_h"), model, device, group);
+        let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model, device);
+        let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model, device);
+        Self {
+            dense_h_to_4h,
+            dense_4h_to_h,
+            real_layer_number,
+            slow_but_exact: config.slow_but_exact,
+            pretraining_tp: config.pretraining_tp as i64,
+        }
+    }
+
     pub fn forward(&self, hidden_states: &Tensor, residual: &Tensor) -> Tensor {
         save_layer_to_disk(
             hidden_states,
@@ -639,7 +695,7 @@ impl BloomMlp {
                 let tp = hidden_states
                     .view((-1, total))
                     .i((.., i * slices..(i + 1) * slices));
-                let dense_tp = self.dense_4h_to_h.weight.i((i * slices..(i + 1) * slices));
+                let dense_tp = self.dense_4h_to_h.weight.i(i * slices..(i + 1) * slices);
 
                 intermediate_output += tp
                     .f_mm(&dense_tp)
@@ -704,6 +760,52 @@ impl BloomBlock {
             model,
             device,
             layer_number,
+        );
+        Self {
+            input_layernorm,
+            self_attention,
+            post_attention_layernorm,
+            mlp,
+            layer_number,
+        }
+    }
+
+    pub fn new_tp(
+        config: &Config,
+        prefix: &str,
+        model: &SafeTensors<'_>,
+        layer_number: usize,
+        device: Device,
+        group: &ThreadGroup,
+    ) -> Self {
+        // attention
+        let input_layernorm = LayerNorm::new(
+            config.hidden_size,
+            &format!("{prefix}.input_layernorm"),
+            model,
+            device,
+        );
+        let post_attention_layernorm = LayerNorm::new(
+            config.hidden_size,
+            &format!("{prefix}.post_attention_layernorm"),
+            model,
+            device,
+        );
+        let self_attention = BloomAttention::new_tp(
+            config,
+            &format!("{prefix}.self_attention"),
+            model,
+            layer_number,
+            device,
+            group,
+        );
+        let mlp = BloomMlp::new_tp(
+            config,
+            &format!("{prefix}.mlp"),
+            model,
+            device,
+            layer_number,
+            group,
         );
         Self {
             input_layernorm,

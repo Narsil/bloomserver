@@ -98,6 +98,90 @@ pub fn padding_with_ack(
     (padding(config, tensors), acks)
 }
 
+pub fn receive(
+    rx: &RChan1,
+    prio_rx: &RChan1,
+    config: &Config,
+) -> ((Tensor, Tensor, Tensor, Tensor, Past), Vec<Ack>) {
+    let mut sel = Select::new();
+    let oper1 = sel.recv(&rx);
+    let oper2 = sel.recv(&prio_rx);
+    let oper = sel.select();
+    let (mut all_items, no_past) = match oper.index() {
+        i if i == oper1 => (vec![oper.recv(&rx).unwrap()], true),
+        i if i == oper2 => (vec![oper.recv(&prio_rx).unwrap()], false),
+        _ => unreachable!(),
+    };
+
+    if no_past {
+        let max_batch_size = 4;
+        while let Ok(item) = prio_rx.recv() {
+            all_items.push(item);
+            if all_items.len() >= max_batch_size {
+                break;
+            }
+        }
+    }
+
+    let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
+        padding_with_ack(&config, all_items);
+    let input_size = input_ids.size();
+    let past_key_values_length = past_key_values[0].seq_length();
+    let causal_mask = prepare_attn_mask(
+        &attention_mask,
+        input_size,
+        past_key_values_length,
+        config.n_head,
+    );
+    (
+        (
+            input_ids,
+            causal_mask,
+            attention_mask,
+            alibi,
+            past_key_values,
+        ),
+        acks,
+    )
+}
+
+pub fn send(
+    lm_logits: Tensor,
+    past_key_values: &[PastLayer],
+    acks: &[Ack],
+    seq_lengths: &[i64],
+    causal_mask: Tensor,
+    config: &Config,
+) {
+    let mut current_batch = 0 as i64;
+    for (mini_batch_size, rq) in acks {
+        // XXX actually clean the padded values of past so that subsequent
+        // calls can get a chance to have a better padding (+ correct attention mask).
+        let seq_length = seq_lengths[current_batch as usize];
+        let total_seq_length = causal_mask.size()[2];
+        let start_batch_size_times_num_heads = current_batch * config.n_head;
+        let end_batch_size_times_num_heads =
+            start_batch_size_times_num_heads + mini_batch_size * config.n_head;
+        let past: Vec<_> = past_key_values
+            .iter()
+            .map(|layer_past| PastLayer {
+                key: layer_past.key.i((
+                    start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                    ..,
+                    total_seq_length - seq_length..,
+                )),
+                value: layer_past.value.i((
+                    start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                    total_seq_length - seq_length..,
+                )),
+            })
+            .collect();
+        let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
+        rq.send((simple_logits, past)).unwrap();
+        current_batch += mini_batch_size;
+    }
+}
+
 pub fn thread1(
     rx: RChan1,
     prio_rx: RChan1,
@@ -155,54 +239,11 @@ pub fn thread1(
 
     let mut last_loop = Instant::now();
     loop {
-        let mut sel = Select::new();
-        let oper1 = sel.recv(&rx);
-        let oper2 = sel.recv(&prio_rx);
-        let oper = sel.select();
-        let (mut all_items, no_past) = match oper.index() {
-            i if i == oper1 => (vec![oper.recv(&rx).unwrap()], true),
-            i if i == oper2 => (vec![oper.recv(&prio_rx).unwrap()], false),
-            _ => unreachable!(),
-        };
-
-        if no_past {
-            let max_batch_size = 4;
-
-            let now = Instant::now();
-            let deadline = std::cmp::max(
-                last_loop + Duration::from_millis(20),
-                now + Duration::from_millis(1),
-            );
-
-            while let Ok(oper) = sel.select_deadline(deadline) {
-                match oper.index() {
-                    i if i == oper1 => {
-                        all_items.push(oper.recv(&rx).unwrap());
-                    }
-                    i if i == oper2 => {
-                        all_items.push(oper.recv(&prio_rx).unwrap());
-                    }
-                    _ => unreachable!(),
-                }
-                if all_items.len() >= max_batch_size {
-                    break;
-                }
-            }
-        }
         // let start = Instant::now();
-        let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
-            padding_with_ack(&config, all_items);
+        let ((input_ids, causal_mask, attention_mask, alibi, mut past_key_values), acks) =
+            receive(&rx, &prio_rx, &config);
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
-
-        let input_size = input_ids.size();
-        let past_key_values_length = past_key_values[0].seq_length();
-        let causal_mask = prepare_attn_mask(
-            &attention_mask,
-            input_size,
-            past_key_values_length,
-            config.n_head,
-        );
 
         let seq_lengths = Vec::<i64>::from(
             attention_mask
@@ -370,7 +411,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     loop {
         let (
             (mut hidden_states, mut causal_mask, mut alibi, mut past_key_values, seq_lengths),
-            rqs,
+            acks,
         ) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
@@ -388,32 +429,13 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         debug("After ln_f", &hidden_states);
         let lm_logits = lm_head.forward(&hidden_states);
 
-        let mut current_batch = 0 as i64;
-        for (mini_batch_size, rq) in rqs {
-            // XXX actually clean the padded values of past so that subsequent
-            // calls can get a chance to have a better padding (+ correct attention mask).
-            let seq_length = seq_lengths[current_batch as usize];
-            let total_seq_length = causal_mask.size()[2];
-            let start_batch_size_times_num_heads = current_batch * config.n_head;
-            let end_batch_size_times_num_heads =
-                start_batch_size_times_num_heads + mini_batch_size * config.n_head;
-            let past: Vec<_> = past_key_values
-                .iter()
-                .map(|layer_past| PastLayer {
-                    key: layer_past.key.i((
-                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
-                        ..,
-                        total_seq_length - seq_length..,
-                    )),
-                    value: layer_past.value.i((
-                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
-                        total_seq_length - seq_length..,
-                    )),
-                })
-                .collect();
-            let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
-            rq.send((simple_logits, past)).unwrap();
-            current_batch += mini_batch_size;
-        }
+        send(
+            lm_logits,
+            &past_key_values,
+            &acks,
+            &seq_lengths,
+            causal_mask,
+            &config,
+        );
     }
 }
