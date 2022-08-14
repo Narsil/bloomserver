@@ -109,7 +109,6 @@ impl<'a> TensorParallelRowLinear<'a> {
             .unwrap()
             .f_view(out_size.as_slice())
             .unwrap();
-        let out = self.group.all_reduce(out).unwrap();
-        out
+        self.group.all_reduce(out).unwrap()
     }
 }

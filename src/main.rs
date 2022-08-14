@@ -203,8 +203,11 @@ fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
 
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let model_name = std::env::var("BLOOM").unwrap_or("bloom".to_string());
-    let (tokenizer, in_channel, prio_channel, config) = init_threads(&model_name);
+    let model_name = std::env::var("BLOOM").unwrap_or_else(|_| "bloom".to_string());
+    let (tokenizer, in_channel, prio_channel, config) = match std::env::var("TP") {
+        Ok(s) if s == *"1" => init_threads_tp(&model_name),
+        _ => init_threads(&model_name),
+    };
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())

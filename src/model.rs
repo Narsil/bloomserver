@@ -13,7 +13,7 @@ pub struct PastLayer {
 
 impl PastLayer {
     pub fn seq_length(&self) -> i64 {
-        return self.key.size()[2];
+        self.key.size()[2]
     }
 }
 
@@ -35,13 +35,12 @@ pub fn non_empty_past(
         Tensor::zeros(&[batch_size * p, q, length_past], (config.kind, device)) + key;
     let past_value_template =
         Tensor::zeros(&[batch_size * p, length_past, q], (config.kind, device)) + value;
-    let all_past_key_values = (0..config.n_layer as usize)
+    (0..config.n_layer as usize)
         .map(|_| PastLayer {
             key: past_key_template.copy(),
             value: past_value_template.copy(),
         })
-        .collect::<Vec<_>>();
-    all_past_key_values
+        .collect::<Vec<_>>()
 }
 pub type Past = Vec<PastLayer>;
 
@@ -158,8 +157,7 @@ fn make_causal_mask(
         .unsqueeze(1)
         .f_lt_tensor(&seq_ids.unsqueeze(0))
         .unwrap();
-    _ = mask
-        .i((.., past_key_values_length..))
+    mask.i((.., past_key_values_length..))
         .f_copy_(&causal_mask)
         .unwrap();
 
@@ -170,8 +168,7 @@ fn make_causal_mask(
     }
 
     // expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
-    let expanded_mask = mask
-        .unsqueeze(0)
+    mask.unsqueeze(0)
         .f_expand(
             &[
                 batch_size,
@@ -180,9 +177,7 @@ fn make_causal_mask(
             ],
             true,
         )
-        .unwrap();
-    // return expanded_mask
-    expanded_mask
+        .unwrap()
 }
 
 /// Expands attention_mask from `[batch_size, src_length]` to `[batch_size, tgt_length, src_length]`.
@@ -230,11 +225,9 @@ pub fn prepare_attn_mask(
     };
 
     // [batch_size, seq_length] -> [batch_size * num_attention_heads, tgt_length, src_length]
-    let result = combined_attention_mask
+    combined_attention_mask
         .f_repeat_interleave_self_int(num_attention_heads, 0, batch_size * num_attention_heads)
-        .unwrap();
-
-    result
+        .unwrap()
 }
 
 pub fn build_alibi_tensor(
@@ -500,7 +493,7 @@ impl BloomAttention {
             Tensor::f_cat(&[&layer_past.value.to_device(device), &value_layer], 1).unwrap();
 
         save_layer_to_disk(
-            &alibi,
+            alibi,
             &format!("rust_baddbmm_sliced_alibi_{}.npy", self.real_layer_number,),
         );
         save_layer_to_disk(
@@ -540,7 +533,7 @@ impl BloomAttention {
             ),
         );
         let attn_weights =
-            attention_scores.masked_fill_(&attention_mask, finfo_min(attention_scores.kind()));
+            attention_scores.masked_fill_(attention_mask, finfo_min(attention_scores.kind()));
         save_layer_to_disk(
             &attn_weights,
             &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
@@ -654,7 +647,7 @@ impl BloomMlp {
         model: &SafeTensors<'_>,
         device: Device,
         real_layer_number: usize,
-        group: &ThreadGroup,
+        _group: &ThreadGroup,
     ) -> Self {
         // let dense_h_to_4h =
         //     TensorParallelColumnLinear::new(&format!("{name}.dense_h_to_4h"), model, device);
@@ -691,7 +684,6 @@ impl BloomMlp {
             let total = self.dense_4h_to_h.weight.size()[0];
             let slices = total / self.pretraining_tp;
             for i in 0..self.pretraining_tp as i64 {
-                let hsize = hidden_states.size();
                 let tp = hidden_states
                     .view((-1, total))
                     .i((.., i * slices..(i + 1) * slices));
@@ -934,7 +926,7 @@ impl BloomModel {
         let input_size = input_ids.size();
         let past_key_values_length = past_key_values[0].seq_length();
         let causal_mask = prepare_attn_mask(
-            &attention_mask,
+            attention_mask,
             input_size,
             past_key_values_length,
             self.num_heads,

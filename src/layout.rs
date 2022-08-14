@@ -104,12 +104,12 @@ pub fn receive(
     config: &Config,
 ) -> ((Tensor, Tensor, Tensor, Tensor, Past), Vec<Ack>) {
     let mut sel = Select::new();
-    let oper1 = sel.recv(&rx);
-    let oper2 = sel.recv(&prio_rx);
+    let oper1 = sel.recv(rx);
+    let oper2 = sel.recv(prio_rx);
     let oper = sel.select();
     let (mut all_items, no_past) = match oper.index() {
-        i if i == oper1 => (vec![oper.recv(&rx).unwrap()], true),
-        i if i == oper2 => (vec![oper.recv(&prio_rx).unwrap()], false),
+        i if i == oper1 => (vec![oper.recv(rx).unwrap()], true),
+        i if i == oper2 => (vec![oper.recv(prio_rx).unwrap()], false),
         _ => unreachable!(),
     };
 
@@ -123,8 +123,8 @@ pub fn receive(
         }
     }
 
-    let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
-        padding_with_ack(&config, all_items);
+    let ((input_ids, attention_mask, alibi, past_key_values), acks) =
+        padding_with_ack(config, all_items);
     let input_size = input_ids.size();
     let past_key_values_length = past_key_values[0].seq_length();
     let causal_mask = prepare_attn_mask(
@@ -153,7 +153,7 @@ pub fn send(
     causal_mask: Tensor,
     config: &Config,
 ) {
-    let mut current_batch = 0 as i64;
+    let mut current_batch = 0i64;
     for (mini_batch_size, rq) in acks {
         // XXX actually clean the padded values of past so that subsequent
         // calls can get a chance to have a better padding (+ correct attention mask).

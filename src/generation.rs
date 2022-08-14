@@ -142,10 +142,9 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
     match &params.generation_mode {
         GenerationMode::Greedy => {
             let seq_length = logits.size()[1];
-            let new_ids = logits
+            logits
                 .i((0..1, seq_length - 1..seq_length))
-                .argmax(-1, false);
-            new_ids
+                .argmax(-1, false)
         }
         GenerationMode::Sampling(params) => {
             let seq_length = logits.size()[1];
@@ -172,8 +171,7 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
             }
 
             let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
-            let new_ids = probs.f_multinomial(1, false).unwrap();
-            new_ids
+            probs.f_multinomial(1, false).unwrap()
         }
         _ => todo!(),
         // Parameters::BeamSearch(params) => {
@@ -236,7 +234,7 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let all_input_ids =
         Tensor::zeros(&[batch_size, max_length_input_ids], kind2) + config.padding_idx;
 
-    let mut all_past_key_values = non_empty_past(&config, batch_size, max_length_past, 0.0, 0.0);
+    let mut all_past_key_values = non_empty_past(config, batch_size, max_length_past, 0.0, 0.0);
 
     let attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
 
