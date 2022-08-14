@@ -32,7 +32,6 @@ async fn generate(
 ) -> actix_web::Result<HttpResponse> {
     let start = Instant::now();
     let input_string = payload.inputs.clone();
-    let max_new_tokens = payload.parameters.max_new_tokens;
     let parameters = payload.parameters.clone();
     let max_new_tokens = payload.parameters.max_new_tokens;
     let string = actix_web::rt::task::spawn_blocking(move || -> Result<String, GenerationError> {
