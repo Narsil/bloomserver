@@ -1,7 +1,7 @@
 use super::*;
 use crate::generation::padding;
 use crate::model::build_alibi_tensor;
-use crate::model::tests::{BLOOM_350M, BLOOM_TESTING};
+use crate::model::tests::{bloom_350m, bloom_testing};
 use crate::model::BloomForCausalLM;
 use crate::model::Config;
 use tch::{IndexOp, Tensor};
@@ -83,9 +83,10 @@ fn test_generate(
 }
 
 #[test]
+#[serial_test::serial]
 fn test_simple_generation() {
+    let model = bloom_350m();
     let config = Config::new350m();
-    let model = BLOOM_350M.lock().unwrap();
     let tokenizer = Tokenizer::from_file("./tokenizer.json").unwrap();
 
     let input_sentence = "I enjoy walking my cute dog";
@@ -122,9 +123,10 @@ fn test_simple_generation() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_logits_testing() {
     let config = Config::new_testing();
-    let model = BLOOM_TESTING.lock().unwrap();
+    let model = bloom_testing();
     let device = Device::Cuda(0);
 
     let example_ids = &[
@@ -162,9 +164,10 @@ fn test_logits_testing() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_embeddings_testing() {
     let config = Config::new_testing();
-    let model = BLOOM_TESTING.lock().unwrap();
+    let model = bloom_testing();
     let device = Device::Cuda(0);
 
     let example_ids = &[

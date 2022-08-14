@@ -3,6 +3,7 @@ use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
 use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
+use std::rc::Rc;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 #[derive(Debug)]
@@ -369,16 +370,73 @@ impl Linear {
     }
 }
 
+/// Different from usual FakeTpLinear in order to remove transpose operation:
+/// weight: [in_features, out_features]
+/// bias: [out_features]
+pub struct FakeTpLinear {
+    linear: Linear,
+    pretraining_tp: usize,
+}
+
+impl FakeTpLinear {
+    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device, pretraining_tp: usize) -> Self {
+        let linear = Linear::new(name, model, device);
+        Self {
+            linear,
+            pretraining_tp,
+        }
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> Tensor {
+        let pretraining_tp = self.pretraining_tp as i64;
+        let slices = xs.size().last().unwrap() / pretraining_tp;
+        let mut output_tensor = Tensor::zeros_like(&xs);
+        for i in 0..pretraining_tp {
+            let context_tp = xs.i((.., .., i * slices..(i + 1) * slices));
+            let dense_tp = self.linear.weight.i(i * slices..(i + 1) * slices);
+
+            let in_features = self.linear.weight.size()[0] / pretraining_tp;
+            let out_features = self.linear.weight.size()[1];
+            let mut out_size = context_tp.size();
+            if let Some(last) = out_size.last_mut() {
+                *last = out_features;
+            }
+
+            let flatten_xs = context_tp.f_reshape(&[-1, in_features]).unwrap();
+            let out = flatten_xs.f_mm(&dense_tp).unwrap();
+            output_tensor += out.f_view(out_size.as_slice()).unwrap();
+        }
+        output_tensor += &self.linear.bias;
+        output_tensor
+    }
+}
+
+pub enum ParallelLinear {
+    Linear(Linear),
+    FakeTp(FakeTpLinear),
+    TensorParallelColumnLinear(TensorParallelColumnLinear),
+    TensorParallelRowLinear(TensorParallelRowLinear),
+}
+
+impl ParallelLinear {
+    pub fn forward(&self, xs: &Tensor) -> Tensor {
+        match self {
+            ParallelLinear::Linear(layer) => layer.forward(xs),
+            ParallelLinear::FakeTp(layer) => layer.forward(xs),
+            ParallelLinear::TensorParallelColumnLinear(layer) => layer.forward(xs),
+            ParallelLinear::TensorParallelRowLinear(layer) => layer.forward(xs),
+        }
+    }
+}
+
 pub struct BloomAttention {
-    dense: Linear,
-    query_key_value: Linear,
+    dense: ParallelLinear,
+    query_key_value: ParallelLinear,
     num_attention_heads: i64,
     head_dim: i64,
     layer_number: usize,
     real_layer_number: usize,
     norm_factor: f64,
-    pretraining_tp: i64,
-    slow_but_exact: bool,
 }
 
 impl BloomAttention {
@@ -389,8 +447,21 @@ impl BloomAttention {
         layer_number: usize,
         device: Device,
     ) -> Self {
-        let dense = Linear::new(&format!("{name}.dense"), model, device);
-        let query_key_value = Linear::new(&format!("{name}.query_key_value"), model, device);
+        let dense = if config.slow_but_exact {
+            ParallelLinear::FakeTp(FakeTpLinear::new(
+                &format!("{name}.dense"),
+                model,
+                device,
+                config.pretraining_tp,
+            ))
+        } else {
+            ParallelLinear::Linear(Linear::new(&format!("{name}.dense"), model, device))
+        };
+        let query_key_value = ParallelLinear::Linear(Linear::new(
+            &format!("{name}.query_key_value"),
+            model,
+            device,
+        ));
         let head_dim = (config.hidden_size / config.n_head) as i64;
         let num_attention_heads = config.n_head as i64;
         let real_layer_number = layer_number;
@@ -404,8 +475,6 @@ impl BloomAttention {
             layer_number,
             real_layer_number,
             norm_factor,
-            slow_but_exact: config.slow_but_exact,
-            pretraining_tp: config.pretraining_tp as i64,
         }
     }
 
@@ -415,13 +484,17 @@ impl BloomAttention {
         model: &SafeTensors<'_>,
         layer_number: usize,
         device: Device,
-        group: &ThreadGroup,
+        group: Rc<ThreadGroup>,
     ) -> Self {
-        // let query_key_value =
-        //     TensorParallelColumnLinear::new(&format!("{name}.query_key_value"), model, device);
-        // let dense = TensorParallelRowLinear::new(&format!("{name}.dense"), model, device, group);
-        let query_key_value = Linear::new(&format!("{name}.query_key_value"), model, device);
-        let dense = Linear::new(&format!("{name}.dense"), model, device);
+        let query_key_value = ParallelLinear::TensorParallelColumnLinear(
+            TensorParallelColumnLinear::new(&format!("{name}.query_key_value"), model, device),
+        );
+        let dense = ParallelLinear::TensorParallelRowLinear(TensorParallelRowLinear::new(
+            &format!("{name}.dense"),
+            model,
+            device,
+            group,
+        ));
         let head_dim = (config.hidden_size / config.n_head) as i64;
         let num_attention_heads = config.n_head as i64;
         let real_layer_number = layer_number;
@@ -435,8 +508,6 @@ impl BloomAttention {
             layer_number,
             real_layer_number,
             norm_factor,
-            slow_but_exact: config.slow_but_exact,
-            pretraining_tp: config.pretraining_tp as i64,
         }
     }
 
@@ -572,18 +643,7 @@ impl BloomAttention {
                 self.num_attention_heads * self.head_dim,
             ))
             .unwrap();
-        let mut output = if self.slow_but_exact {
-            let slices = context.size().last().unwrap() / self.pretraining_tp;
-            let mut output_tensor = Tensor::zeros_like(&context);
-            for i in 0..self.pretraining_tp {
-                let context_tp = context.i((.., .., i * slices..(i + 1) * slices));
-                let dense_tp = self.dense.weight.i((.., i * slices..(i + 1) * slices));
-                output_tensor += context_tp.linear::<Tensor>(&dense_tp, None);
-            }
-            output_tensor
-        } else {
-            self.dense.forward(&context)
-        };
+        let mut output = self.dense.forward(&context);
         save_layer_to_disk(
             &output,
             &format!("rust_bmm_dense_{}.npy", self.real_layer_number,),
@@ -647,7 +707,7 @@ impl BloomMlp {
         model: &SafeTensors<'_>,
         device: Device,
         real_layer_number: usize,
-        _group: &ThreadGroup,
+        _group: Rc<ThreadGroup>,
     ) -> Self {
         // let dense_h_to_4h =
         //     TensorParallelColumnLinear::new(&format!("{name}.dense_h_to_4h"), model, device);
@@ -768,7 +828,7 @@ impl BloomBlock {
         model: &SafeTensors<'_>,
         layer_number: usize,
         device: Device,
-        group: &ThreadGroup,
+        group: Rc<ThreadGroup>,
     ) -> Self {
         // attention
         let input_layernorm = LayerNorm::new(
@@ -789,7 +849,7 @@ impl BloomBlock {
             model,
             layer_number,
             device,
-            group,
+            Rc::clone(&group),
         );
         let mlp = BloomMlp::new_tp(
             config,
@@ -1000,14 +1060,8 @@ pub mod tests {
     use crate::test::assert_all_close;
     use memmap::MmapOptions;
     use once_cell::sync::Lazy;
-    use std::sync::{Arc, Mutex};
 
-    pub static BLOOM_350M: Lazy<Arc<Mutex<BloomForCausalLM>>> =
-        Lazy::new(|| Arc::new(Mutex::new(bloom_350m())));
-    pub static BLOOM_TESTING: Lazy<Arc<Mutex<BloomForCausalLM>>> =
-        Lazy::new(|| Arc::new(Mutex::new(bloom_testing())));
-
-    fn bloom_350m() -> BloomForCausalLM {
+    pub(crate) fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();
         let file = std::fs::File::open("./weights/bloom-350m.bin").unwrap();
         // SAFETY: This is actually unsafe.
@@ -1020,7 +1074,7 @@ pub mod tests {
         model
     }
 
-    fn bloom_testing() -> BloomForCausalLM {
+    pub(crate) fn bloom_testing() -> BloomForCausalLM {
         let config = Config::new_testing();
         let file = std::fs::File::open("./weights/bloom-testing.bin").unwrap();
         // SAFETY: This is actually unsafe.
@@ -1147,10 +1201,11 @@ pub mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_bloom_350m() {
         // Batched input (2, 4)
         // First input is not full
-        let model = BLOOM_350M.lock().unwrap();
+        let model = bloom_350m();
         let config = Config::new350m();
         let device = Device::Cuda(0);
         let mut past_key_values = empty_past(&config, 2);

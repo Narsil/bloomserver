@@ -231,6 +231,9 @@ mod tests {
 
     #[actix_web::test]
     async fn test_generation_testing() {
+        if Cuda::device_count() < 3 {
+            return;
+        }
         let (tokenizer, in_channel, prio_channel, config) =
             init_threads("bigscience-small-testing");
         let app = test::init_service(
@@ -260,6 +263,9 @@ mod tests {
 
     #[actix_web::test]
     async fn test_generation_350m() {
+        if Cuda::device_count() < 16 {
+            return;
+        }
         let (tokenizer, in_channel, prio_channel, config) = init_threads("bloom-350m");
         info!("Started");
         let app = test::init_service(

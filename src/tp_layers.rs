@@ -1,6 +1,7 @@
 use crate::convert;
 use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
+use std::rc::Rc;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 /// Different from usual TensorParallelColumnLinear in order to remove transpose operation:
@@ -55,18 +56,18 @@ impl TensorParallelColumnLinear {
 /// Different from usual TensorParallelRowLinear in order to remove transpose operation:
 /// weight: [in_features, out_features]
 /// bias: [out_features]
-pub struct TensorParallelRowLinear<'a> {
+pub struct TensorParallelRowLinear {
     weight: Tensor,
     bias: Tensor,
-    group: &'a ThreadGroup,
+    group: Rc<ThreadGroup>,
 }
 
-impl<'a> TensorParallelRowLinear<'a> {
+impl TensorParallelRowLinear {
     pub fn new(
         name: &str,
         model: &SafeTensors<'_>,
         device: Device,
-        group: &'a ThreadGroup,
+        group: Rc<ThreadGroup>,
     ) -> Self {
         let tname = format!("{name}.weight");
         let weight = convert(
