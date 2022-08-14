@@ -200,7 +200,7 @@ pub fn thread1(
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
 
     let word_embeddings = Embedding::new("word_embeddings", &embedding_model, device);
-    let word_embeddings_layernorm = LayerNorm::new(
+    let word_embeddings_layernorm = LayerNorm::load(
         config.hidden_size,
         "word_embeddings_layernorm",
         &embedding_model,
@@ -218,7 +218,7 @@ pub fn thread1(
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(
+            BloomBlock::load(
                 &config,
                 &if std::env::var("BLOOM").unwrap_or_else(|_| "".to_string()) == "bloom-dgx" {
                     "h.0".to_string()
@@ -295,7 +295,7 @@ pub fn thread2(
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(
+            BloomBlock::load(
                 &config,
                 &if std::env::var("BLOOM").unwrap_or_else(|_| "".to_string()) == "bloom-dgx" {
                     "h.0".to_string()
@@ -370,7 +370,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let final_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let ln_f = LayerNorm::new(config.hidden_size, "ln_f", &final_model, device);
+    let ln_f = LayerNorm::load(config.hidden_size, "ln_f", &final_model, device);
     let lm_head = InvertedEmbedding::new("word_embeddings", &embedding_model, device);
 
     let offset = layout_config.layers_first_thread
@@ -388,7 +388,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(
+            BloomBlock::load(
                 &config,
                 &if std::env::var("BLOOM").unwrap_or_else(|_| "".to_string()) == "bloom-dgx" {
                     "h.0".to_string()

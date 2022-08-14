@@ -25,17 +25,17 @@ pub fn thread(group: ThreadGroup, config: Config, channels: Option<(RChan1, RCha
     // let model = SafeTensors::deserialize(&mmap).unwrap();
 
     // let word_embeddings = Embedding::new("word_embeddings", &model, device);
-    // let word_embeddings_layernorm = LayerNorm::new(
+    // let word_embeddings_layernorm = LayerNorm::load(
     //     config.hidden_size,
     //     "word_embeddings_layernorm",
     //     &model,
     //     device,
     // );
     // let layers: Vec<BloomBlock> = (0..config.n_layer as usize)
-    //     .map(|i| BloomBlock::new_tp(&config, &format!("h.{i}"), &model, i, device, &group))
+    //     .map(|i| BloomBlock::load_tp(&config, &format!("h.{i}"), &model, i, device, &group))
     //     .collect();
 
-    // let ln_f = LayerNorm::new(config.hidden_size, "ln_f", &model, device);
+    // let ln_f = LayerNorm::load(config.hidden_size, "ln_f", &model, device);
     // let lm_head = InvertedEmbedding::new("word_embeddings", &model, device);
 
     // if let Some((rx, prio_rx)) = channels {

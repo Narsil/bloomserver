@@ -1,4 +1,4 @@
-use crate::convert;
+use crate::model::loader::convert;
 use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
 use nccl_rs::ThreadGroup;
@@ -281,27 +281,13 @@ fn finfo_min(kind: Kind) -> f64 {
 }
 
 pub struct LayerNorm {
-    weight: Tensor,
-    bias: Tensor,
-    hidden_size: i64,
+    pub(super) weight: Tensor,
+    pub(super) bias: Tensor,
+    pub(super) hidden_size: i64,
 }
 
 impl LayerNorm {
-    pub fn new(hidden_size: i64, name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight_name = format!("{name}.weight");
-        let weight = convert(
-            model
-                .tensor(&weight_name)
-                .unwrap_or_else(|_| panic!("Failed to load {weight_name} with name {name}")),
-            device,
-        );
-        let bias_name = format!("{name}.bias");
-        let bias = convert(
-            model
-                .tensor(&bias_name)
-                .unwrap_or_else(|_| panic!("Failed to load {bias_name}")),
-            device,
-        );
+    pub fn new(weight: Tensor, bias: Tensor, hidden_size: i64) -> Self {
         Self {
             hidden_size,
             weight,
@@ -325,30 +311,12 @@ impl LayerNorm {
 /// weight: [in_features, out_features]
 /// bias: [out_features]
 pub struct Linear {
-    weight: Tensor,
-    bias: Tensor,
+    pub(super) weight: Tensor,
+    pub(super) bias: Tensor,
 }
 
 impl Linear {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let tname = format!("{name}.weight");
-        let weight = convert(
-            model
-                .tensor(&tname)
-                .unwrap_or_else(|_| panic!("Could not find {tname}")),
-            device,
-        )
-        .f_transpose_copy(1, 0)
-        .unwrap();
-
-        let bias_name = format!("{name}.bias");
-        let bias = convert(
-            model
-                .tensor(&bias_name)
-                .unwrap_or_else(|_| panic!("Could not find {bias_name}")),
-            device,
-        );
-
+    pub fn new(weight: Tensor, bias: Tensor) -> Self {
         Self { weight, bias }
     }
 
@@ -374,13 +342,12 @@ impl Linear {
 /// weight: [in_features, out_features]
 /// bias: [out_features]
 pub struct FakeTpLinear {
-    linear: Linear,
-    pretraining_tp: usize,
+    pub(super) linear: Linear,
+    pub(super) pretraining_tp: usize,
 }
 
 impl FakeTpLinear {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device, pretraining_tp: usize) -> Self {
-        let linear = Linear::new(name, model, device);
+    pub fn new(linear: Linear, pretraining_tp: usize) -> Self {
         Self {
             linear,
             pretraining_tp,
@@ -430,42 +397,24 @@ impl ParallelLinear {
 }
 
 pub struct BloomAttention {
-    dense: ParallelLinear,
-    query_key_value: ParallelLinear,
-    num_attention_heads: i64,
-    head_dim: i64,
-    layer_number: usize,
-    real_layer_number: usize,
-    norm_factor: f64,
+    pub(super) dense: ParallelLinear,
+    pub(super) query_key_value: ParallelLinear,
+    pub(super) num_attention_heads: i64,
+    pub(super) head_dim: i64,
+    pub(super) layer_number: usize,
+    pub(super) norm_factor: f64,
 }
 
 impl BloomAttention {
     pub fn new(
+        query_key_value: ParallelLinear,
+        dense: ParallelLinear,
         config: &Config,
-        name: &str,
-        model: &SafeTensors<'_>,
         layer_number: usize,
-        device: Device,
     ) -> Self {
-        let dense = if config.slow_but_exact {
-            ParallelLinear::FakeTp(FakeTpLinear::new(
-                &format!("{name}.dense"),
-                model,
-                device,
-                config.pretraining_tp,
-            ))
-        } else {
-            ParallelLinear::Linear(Linear::new(&format!("{name}.dense"), model, device))
-        };
-        let query_key_value = ParallelLinear::Linear(Linear::new(
-            &format!("{name}.query_key_value"),
-            model,
-            device,
-        ));
         let head_dim = (config.hidden_size / config.n_head) as i64;
         let num_attention_heads = config.n_head as i64;
-        let real_layer_number = layer_number;
-        let layer_number = std::cmp::max(1, layer_number);
+        let layer_number = layer_number;
         let norm_factor = 1.0 / (head_dim as f64).sqrt();
         Self {
             dense,
@@ -473,40 +422,6 @@ impl BloomAttention {
             num_attention_heads,
             head_dim,
             layer_number,
-            real_layer_number,
-            norm_factor,
-        }
-    }
-
-    pub fn new_tp(
-        config: &Config,
-        name: &str,
-        model: &SafeTensors<'_>,
-        layer_number: usize,
-        device: Device,
-        group: Rc<ThreadGroup>,
-    ) -> Self {
-        let query_key_value = ParallelLinear::TensorParallelColumnLinear(
-            TensorParallelColumnLinear::new(&format!("{name}.query_key_value"), model, device),
-        );
-        let dense = ParallelLinear::TensorParallelRowLinear(TensorParallelRowLinear::new(
-            &format!("{name}.dense"),
-            model,
-            device,
-            group,
-        ));
-        let head_dim = (config.hidden_size / config.n_head) as i64;
-        let num_attention_heads = config.n_head as i64;
-        let real_layer_number = layer_number;
-        let layer_number = std::cmp::max(1, layer_number);
-        let norm_factor = 1.0 / (head_dim as f64).sqrt();
-        Self {
-            dense,
-            query_key_value,
-            num_attention_heads,
-            head_dim,
-            layer_number,
-            real_layer_number,
             norm_factor,
         }
     }
@@ -524,7 +439,7 @@ impl BloomAttention {
         let (batch_size, q_length) = if let [batch_size, q_length] = mixed_x_layer.size()[..2] {
             (batch_size, q_length)
         } else {
-            todo!()
+            unreachable!()
         };
         debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
@@ -565,19 +480,19 @@ impl BloomAttention {
 
         save_layer_to_disk(
             alibi,
-            &format!("rust_baddbmm_sliced_alibi_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_sliced_alibi_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             &key_layer,
-            &format!("rust_baddbmm_key_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_key_layer_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             &query_layer,
-            &format!("rust_baddbmm_query_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_query_layer_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             &value_layer,
-            &format!("rust_baddbmm_value_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_value_layer_{}.npy", self.layer_number,),
         );
 
         let mut attention_scores = alibi
@@ -586,7 +501,7 @@ impl BloomAttention {
 
         save_layer_to_disk(
             &attention_scores,
-            &format!("rust_baddbmm_matmul_result_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_matmul_result_{}.npy", self.layer_number,),
         );
 
         // cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
@@ -598,16 +513,13 @@ impl BloomAttention {
 
         save_layer_to_disk(
             &attention_scores,
-            &format!(
-                "rust_softmax_attention_scores_{}.npy",
-                self.real_layer_number,
-            ),
+            &format!("rust_softmax_attention_scores_{}.npy", self.layer_number,),
         );
         let attn_weights =
             attention_scores.masked_fill_(attention_mask, finfo_min(attention_scores.kind()));
         save_layer_to_disk(
             &attn_weights,
-            &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
+            &format!("rust_softmax_attn_weights_{}.npy", self.layer_number,),
         );
         let attention_probs = attn_weights
             .f_softmax(-1, Kind::Float)
@@ -615,15 +527,12 @@ impl BloomAttention {
             .to_kind(input_dtype);
         save_layer_to_disk(
             &attention_probs,
-            &format!(
-                "rust_softmax_attention_probs_{}.npy",
-                self.real_layer_number,
-            ),
+            &format!("rust_softmax_attention_probs_{}.npy", self.layer_number,),
         );
 
         save_layer_to_disk(
             &value_layer,
-            &format!("rust_bmm_value_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_value_layer_{}.npy", self.layer_number,),
         );
         let context_layer = Tensor::f_bmm(&attention_probs, &value_layer).unwrap();
 
@@ -646,16 +555,16 @@ impl BloomAttention {
         let mut output = self.dense.forward(&context);
         save_layer_to_disk(
             &output,
-            &format!("rust_bmm_dense_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_dense_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             residual,
-            &format!("rust_bmm_residual_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_residual_{}.npy", self.layer_number,),
         );
         output += residual;
         save_layer_to_disk(
             &output,
-            &format!("rust_bmm_dropout_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_dropout_{}.npy", self.layer_number,),
         );
 
         // update layer_past
@@ -669,11 +578,11 @@ impl BloomAttention {
 }
 
 pub struct BloomMlp {
-    dense_h_to_4h: Linear,
-    dense_4h_to_h: Linear,
-    real_layer_number: usize,
-    slow_but_exact: bool,
-    pretraining_tp: i64,
+    pub(super) dense_h_to_4h: Linear,
+    pub(super) dense_4h_to_h: Linear,
+    pub(super) layer_number: usize,
+    pub(super) slow_but_exact: bool,
+    pub(super) pretraining_tp: i64,
 }
 
 // TODO @thomasw21: Figure out how to compile this into a single operation.
@@ -684,41 +593,15 @@ fn bloom_gelu(x: &Tensor) -> Tensor {
 
 impl BloomMlp {
     pub fn new(
+        dense_h_to_4h: Linear,
+        dense_4h_to_h: Linear,
         config: &Config,
-        name: &str,
-        model: &SafeTensors<'_>,
-        device: Device,
-        real_layer_number: usize,
+        layer_number: usize,
     ) -> Self {
-        let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model, device);
-        let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model, device);
         Self {
             dense_h_to_4h,
             dense_4h_to_h,
-            real_layer_number,
-            slow_but_exact: config.slow_but_exact,
-            pretraining_tp: config.pretraining_tp as i64,
-        }
-    }
-
-    pub fn new_tp(
-        config: &Config,
-        name: &str,
-        model: &SafeTensors<'_>,
-        device: Device,
-        real_layer_number: usize,
-        _group: Rc<ThreadGroup>,
-    ) -> Self {
-        // let dense_h_to_4h =
-        //     TensorParallelColumnLinear::new(&format!("{name}.dense_h_to_4h"), model, device);
-        // let dense_4h_to_h =
-        //     TensorParallelRowLinear::new(&format!("{name}.dense_4h_to_h"), model, device, group);
-        let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model, device);
-        let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model, device);
-        Self {
-            dense_h_to_4h,
-            dense_4h_to_h,
-            real_layer_number,
+            layer_number,
             slow_but_exact: config.slow_but_exact,
             pretraining_tp: config.pretraining_tp as i64,
         }
@@ -727,7 +610,7 @@ impl BloomMlp {
     pub fn forward(&self, hidden_states: &Tensor, residual: &Tensor) -> Tensor {
         save_layer_to_disk(
             hidden_states,
-            &format!("rust_mlp_init_{}.npy", self.real_layer_number,),
+            &format!("rust_mlp_init_{}.npy", self.layer_number,),
         );
         debug("hidden_states", hidden_states);
         debug("INCOMING residual", residual);
@@ -736,7 +619,7 @@ impl BloomMlp {
         let hidden_states = bloom_gelu(&hidden_states);
         save_layer_to_disk(
             &hidden_states,
-            &format!("rust_mlp_gelu_{}.npy", self.real_layer_number,),
+            &format!("rust_mlp_gelu_{}.npy", self.layer_number,),
         );
         debug("hidden_states gelu", &hidden_states);
         let mut hidden_states = if self.slow_but_exact {
@@ -764,55 +647,28 @@ impl BloomMlp {
         debug("hidden_states residual", &hidden_states);
         save_layer_to_disk(
             &hidden_states,
-            &format!("rust_mlp_output_{}.npy", self.real_layer_number,),
+            &format!("rust_mlp_output_{}.npy", self.layer_number,),
         );
         hidden_states
     }
 }
 
 pub struct BloomBlock {
-    input_layernorm: LayerNorm,
-    self_attention: BloomAttention,
-    post_attention_layernorm: LayerNorm,
-    mlp: BloomMlp,
-    layer_number: usize,
+    pub(super) input_layernorm: LayerNorm,
+    pub(super) self_attention: BloomAttention,
+    pub(super) post_attention_layernorm: LayerNorm,
+    pub(super) mlp: BloomMlp,
+    pub(super) layer_number: usize,
 }
 
 impl BloomBlock {
     pub fn new(
-        config: &Config,
-        prefix: &str,
-        model: &SafeTensors<'_>,
+        input_layernorm: LayerNorm,
+        self_attention: BloomAttention,
+        post_attention_layernorm: LayerNorm,
+        mlp: BloomMlp,
         layer_number: usize,
-        device: Device,
     ) -> Self {
-        // attention
-        let input_layernorm = LayerNorm::new(
-            config.hidden_size,
-            &format!("{prefix}.input_layernorm"),
-            model,
-            device,
-        );
-        let post_attention_layernorm = LayerNorm::new(
-            config.hidden_size,
-            &format!("{prefix}.post_attention_layernorm"),
-            model,
-            device,
-        );
-        let self_attention = BloomAttention::new(
-            config,
-            &format!("{prefix}.self_attention"),
-            model,
-            layer_number,
-            device,
-        );
-        let mlp = BloomMlp::new(
-            config,
-            &format!("{prefix}.mlp"),
-            model,
-            device,
-            layer_number,
-        );
         Self {
             input_layernorm,
             self_attention,
@@ -831,19 +687,19 @@ impl BloomBlock {
         group: Rc<ThreadGroup>,
     ) -> Self {
         // attention
-        let input_layernorm = LayerNorm::new(
+        let input_layernorm = LayerNorm::load(
             config.hidden_size,
             &format!("{prefix}.input_layernorm"),
             model,
             device,
         );
-        let post_attention_layernorm = LayerNorm::new(
+        let post_attention_layernorm = LayerNorm::load(
             config.hidden_size,
             &format!("{prefix}.post_attention_layernorm"),
             model,
             device,
         );
-        let self_attention = BloomAttention::new_tp(
+        let self_attention = BloomAttention::load_tp(
             config,
             &format!("{prefix}.self_attention"),
             model,
@@ -851,7 +707,7 @@ impl BloomBlock {
             device,
             Rc::clone(&group),
         );
-        let mlp = BloomMlp::new_tp(
+        let mlp = BloomMlp::load_tp(
             config,
             &format!("{prefix}.mlp"),
             model,
@@ -942,25 +798,19 @@ pub struct BloomModel {
 }
 
 impl BloomModel {
-    pub fn new(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
-        let word_embeddings = Embedding::new("word_embeddings", model, device);
-        let word_embeddings_layernorm = LayerNorm::new(
-            config.hidden_size,
-            "word_embeddings_layernorm",
-            model,
-            device,
-        );
-        let ln_f = LayerNorm::new(config.hidden_size, "ln_f", model, device);
-        let h = (0..config.n_layer)
-            .map(|i| BloomBlock::new(config, &format!("h.{i}"), model, i as usize, device))
-            .collect();
-        let num_heads = config.n_head;
+    pub fn new(
+        word_embeddings: Embedding,
+        word_embeddings_layernorm: LayerNorm,
+        h: Vec<BloomBlock>,
+        ln_f: LayerNorm,
+        config: &Config,
+    ) -> Self {
         Self {
             word_embeddings,
             word_embeddings_layernorm,
             h,
             ln_f,
-            num_heads,
+            num_heads: config.n_head,
         }
     }
 
@@ -1031,7 +881,7 @@ pub struct BloomForCausalLM {
 
 impl BloomForCausalLM {
     pub fn new(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
-        let transformer = BloomModel::new(config, model, device);
+        let transformer = BloomModel::load(config, model, device);
         let lm_head = InvertedEmbedding::new("word_embeddings", model, device);
         Self {
             transformer,

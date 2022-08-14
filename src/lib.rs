@@ -44,24 +44,3 @@ impl ResponseError for GenerationError {
         }
     }
 }
-
-pub fn convert(view: TensorView, device: Device) -> Tensor {
-    let kind = match view.get_dtype() {
-        Dtype::F16 => kind::Kind::Half,
-        Dtype::BF16 => kind::Kind::BFloat16,
-        _ => {
-            todo!("Need to implement that");
-        }
-    };
-    let t = Tensor::of_data_size(
-        view.get_data(),
-        &view
-            .get_shape()
-            .iter()
-            .map(|i| *i as i64)
-            .collect::<Vec<_>>(),
-        kind,
-    )
-    .to_device(device);
-    t
-}

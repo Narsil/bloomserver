@@ -1,4 +1,4 @@
-use crate::convert;
+use crate::model::loader::convert;
 use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
 use std::rc::Rc;
