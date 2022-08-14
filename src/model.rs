@@ -1015,7 +1015,8 @@ pub mod tests {
 
         assert_eq!(logits.size(), vec![2, 4, 250880]);
         let expected = Tensor::of_slice(&[
-            640.5, 668.5, 671.0, 102.375, 670.5, 676.5, 680.5, 676.0, 671.0, 670.0,
+            308.7500, 314.0000, 325.2500, 198.2500, 322.7500, 328.0000, 327.5000, 325.7500,
+            320.0000, 321.2,
         ])
         .to_kind(config.kind)
         .to_device(device);
@@ -1027,7 +1028,8 @@ pub mod tests {
             // Original implem output in comment
             // Most likely linked to odd `baddbmm` kernel for alpha + beta fusion
             // Which leads to small drifts.
-            vec![4141, 4141, 2, 17, 64530, 15, 15, 100] // vec![235149, 235149, 2, 17, 64530, 15, 15, 100]
+            vec![4141, 4141, 2, 17, 228, 132, 15, 100],
+            // vec![4141, 4141, 2, 17, 64530, 15, 15, 100] // vec![235149, 235149, 2, 17, 64530, 15, 15, 100]
         );
     }
 }
