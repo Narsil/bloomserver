@@ -222,11 +222,57 @@ impl BloomBlock {
             layer_number,
         }
     }
+
+    pub fn load_tp(
+        config: &Config,
+        prefix: &str,
+        model: &SafeTensors<'_>,
+        layer_number: usize,
+        device: Device,
+        group: Rc<ThreadGroup>,
+    ) -> Self {
+        // attention
+        let input_layernorm = LayerNorm::load(
+            config.hidden_size,
+            &format!("{prefix}.input_layernorm"),
+            model,
+            device,
+        );
+        let post_attention_layernorm = LayerNorm::load(
+            config.hidden_size,
+            &format!("{prefix}.post_attention_layernorm"),
+            model,
+            device,
+        );
+        let self_attention = BloomAttention::load_tp(
+            config,
+            &format!("{prefix}.self_attention"),
+            model,
+            layer_number,
+            device,
+            Rc::clone(&group),
+        );
+        let mlp = BloomMlp::load_tp(
+            config,
+            &format!("{prefix}.mlp"),
+            model,
+            device,
+            layer_number,
+            group,
+        );
+        Self {
+            input_layernorm,
+            self_attention,
+            post_attention_layernorm,
+            mlp,
+            layer_number,
+        }
+    }
 }
 
 impl BloomModel {
     pub fn load(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
-        let word_embeddings = Embedding::new("word_embeddings", model, device);
+        let word_embeddings = Embedding::load("word_embeddings", model, device);
         let word_embeddings_layernorm = LayerNorm::load(
             config.hidden_size,
             "word_embeddings_layernorm",
@@ -238,5 +284,27 @@ impl BloomModel {
             .map(|i| BloomBlock::load(config, &format!("h.{i}"), model, i as usize, device))
             .collect();
         Self::new(word_embeddings, word_embeddings_layernorm, h, ln_f, config)
+    }
+}
+
+impl Embedding {
+    pub fn load(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+        Self::new(weight)
+    }
+}
+
+impl InvertedEmbedding {
+    pub fn load(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+        Self::new(weight)
+    }
+}
+
+impl BloomForCausalLM {
+    pub fn load(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
+        let transformer = BloomModel::load(config, model, device);
+        let lm_head = InvertedEmbedding::load("word_embeddings", model, device);
+        Self::new(transformer, lm_head)
     }
 }

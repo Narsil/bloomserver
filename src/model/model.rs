@@ -1,9 +1,5 @@
-use crate::model::loader::convert;
 use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
-use nccl_rs::ThreadGroup;
-use safetensors::SafeTensors;
-use std::rc::Rc;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 #[derive(Debug)]
@@ -678,52 +674,6 @@ impl BloomBlock {
         }
     }
 
-    pub fn new_tp(
-        config: &Config,
-        prefix: &str,
-        model: &SafeTensors<'_>,
-        layer_number: usize,
-        device: Device,
-        group: Rc<ThreadGroup>,
-    ) -> Self {
-        // attention
-        let input_layernorm = LayerNorm::load(
-            config.hidden_size,
-            &format!("{prefix}.input_layernorm"),
-            model,
-            device,
-        );
-        let post_attention_layernorm = LayerNorm::load(
-            config.hidden_size,
-            &format!("{prefix}.post_attention_layernorm"),
-            model,
-            device,
-        );
-        let self_attention = BloomAttention::load_tp(
-            config,
-            &format!("{prefix}.self_attention"),
-            model,
-            layer_number,
-            device,
-            Rc::clone(&group),
-        );
-        let mlp = BloomMlp::load_tp(
-            config,
-            &format!("{prefix}.mlp"),
-            model,
-            device,
-            layer_number,
-            group,
-        );
-        Self {
-            input_layernorm,
-            self_attention,
-            post_attention_layernorm,
-            mlp,
-            layer_number,
-        }
-    }
-
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -776,8 +726,7 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+    pub fn new(weight: Tensor) -> Self {
         Self { weight }
     }
 
@@ -857,8 +806,7 @@ pub struct InvertedEmbedding {
 }
 
 impl InvertedEmbedding {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+    pub fn new(weight: Tensor) -> Self {
         Self { weight }
     }
 
@@ -880,9 +828,7 @@ pub struct BloomForCausalLM {
 }
 
 impl BloomForCausalLM {
-    pub fn new(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
-        let transformer = BloomModel::load(config, model, device);
-        let lm_head = InvertedEmbedding::new("word_embeddings", model, device);
+    pub fn new(transformer: BloomModel, lm_head: InvertedEmbedding) -> Self {
         Self {
             transformer,
             lm_head,
@@ -909,7 +855,10 @@ pub mod tests {
     use crate::empty_past;
     use crate::test::assert_all_close;
     use memmap::MmapOptions;
+    use nccl_rs::ThreadGroup;
     use once_cell::sync::Lazy;
+    use safetensors::SafeTensors;
+    use std::rc::Rc;
 
     pub(crate) fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();
@@ -920,7 +869,7 @@ pub mod tests {
 
         let device = Device::Cuda(0);
 
-        let model = BloomForCausalLM::new(&config, &model_file, device);
+        let model = BloomForCausalLM::load(&config, &model_file, device);
         model
     }
 
@@ -933,7 +882,7 @@ pub mod tests {
 
         let device = Device::Cuda(0);
 
-        let model = BloomForCausalLM::new(&config, &model_file, device);
+        let model = BloomForCausalLM::load(&config, &model_file, device);
         model
     }
     #[test]

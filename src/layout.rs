@@ -199,7 +199,7 @@ pub fn thread1(
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let word_embeddings = Embedding::new("word_embeddings", &embedding_model, device);
+    let word_embeddings = Embedding::load("word_embeddings", &embedding_model, device);
     let word_embeddings_layernorm = LayerNorm::load(
         config.hidden_size,
         "word_embeddings_layernorm",
@@ -371,7 +371,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let final_model = SafeTensors::deserialize(&mmap).unwrap();
 
     let ln_f = LayerNorm::load(config.hidden_size, "ln_f", &final_model, device);
-    let lm_head = InvertedEmbedding::new("word_embeddings", &embedding_model, device);
+    let lm_head = InvertedEmbedding::load("word_embeddings", &embedding_model, device);
 
     let offset = layout_config.layers_first_thread
         + layout_config.layers_per_thread * layout_config.n_threads;
