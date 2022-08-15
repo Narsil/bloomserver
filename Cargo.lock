@@ -1449,7 +1449,7 @@ dependencies = [
 [[package]]
 name = "nccl-rs"
 version = "0.1.0"
-source = "git+https://github.com/Narsil/nccl-rs#99c3852404a42bd99035425b3c6d7620a0ff2d35"
+source = "git+https://github.com/Narsil/nccl-rs#5f8ca057650c09298522f506c4de19f46e76c998"
 dependencies = [
  "nccl-sys",
  "tch",
@@ -1459,7 +1459,7 @@ dependencies = [
 [[package]]
 name = "nccl-sys"
 version = "0.1.0"
-source = "git+https://github.com/Narsil/nccl-rs#99c3852404a42bd99035425b3c6d7620a0ff2d35"
+source = "git+https://github.com/Narsil/nccl-rs#5f8ca057650c09298522f506c4de19f46e76c998"
 dependencies = [
  "bindgen",
 ]
