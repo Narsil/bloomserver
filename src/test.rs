@@ -4,7 +4,7 @@ use crate::model::build_alibi_tensor;
 use crate::model::tests::{bloom_350m, bloom_testing};
 use crate::model::BloomForCausalLM;
 use crate::model::Config;
-use tch::{IndexOp, Tensor};
+use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 #[derive(Debug)]

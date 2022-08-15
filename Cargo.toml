@@ -24,3 +24,11 @@ nccl-rs = { git = "https://github.com/Narsil/nccl-rs" }
 [dev-dependencies]
 once_cell = "1.13"
 serial_test = "0.9"
+
+[[bin]]
+name = "pp"
+path = "src/bin/pp.rs"
+
+[[bin]]
+name = "tp"
+path = "src/bin/tp.rs"

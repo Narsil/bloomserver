@@ -855,10 +855,7 @@ pub mod tests {
     use crate::empty_past;
     use crate::test::assert_all_close;
     use memmap::MmapOptions;
-    use nccl_rs::ThreadGroup;
-    use once_cell::sync::Lazy;
     use safetensors::SafeTensors;
-    use std::rc::Rc;
 
     pub(crate) fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();

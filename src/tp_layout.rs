@@ -1,14 +1,37 @@
-use crate::layout::{padding_with_ack, receive, send, RChan1};
-use crate::model::{BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm};
-use crate::utils::debug;
+use crate::generation::{next_ids, padding, Parameters};
+use crate::model::{
+    empty_past, prepare_attn_mask, BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm,
+    Past,
+};
+use crossbeam_channel::{Receiver, Sender};
 use log::info;
 use memmap::MmapOptions;
 use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
 use std::rc::Rc;
-use tch::{kind::Kind, Device};
+use tch::{Device, IndexOp, Tensor};
 
-pub fn thread(group: ThreadGroup, config: Config, channels: Option<(RChan1, RChan1)>) {
+type Ack = (Tensor, Parameters, Sender<Tensor>);
+pub type Msg = (Tensor, Parameters, Sender<Tensor>);
+pub type TpReceiver = Receiver<Msg>;
+pub type TpSender = Sender<Msg>;
+
+pub fn padding_with_ack(
+    config: &Config,
+    items: Vec<(Tensor, Parameters, Sender<Tensor>)>,
+) -> ((Tensor, Tensor, Tensor, Past), Vec<Ack>) {
+    let mut tensors = vec![];
+    let mut acks = vec![];
+    let batch_size = items.len() as i64;
+    for item in items {
+        let past = empty_past(&config, batch_size);
+        tensors.push((item.0.copy(), past));
+        acks.push((item.0, item.1, item.2));
+    }
+    (padding(config, tensors), acks)
+}
+
+pub fn thread(group: ThreadGroup, config: Config, channel: TpReceiver) {
     // TODO load the weights
     let thread_number = group.rank() as usize;
     info!("Starting thread {thread_number}");
@@ -24,6 +47,7 @@ pub fn thread(group: ThreadGroup, config: Config, channels: Option<(RChan1, RCha
     let model = SafeTensors::deserialize(&mmap).unwrap();
 
     let word_embeddings = Embedding::load("word_embeddings", &model, device);
+
     let word_embeddings_layernorm = LayerNorm::load(
         config.hidden_size,
         "word_embeddings_layernorm",
@@ -45,44 +69,64 @@ pub fn thread(group: ThreadGroup, config: Config, channels: Option<(RChan1, RCha
 
     let ln_f = LayerNorm::load(config.hidden_size, "ln_f", &model, device);
     let lm_head = InvertedEmbedding::load("word_embeddings", &model, device);
+    let elapsed = start.elapsed();
+    info!("Loaded thread {thread_number} in {elapsed:?}");
 
-    if let Some((rx, prio_rx)) = channels {
-        loop {
-            let ((input_ids, causal_mask, attention_mask, alibi, mut past_key_values), acks) =
-                receive(&rx, &prio_rx, &config);
+    let max_batch_size = 16;
+    loop {
+        let mut all_items = vec![channel.recv().unwrap()];
+        while let Ok(item) = channel.recv_timeout(std::time::Duration::from_millis(0)) {
+            all_items.push(item);
+            if all_items.len() > max_batch_size {
+                break;
+            }
+        }
+
+        let ((mut input_ids, mut attention_mask, mut alibi, mut past_key_values), mut acks) =
+            padding_with_ack(&config, all_items);
+
+        while !acks.is_empty() {
+            let input_size = input_ids.size();
+            let past_key_values_length = past_key_values[0].seq_length();
+            let causal_mask = prepare_attn_mask(
+                &attention_mask,
+                input_size,
+                past_key_values_length,
+                config.n_head,
+            );
             let inputs_embeds = word_embeddings.forward(&input_ids);
             let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
-
-            let seq_lengths = Vec::<i64>::from(
-                attention_mask
-                    .f_sum_dim_intlist(&[-1], false, Kind::Int)
-                    .unwrap(),
-            );
-
-            group.broadcast((hidden_states, past_key_values, causal_mask, alibi));
 
             for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
                 hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
             }
-            debug("last_hidden_states", &hidden_states);
             hidden_states = ln_f.forward(&hidden_states);
-            debug("After ln_f", &hidden_states);
             let lm_logits = lm_head.forward(&hidden_states);
 
-            send(
-                lm_logits,
-                &past_key_values,
-                &acks,
-                &seq_lengths,
-                causal_mask,
-                &config,
-            );
-        }
-    } else {
-        let (hidden_states, past_key_values, causal_mask, alibi) = group.broadcast_recv();
+            let mut keep_ids = vec![];
+            let mut keep_head_ids = vec![];
+            let num_heads = config.n_head;
+            for (i, (all_ids, parameters, rq)) in (0..lm_logits.size()[0]).zip(acks.iter_mut()) {
+                let new_ids =
+                    next_ids(&parameters, &lm_logits.i(i..i + 1)).to_device(input_ids.device());
+                *all_ids = Tensor::f_cat(&[all_ids.copy(), new_ids], 1).unwrap();
+                if all_ids.size()[1] >= parameters.max_new_tokens as i64 {
+                    if group.rank() == 0 {
+                        rq.send(all_ids.copy()).unwrap();
+                    }
+                } else {
+                    keep_ids.push(i);
+                    keep_head_ids.extend(i * num_heads..(i + 1) * num_heads);
+                }
+            }
 
-        for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
-            hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
+            input_ids = input_ids.i(keep_ids.as_slice());
+            attention_mask = attention_mask.i(keep_ids.as_slice());
+            alibi = alibi.i(keep_head_ids.as_slice());
+            past_key_values.iter_mut().for_each(|past| {
+                past.key = past.key.i(keep_head_ids.as_slice());
+                past.value = past.value.i(keep_head_ids.as_slice());
+            });
         }
     }
 }

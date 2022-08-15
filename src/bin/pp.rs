@@ -3,17 +3,15 @@ use actix_web::middleware::Logger;
 use actix_web::{http::header::ContentType, post, web, App, HttpResponse, HttpServer};
 use crossbeam_channel::{bounded, unbounded, Sender};
 use log::info;
-use nccl_rs::ThreadGroup;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
-use tch::{kind, Cuda, Device, IndexOp, Tensor};
+use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 use bloomserver::generation::next_ids;
 use bloomserver::layout::{thread1, thread2, thread3, LayoutConfig, Msg, Msg2, SChan1};
 use bloomserver::model::{Config, Past};
-use bloomserver::tp_layout::thread as tp_thread;
 use bloomserver::utils::SAVE;
 use bloomserver::{empty_past, Generation, GenerationError};
 
@@ -116,44 +114,6 @@ async fn generate(
         .json(json!([{ "generated_text": string }])))
 }
 
-fn init_threads_tp(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-    tch::maybe_init_cuda();
-    let start = std::time::Instant::now();
-    let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json").unwrap());
-    info!("Loaded tokenizer in {:?}", start.elapsed());
-    info!("Starting threads {:?}", std::time::Instant::now());
-
-    let (tx, rx) = bounded::<Msg>(1);
-    let (prio_tx, prio_rx) = unbounded::<Msg>();
-
-    let world_size = Cuda::device_count() as i32;
-
-    let config = match model_name {
-        "bigscience-small-testing" => Config::new_testing(),
-        "bloom-350m" => Config::new350m(),
-        "bloom" => Config::new(),
-        "bloom-dgx" => Config::new(),
-        other => panic!("Model {other} is not known"),
-    };
-
-    let id = ThreadGroup::new_id().unwrap();
-    let config_ = config.clone();
-    tokio::task::spawn_blocking(move || {
-        let group = ThreadGroup::new(world_size, 0, id).unwrap();
-        tp_thread(group, config_, Some((rx, prio_rx)));
-    });
-    for rank in 1..world_size {
-        let config_ = config.clone();
-        tokio::task::spawn_blocking(move || {
-            let group = ThreadGroup::new(world_size, rank, id).unwrap();
-            tp_thread(group, config_, None);
-        });
-    }
-
-    (tokenizer, tx, prio_tx, config)
-}
-
 fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     tch::maybe_init_cuda();
@@ -204,18 +164,15 @@ fn init_threads(model_name: &str) -> (Arc<Tokenizer>, SChan1, SChan1, Config) {
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let model_name = std::env::var("BLOOM").unwrap_or_else(|_| "bloom".to_string());
-    let (tokenizer, in_channel, prio_channel, config) = match std::env::var("TP") {
-        Ok(s) if s == *"1" => init_threads_tp(&model_name),
-        _ => init_threads(&model_name),
-    };
+    let (tokenizer, in_channel, prio_channel, config) = init_threads(&model_name);
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(AppState {
                 tokenizer: tokenizer.clone(),
+                config: config.clone(),
                 in_channel: in_channel.clone(),
                 prio_channel: prio_channel.clone(),
-                config: config.clone(),
             }))
             .service(generate)
     })
@@ -228,6 +185,7 @@ async fn main() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use actix_web::test;
+    use tch::Cuda;
 
     #[actix_web::test]
     async fn test_generation_testing() {

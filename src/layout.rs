@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Select, Sender};
 use log::info;
 use memmap::MmapOptions;
 use safetensors::SafeTensors;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 /// Size of batch and response channel
@@ -237,7 +237,6 @@ pub fn thread1(
         start.elapsed()
     );
 
-    let mut last_loop = Instant::now();
     loop {
         // let start = Instant::now();
         let ((input_ids, causal_mask, attention_mask, alibi, mut past_key_values), acks) =
@@ -265,7 +264,6 @@ pub fn thread1(
             acks,
         ))
         .unwrap();
-        last_loop = Instant::now();
     }
 }
 
@@ -428,7 +426,6 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         hidden_states = ln_f.forward(&hidden_states);
         debug("After ln_f", &hidden_states);
         let lm_logits = lm_head.forward(&hidden_states);
-
         send(
             lm_logits,
             &past_key_values,

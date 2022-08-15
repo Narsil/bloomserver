@@ -10,9 +10,7 @@ pub mod utils;
 
 pub use crate::model::{empty_past, non_empty_past};
 use actix_web::{http::StatusCode, ResponseError};
-use safetensors::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
-use tch::{kind, Device, Tensor};
 use thiserror::Error;
 
 use crate::generation::Parameters;
@@ -33,6 +31,8 @@ pub enum GenerationError {
     InputTooLong,
     #[error("{{\"error\": \"We can't generate more than 64 tokens at a time. We're disabling long generations temporarily\"}}")]
     TooManyNewTokens,
+    #[error("{{\"error\": \"Could not receive any answer an internal error occurred\"}}")]
+    CouldNotReceiveAnswer,
 }
 
 impl ResponseError for GenerationError {
@@ -41,6 +41,7 @@ impl ResponseError for GenerationError {
             GenerationError::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
             GenerationError::InputTooLong => StatusCode::BAD_REQUEST,
             GenerationError::TooManyNewTokens => StatusCode::BAD_REQUEST,
+            GenerationError::CouldNotReceiveAnswer => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

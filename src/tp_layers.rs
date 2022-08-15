@@ -2,7 +2,7 @@ use crate::model::loader::convert;
 use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
 use std::rc::Rc;
-use tch::{kind::Kind, Device, IndexOp, Tensor};
+use tch::{Device, Tensor};
 
 /// Different from usual TensorParallelColumnLinear in order to remove transpose operation:
 /// weight: [in_features, out_features]
