@@ -1,5 +1,6 @@
 use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
+use log::debug;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 #[derive(Debug)]
@@ -216,6 +217,8 @@ pub fn prepare_attn_mask(
     // )
     let combined_attention_mask = if src_length > 1 {
         let causal_mask = make_causal_mask(input_size, device, past_key_values_length);
+        debug!("causal {:?}", causal_mask);
+        debug!("expanded {:?}", expanded_attn_mask);
         expanded_attn_mask.f_logical_or(&causal_mask).unwrap()
     } else {
         expanded_attn_mask

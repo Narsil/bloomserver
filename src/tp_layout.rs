@@ -1,10 +1,10 @@
 use crate::generation::{next_ids, padding, Parameters};
 use crate::model::{
-    empty_past, prepare_attn_mask, BloomBlock, Config, Embedding, InvertedEmbedding, LayerNorm,
-    Past,
+    build_alibi_tensor, empty_past, prepare_attn_mask, BloomBlock, Config, Embedding,
+    InvertedEmbedding, LayerNorm, Past,
 };
 use crossbeam_channel::{Receiver, Sender};
-use log::info;
+use log::{debug, info};
 use memmap::MmapOptions;
 use nccl_rs::ThreadGroup;
 use safetensors::SafeTensors;
@@ -31,15 +31,53 @@ pub fn padding_with_ack(
     (padding(config, tensors), acks)
 }
 
-pub fn thread(group: ThreadGroup, config: Config, channel: TpReceiver) {
-    // TODO load the weights
+#[derive(Clone)]
+pub struct LayoutConfig {
+    pub embeddings_filename: String,
+    pub final_filename: String,
+    pub layer_template_filename: String,
+}
+
+impl LayoutConfig {
+    pub fn new() -> Self {
+        Self {
+            embeddings_filename: "./weights/bloom-embedding.bin".to_string(),
+            final_filename: "./weights/bloom-final.bin".to_string(),
+            layer_template_filename: "./weights/bloom-h.{}.bin".to_string(),
+        }
+    }
+
+    pub fn new_testing() -> Self {
+        Self {
+            embeddings_filename: "./weights/bloom-testing.bin".to_string(),
+            final_filename: "./weights/bloom-testing.bin".to_string(),
+            layer_template_filename: "./weights/bloom-testing.bin".to_string(),
+        }
+    }
+
+    pub fn new350m() -> Self {
+        Self {
+            embeddings_filename: "./weights/bloom-350m.bin".to_string(),
+            final_filename: "./weights/bloom-350m.bin".to_string(),
+            layer_template_filename: "./weights/bloom-350m.bin".to_string(),
+        }
+    }
+}
+
+pub fn thread(
+    group: ThreadGroup,
+    config: Config,
+    layout_config: LayoutConfig,
+    channel: TpReceiver,
+) {
     let thread_number = group.rank() as usize;
     info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
     let group = Rc::new(group);
 
-    let filename = "weights/bloom-testing.bin";
+    // TODO support large model
+    let filename = layout_config.embeddings_filename;
 
     let file = std::fs::File::open(filename).unwrap();
     // SAFETY: This is actually unsafe.
@@ -74,6 +112,7 @@ pub fn thread(group: ThreadGroup, config: Config, channel: TpReceiver) {
 
     let max_batch_size = 16;
     loop {
+        debug!("Waiting on channel");
         let mut all_items = vec![channel.recv().unwrap()];
         while let Ok(item) = channel.recv_timeout(std::time::Duration::from_millis(0)) {
             all_items.push(item);
@@ -82,10 +121,13 @@ pub fn thread(group: ThreadGroup, config: Config, channel: TpReceiver) {
             }
         }
 
-        let ((mut input_ids, mut attention_mask, mut alibi, mut past_key_values), mut acks) =
+        let ((mut input_ids, mut attention_mask, _alibi, mut past_key_values), mut acks) =
             padding_with_ack(&config, all_items);
 
+        let initial_length = input_ids.size()[1];
+
         while !acks.is_empty() {
+            let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
             let input_size = input_ids.size();
             let past_key_values_length = past_key_values[0].seq_length();
             let causal_mask = prepare_attn_mask(
@@ -106,27 +148,37 @@ pub fn thread(group: ThreadGroup, config: Config, channel: TpReceiver) {
             let mut keep_ids = vec![];
             let mut keep_head_ids = vec![];
             let num_heads = config.n_head;
-            for (i, (all_ids, parameters, rq)) in (0..lm_logits.size()[0]).zip(acks.iter_mut()) {
+
+            let mut all_new_ids = vec![];
+            let mut new_acks = vec![];
+            for (i, (mut all_ids, parameters, rq)) in (0..lm_logits.size()[0]).zip(acks.into_iter())
+            {
                 let new_ids =
                     next_ids(&parameters, &lm_logits.i(i..i + 1)).to_device(input_ids.device());
-                *all_ids = Tensor::f_cat(&[all_ids.copy(), new_ids], 1).unwrap();
-                if all_ids.size()[1] >= parameters.max_new_tokens as i64 {
+                all_ids = Tensor::f_cat(&[all_ids, new_ids.copy()], 1).unwrap();
+                if all_ids.size()[1] - initial_length >= parameters.max_new_tokens as i64 {
                     if group.rank() == 0 {
                         rq.send(all_ids.copy()).unwrap();
                     }
                 } else {
+                    new_acks.push((all_ids, parameters, rq));
+                    all_new_ids.push(new_ids);
                     keep_ids.push(i);
                     keep_head_ids.extend(i * num_heads..(i + 1) * num_heads);
                 }
             }
+            acks = new_acks;
+            if acks.is_empty() {
+                break;
+            }
 
-            input_ids = input_ids.i(keep_ids.as_slice());
-            attention_mask = attention_mask.i(keep_ids.as_slice());
-            alibi = alibi.i(keep_head_ids.as_slice());
+            input_ids = Tensor::f_cat(&all_new_ids, 1).unwrap();
             past_key_values.iter_mut().for_each(|past| {
                 past.key = past.key.i(keep_head_ids.as_slice());
                 past.value = past.value.i(keep_head_ids.as_slice());
             });
+            let ones = Tensor::ones(&[input_ids.size()[0], 1], (config.kind, device));
+            attention_mask = Tensor::f_cat(&[attention_mask, ones], 1).unwrap();
         }
     }
 }

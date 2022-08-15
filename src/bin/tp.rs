@@ -12,7 +12,7 @@ use tokenizers::Tokenizer;
 
 use bloomserver::generation::Parameters;
 use bloomserver::model::Config;
-use bloomserver::tp_layout::thread;
+use bloomserver::tp_layout::{thread, LayoutConfig};
 use bloomserver::{Generation, GenerationError};
 
 #[derive(Clone)]
@@ -110,21 +110,21 @@ fn init_threads(
 
     let world_size = Cuda::device_count() as i32;
 
-    let config = match model_name {
-        "bigscience-small-testing" => Config::new_testing(),
-        "bloom-350m" => Config::new350m(),
-        "bloom" => Config::new(),
-        "bloom-dgx" => Config::new(),
+    let (config, layout_config) = match model_name {
+        "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
+        "bloom-350m" => (Config::new350m(), LayoutConfig::new350m()),
+        "bloom" => (Config::new(), LayoutConfig::new()),
         other => panic!("Model {other} is not known"),
     };
 
     let id = ThreadGroup::new_id().unwrap();
     for rank in 0..world_size {
-        let config_ = config.clone();
+        let config = config.clone();
+        let layout_config = layout_config.clone();
         let rx = rx.clone();
         tokio::task::spawn_blocking(move || {
             let group = ThreadGroup::new(world_size, rank, id).unwrap();
-            thread(group, config_, rx);
+            thread(group, config, layout_config, rx);
         });
     }
 
@@ -175,5 +175,47 @@ mod tests {
         let body = resp.into_body();
         let bytes = actix_web::body::to_bytes(body).await;
         assert_eq!(bytes.unwrap(), web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog\"}]"));
+    }
+
+    #[actix_web::test]
+    async fn test_tp_generation_350m() {
+        let (tokenizer, channel) = init_threads("bloom-350m");
+        info!("Started");
+        let app = test::init_service(
+            App::new()
+                .wrap(Logger::default())
+                .app_data(web::Data::new(AppState { tokenizer, channel }))
+                .service(generate),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "I enjoy walking my cute dog", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"I enjoy walking my cute dog, but I also love to play with my cat. I am a very active person and I love\"}]")
+        );
+
+        let req = test::TestRequest::post()
+            .uri("/generate")
+            .insert_header(ContentType::json())
+            .set_json(serde_json::json!({"inputs": "A \"whatpu\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \"farduddle\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is:", "parameters": {"max_new_tokens": 20}}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = resp.into_body();
+        let bytes = actix_web::body::to_bytes(body).await;
+        assert_eq!(
+            bytes.unwrap(),
+            web::Bytes::from_static(b"[{\"generated_text\":\"A \\\"whatpu\\\" is a small, furry animal native to Tanzania. An example of a sentence that uses the word whatpu is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"farduddle\\\" means to jump up and down really fast. An example of a sentence that uses the word farduddle is: We were traveling in Africa and we saw these very cute whatpus. To do a \\\"fardudd\"}]")
+        );
     }
 }
