@@ -4,7 +4,7 @@ use crate::model::{
 };
 use crate::utils::debug;
 use crossbeam_channel::{Receiver, Select, Sender};
-use log::info;
+use log::{info, debug};
 use memmap::MmapOptions;
 use safetensors::SafeTensors;
 use std::time::Duration;
@@ -103,19 +103,20 @@ pub fn receive(
     prio_rx: &RChan1,
     config: &Config,
 ) -> ((Tensor, Tensor, Tensor, Tensor, Past), Vec<Ack>) {
+    debug!("Receiving on thread1");
     let mut sel = Select::new();
     let oper1 = sel.recv(rx);
     let oper2 = sel.recv(prio_rx);
     let oper = sel.select();
-    let (mut all_items, no_past) = match oper.index() {
-        i if i == oper1 => (vec![oper.recv(rx).unwrap()], true),
-        i if i == oper2 => (vec![oper.recv(prio_rx).unwrap()], false),
+    let (mut all_items, past) = match oper.index() {
+        i if i == oper1 => (vec![oper.recv(rx).unwrap()], false),
+        i if i == oper2 => (vec![oper.recv(prio_rx).unwrap()], true),
         _ => unreachable!(),
     };
 
-    if no_past {
+    if past {
         let max_batch_size = 4;
-        while let Ok(item) = prio_rx.recv() {
+        while let Ok(item) = prio_rx.recv_timeout(Duration::from_millis(10)) {
             all_items.push(item);
             if all_items.len() >= max_batch_size {
                 break;
