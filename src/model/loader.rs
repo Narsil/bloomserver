@@ -2,7 +2,8 @@ use crate::model::model::{
     BloomAttention, BloomBlock, BloomForCausalLM, BloomMlp, BloomModel, Config, Embedding,
     FakeTpLinear, InvertedEmbedding, LayerNorm, Linear, ParallelLinear,
 };
-use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
+use crate::model::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
+use log::debug;
 use nccl_rs::ThreadGroup;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use std::rc::Rc;
@@ -103,9 +104,9 @@ impl BloomAttention {
         group: Rc<ThreadGroup>,
     ) -> Self {
         let query_key_value = ParallelLinear::TensorParallelColumnLinear(
-            TensorParallelColumnLinear::new(&format!("{name}.query_key_value"), model, device),
+            TensorParallelColumnLinear::load(&format!("{name}.query_key_value"), model, device),
         );
-        let dense = ParallelLinear::TensorParallelRowLinear(TensorParallelRowLinear::new(
+        let dense = ParallelLinear::TensorParallelRowLinear(TensorParallelRowLinear::load(
             &format!("{name}.dense"),
             model,
             device,
@@ -306,5 +307,59 @@ impl BloomForCausalLM {
         let transformer = BloomModel::load(config, model, device);
         let lm_head = InvertedEmbedding::load("word_embeddings", model, device);
         Self::new(transformer, lm_head)
+    }
+}
+
+impl TensorParallelColumnLinear {
+    pub fn load(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
+        let tname = format!("{name}.weight");
+        let weight = convert(
+            model
+                .tensor(&tname)
+                .unwrap_or_else(|_| panic!("Could not find {tname}")),
+            device,
+        )
+        .f_transpose_copy(1, 0)
+        .unwrap();
+
+        let bias_name = format!("{name}.bias");
+        let bias = convert(
+            model
+                .tensor(&bias_name)
+                .unwrap_or_else(|_| panic!("Could not find {bias_name}")),
+            device,
+        );
+
+        Self::new(weight, bias)
+    }
+}
+
+impl TensorParallelRowLinear {
+    pub fn load(
+        name: &str,
+        model: &SafeTensors<'_>,
+        device: Device,
+        group: Rc<ThreadGroup>,
+    ) -> Self {
+        let tname = format!("{name}.weight");
+        let weight = convert(
+            model
+                .tensor(&tname)
+                .unwrap_or_else(|_| panic!("Could not find {tname}")),
+            device,
+        )
+        .f_transpose_copy(1, 0)
+        .unwrap();
+        debug!("Row linear {:?}", weight);
+
+        let bias_name = format!("{name}.bias");
+        let bias = convert(
+            model
+                .tensor(&bias_name)
+                .unwrap_or_else(|_| panic!("Could not find {bias_name}")),
+            device,
+        );
+
+        Self::new(weight, bias, group)
     }
 }

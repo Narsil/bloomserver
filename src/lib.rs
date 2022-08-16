@@ -4,7 +4,6 @@ pub mod layout;
 pub mod model;
 #[cfg(test)]
 mod test;
-pub mod tp_layers;
 pub mod tp_layout;
 pub mod utils;
 

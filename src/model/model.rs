@@ -1,4 +1,4 @@
-use crate::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
+use crate::model::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
 use log::debug;
 use tch::{kind::Kind, Device, IndexOp, Tensor};

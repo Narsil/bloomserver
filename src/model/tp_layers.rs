@@ -1,8 +1,6 @@
-use crate::model::loader::convert;
 use nccl_rs::ThreadGroup;
-use safetensors::SafeTensors;
 use std::rc::Rc;
-use tch::{Device, Tensor};
+use tch::Tensor;
 
 /// Different from usual TensorParallelColumnLinear in order to remove transpose operation:
 /// weight: [in_features, out_features]
@@ -13,25 +11,7 @@ pub struct TensorParallelColumnLinear {
 }
 
 impl TensorParallelColumnLinear {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let tname = format!("{name}.weight");
-        let weight = convert(
-            model
-                .tensor(&tname)
-                .unwrap_or_else(|_| panic!("Could not find {tname}")),
-            device,
-        )
-        .f_transpose_copy(1, 0)
-        .unwrap();
-
-        let bias_name = format!("{name}.bias");
-        let bias = convert(
-            model
-                .tensor(&bias_name)
-                .unwrap_or_else(|_| panic!("Could not find {bias_name}")),
-            device,
-        );
-
+    pub fn new(weight: Tensor, bias: Tensor) -> Self {
         Self { weight, bias }
     }
 
@@ -63,37 +43,13 @@ pub struct TensorParallelRowLinear {
 }
 
 impl TensorParallelRowLinear {
-    pub fn new(
-        name: &str,
-        model: &SafeTensors<'_>,
-        device: Device,
-        group: Rc<ThreadGroup>,
-    ) -> Self {
-        let tname = format!("{name}.weight");
-        let weight = convert(
-            model
-                .tensor(&tname)
-                .unwrap_or_else(|_| panic!("Could not find {tname}")),
-            device,
-        )
-        .f_transpose_copy(1, 0)
-        .unwrap();
-
-        let bias_name = format!("{name}.bias");
-        let bias = convert(
-            model
-                .tensor(&bias_name)
-                .unwrap_or_else(|_| panic!("Could not find {bias_name}")),
-            device,
-        );
-
+    pub fn new(weight: Tensor, bias: Tensor, group: Rc<ThreadGroup>) -> Self {
         Self {
             weight,
             bias,
             group,
         }
     }
-
     pub fn forward(&self, xs: &Tensor) -> Tensor {
         let in_features = self.weight.size()[0];
         let out_features = self.weight.size()[1];

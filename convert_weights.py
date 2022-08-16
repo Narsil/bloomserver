@@ -1,4 +1,4 @@
-from safetensors.torch import save_file, load_file, load
+from safetensors.torch import save_file
 # from huggingface_hub import hf_hub_download
 from transformers.utils import hf_bucket_url, cached_path
 import torch
