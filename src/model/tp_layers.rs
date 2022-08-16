@@ -1,6 +1,7 @@
 use nccl_rs::ThreadGroup;
 use std::rc::Rc;
 use tch::Tensor;
+use log::debug;
 
 /// Different from usual TensorParallelColumnLinear in order to remove transpose operation:
 /// weight: [in_features, out_features]
@@ -66,6 +67,9 @@ impl TensorParallelRowLinear {
             .unwrap()
             .f_view(out_size.as_slice())
             .unwrap();
-        self.group.all_reduce(out).unwrap()
+        debug!("Before all reduce {:?}", out);
+        let out = self.group.all_reduce(out).unwrap();
+        debug!("After all reduce {:?}", out);
+        out
     }
 }

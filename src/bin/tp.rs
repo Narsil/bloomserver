@@ -7,7 +7,7 @@ use nccl_rs::ThreadGroup;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
-use tch::{kind, Cuda, Device, IndexOp, Tensor};
+use tch::{kind, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 use bloomserver::generation::Parameters;
@@ -108,7 +108,6 @@ fn init_threads(
 
     let (tx, rx) = bounded::<(Tensor, Parameters, Sender<Tensor>)>(1);
 
-    let world_size = Cuda::device_count() as i32;
 
     let (config, layout_config) = match model_name {
         "bigscience-small-testing" => (Config::new_testing(), LayoutConfig::new_testing()),
@@ -117,14 +116,14 @@ fn init_threads(
         other => panic!("Model {other} is not known"),
     };
 
+    let world_size = layout_config.world_size as i32;
     let id = ThreadGroup::new_id().unwrap();
     for rank in 0..world_size {
         let config = config.clone();
-        let layout_config = layout_config.clone();
         let rx = rx.clone();
         tokio::task::spawn_blocking(move || {
             let group = ThreadGroup::new(world_size, rank, id).unwrap();
-            thread(group, config, layout_config, rx);
+            thread(group, config, rx);
         });
     }
 

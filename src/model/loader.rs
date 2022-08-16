@@ -3,7 +3,6 @@ use crate::model::model::{
     FakeTpLinear, InvertedEmbedding, LayerNorm, Linear, ParallelLinear,
 };
 use crate::model::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
-use log::debug;
 use nccl_rs::ThreadGroup;
 use safetensors::{Dtype, SafeTensors, TensorView};
 use std::rc::Rc;
@@ -17,13 +16,14 @@ pub fn convert(view: TensorView, device: Device) -> Tensor {
             todo!("Need to implement that");
         }
     };
-    let t = Tensor::of_data_size(
-        view.get_data(),
-        &view
+    let shape = view
             .get_shape()
             .iter()
             .map(|i| *i as i64)
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>();
+    let t = Tensor::of_data_size(
+        view.get_data(),
+        &shape,
         kind,
     )
     .to_device(device);
@@ -103,6 +103,7 @@ impl BloomAttention {
         device: Device,
         group: Rc<ThreadGroup>,
     ) -> Self {
+        let num_attention_heads = config.n_head as i64 / group.ranks() as i64;
         let query_key_value = ParallelLinear::TensorParallelColumnLinear(
             TensorParallelColumnLinear::load(&format!("{name}.query_key_value"), model, device),
         );
@@ -113,7 +114,6 @@ impl BloomAttention {
             group,
         ));
         let head_dim = (config.hidden_size / config.n_head) as i64;
-        let num_attention_heads = config.n_head as i64;
         let layer_number = layer_number;
         let norm_factor = 1.0 / (head_dim as f64).sqrt();
         Self {
@@ -290,7 +290,9 @@ impl BloomModel {
 
 impl Embedding {
     pub fn load(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+        let weight_name = format!("{name}.weight");
+        let tensor = model.tensor(&weight_name).unwrap();
+        let weight = convert(tensor, device);
         Self::new(weight)
     }
 }
@@ -350,7 +352,6 @@ impl TensorParallelRowLinear {
         )
         .f_transpose_copy(1, 0)
         .unwrap();
-        debug!("Row linear {:?}", weight);
 
         let bias_name = format!("{name}.bias");
         let bias = convert(

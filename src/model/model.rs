@@ -27,7 +27,8 @@ pub fn non_empty_past(
     value: f64,
 ) -> Past {
     let device = Device::Cuda(0);
-    let p = config.n_head;
+    // TODO divide by tp_world_size
+    let p = config.n_head/ 2;
     let q = config.hidden_size / config.n_head;
     let past_key_template =
         Tensor::zeros(&[batch_size * p, q, length_past], (config.kind, device)) + key;
@@ -473,6 +474,8 @@ impl BloomAttention {
 
         // TODO @thomasw21: Figure out why we need to cast to device here.
         let device = query_layer.device();
+        debug!("Previous past {:?}", layer_past.key);
+        debug!("new key {:?}", key_layer);
         let key_layer = Tensor::f_cat(&[&layer_past.key.to_device(device), &key_layer], 2).unwrap();
         let value_layer =
             Tensor::f_cat(&[&layer_past.value.to_device(device), &value_layer], 1).unwrap();
@@ -493,6 +496,10 @@ impl BloomAttention {
             &value_layer,
             &format!("rust_baddbmm_value_layer_{}.npy", self.layer_number,),
         );
+
+        debug!("alibi {alibi:?}");
+        debug!("query {query_layer:?}");
+        debug!("key {key_layer:?}");
 
         let mut attention_scores = alibi
             .f_baddbmm_s(&query_layer, &key_layer, 1.0, self.norm_factor)
@@ -515,7 +522,7 @@ impl BloomAttention {
             &format!("rust_softmax_attention_scores_{}.npy", self.layer_number,),
         );
         let attn_weights =
-            attention_scores.masked_fill_(attention_mask, finfo_min(attention_scores.kind()));
+            attention_scores.f_masked_fill_(attention_mask, finfo_min(attention_scores.kind())).unwrap();
         save_layer_to_disk(
             &attn_weights,
             &format!("rust_softmax_attn_weights_{}.npy", self.layer_number,),
@@ -551,6 +558,7 @@ impl BloomAttention {
                 self.num_attention_heads * self.head_dim,
             ))
             .unwrap();
+        debug!("Before dense");
         let mut output = self.dense.forward(&context);
         save_layer_to_disk(
             &output,

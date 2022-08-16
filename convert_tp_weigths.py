@@ -12,7 +12,7 @@ def match_suffix(text, suffix):
 
 def shard_model(model_name: str, path: Path, tp_world_size: int, dtype: torch.dtype):
     """BLOOM specific sharding mechanism"""
-    save_paths = [path / f"{model_name}_tp-rank-{tp_rank}-of-{tp_world_size}.pty" for tp_rank in range(tp_world_size)]
+    save_paths = [path / f"{model_name}_tp-rank-{tp_rank}-of-{tp_world_size}.bin" for tp_rank in range(tp_world_size)]
     if all(save_path.exists() for save_path in save_paths):
         print("Loading already cached values")
         return save_paths

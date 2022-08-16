@@ -33,33 +33,25 @@ pub fn padding_with_ack(
 
 #[derive(Clone)]
 pub struct LayoutConfig {
-    pub embeddings_filename: String,
-    pub final_filename: String,
-    pub layer_template_filename: String,
+    pub world_size: usize,
 }
 
 impl LayoutConfig {
     pub fn new() -> Self {
         Self {
-            embeddings_filename: "./weights/bloom-embedding.bin".to_string(),
-            final_filename: "./weights/bloom-final.bin".to_string(),
-            layer_template_filename: "./weights/bloom-h.{}.bin".to_string(),
+            world_size: 16
         }
     }
 
     pub fn new_testing() -> Self {
         Self {
-            embeddings_filename: "./weights/bloom-testing.bin".to_string(),
-            final_filename: "./weights/bloom-testing.bin".to_string(),
-            layer_template_filename: "./weights/bloom-testing.bin".to_string(),
+            world_size: 2
         }
     }
 
     pub fn new350m() -> Self {
         Self {
-            embeddings_filename: "./weights/bloom-350m.bin".to_string(),
-            final_filename: "./weights/bloom-350m.bin".to_string(),
-            layer_template_filename: "./weights/bloom-350m.bin".to_string(),
+            world_size: 4
         }
     }
 }
@@ -67,28 +59,30 @@ impl LayoutConfig {
 pub fn thread(
     group: ThreadGroup,
     config: Config,
-    layout_config: LayoutConfig,
     channel: TpReceiver,
 ) {
     let thread_number = group.rank() as usize;
+    let world_size= group.ranks() as i32;
     info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
     let group = Rc::new(group);
 
     // TODO support large model
-    let filename = layout_config.embeddings_filename;
+    let filename = format!("./weights/bigscience/bigscience-small-testing_tp-rank-{thread_number}-of-{world_size}.bin");
+
 
     let file = std::fs::File::open(filename).unwrap();
     // SAFETY: This is actually unsafe.
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let word_embeddings = Embedding::load("word_embeddings", &model, device);
+    let word_embeddings = Embedding::load("transformer.word_embeddings", &model, device);
+
 
     let word_embeddings_layernorm = LayerNorm::load(
         config.hidden_size,
-        "word_embeddings_layernorm",
+        "transformer.word_embeddings_layernorm",
         &model,
         device,
     );
@@ -96,7 +90,7 @@ pub fn thread(
         .map(|i| {
             BloomBlock::load_tp(
                 &config,
-                &format!("h.{i}"),
+                &format!("transformer.h.{i}"),
                 &model,
                 i,
                 device,
@@ -105,8 +99,8 @@ pub fn thread(
         })
         .collect();
 
-    let ln_f = LayerNorm::load(config.hidden_size, "ln_f", &model, device);
-    let lm_head = InvertedEmbedding::load("word_embeddings", &model, device);
+    let ln_f = LayerNorm::load(config.hidden_size, "transformer.ln_f", &model, device);
+    let lm_head = InvertedEmbedding::load("transformer.word_embeddings", &model, device);
     let elapsed = start.elapsed();
     info!("Loaded thread {thread_number} in {elapsed:?}");
 
@@ -123,18 +117,26 @@ pub fn thread(
 
         let ((mut input_ids, mut attention_mask, _alibi, mut past_key_values), mut acks) =
             padding_with_ack(&config, all_items);
+        input_ids = input_ids.to_device(device);
+        attention_mask = attention_mask.to_device(device);
+        past_key_values.iter_mut().for_each(|past|{
+            past.key = past.key.to_device(device);
+            past.value = past.value.to_device(device);
+        });
 
         let initial_length = input_ids.size()[1];
 
         while !acks.is_empty() {
-            let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
+            // TODO correct handling of rank
+            let alibi = build_alibi_tensor(&attention_mask, config.n_head / 2, config.kind, device);
             let input_size = input_ids.size();
             let past_key_values_length = past_key_values[0].seq_length();
+            // TODO correct handling of rank
             let causal_mask = prepare_attn_mask(
                 &attention_mask,
                 input_size,
                 past_key_values_length,
-                config.n_head,
+                config.n_head / 2,
             );
             let inputs_embeds = word_embeddings.forward(&input_ids);
             let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
