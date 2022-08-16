@@ -95,7 +95,7 @@ pub fn padding_with_ack(
         tensors.push((item.0, item.1));
         acks.push(item.2);
     }
-    (padding(config, tensors), acks)
+    (padding(config, tensors, 1), acks)
 }
 
 pub fn receive(

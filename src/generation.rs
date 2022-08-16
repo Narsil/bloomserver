@@ -213,7 +213,7 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
     }
 }
 
-pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
+pub fn padding(config: &Config, items: Vec<(Tensor, Past)>, world_size: usize) -> (Tensor, Tensor, Tensor, Past) {
     let (max_length_input_ids, max_length_past) = items
         .iter()
         .map(|(ids, past)| (ids.size()[1], past[0].seq_length()))
@@ -234,7 +234,7 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let all_input_ids =
         Tensor::zeros(&[batch_size, max_length_input_ids], kind2) + config.padding_idx;
 
-    let mut all_past_key_values = non_empty_past(config, batch_size, max_length_past, 0.0, 0.0);
+    let mut all_past_key_values = non_empty_past(config, batch_size, max_length_past, 0.0, 0.0, world_size);
 
     let attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
 
@@ -404,12 +404,12 @@ mod tests {
             .view((1, 6))
             .to_kind(kind::Kind::Int64)
             .to_device(device);
-        let past = empty_past(&config, 1);
-        let past2 = empty_past(&config, 1);
+        let past = empty_past(&config, 1, 1);
+        let past2 = empty_past(&config, 1, 1);
 
         let items = vec![(input_ids, past), (input_ids2, past2)];
 
-        let (all_input_ids, _, _, _) = padding(&config, items);
+        let (all_input_ids, _, _, _) = padding(&config, items, 1);
 
         assert_eq!(all_input_ids.size(), vec![2, 6]);
         assert_eq!(
@@ -432,12 +432,12 @@ mod tests {
             .to_device(device);
 
         // Batch_size=1, seq_length=4
-        let past = non_empty_past(&config, 1, 4, 3.0, 4.0);
-        let past2 = non_empty_past(&config, 1, 6, 5.0, 6.0);
+        let past = non_empty_past(&config, 1, 4, 3.0, 4.0, 1);
+        let past2 = non_empty_past(&config, 1, 6, 5.0, 6.0, 1);
 
         let items = vec![(input_ids, past), (input_ids2, past2)];
 
-        let (all_input_ids, attention_mask, alibi, past_key_values) = padding(&config, items);
+        let (all_input_ids, attention_mask, alibi, past_key_values) = padding(&config, items,1);
 
         assert_eq!(all_input_ids.size(), vec![2, 1]);
         assert_eq!(attention_mask.size(), vec![2, 7]);

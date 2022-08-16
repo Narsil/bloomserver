@@ -1,6 +1,8 @@
 from pathlib import Path
 
 import torch
+import os
+import tqdm
 from torch import nn
 from transformers import AutoModelForCausalLM
 from safetensors.torch import save_file
@@ -80,11 +82,20 @@ def shard_model(model_name: str, path: Path, tp_world_size: int, dtype: torch.dt
 
     return save_paths
 
-if __name__ == "__main__":
-    model_name = "bigscience/bigscience-small-testing"
+def main():
     save_path = Path("weights/")
-    tp_world_size = 2
+    model_name = "bigscience/bloom"
+    tp_world_size = 16
     dtype = torch.bfloat16
-
     shard_model(model_name, save_path, tp_world_size=tp_world_size, dtype=dtype)
+
+def main2():
+    for i in tqdm.tqdm(range(16)):
+        local = f"bloom_tp-rank-{i}-of-16.pty"
+        filename = f"/home/thomas_wang_huggingface_co/models/bigscience/{local}"
+        data = torch.load(filename, map_location="cpu")
+        save_file(data.copy(), os.path.join("weights", "bigscience", local))
+
+if __name__ == "__main__":
+    main2()
 

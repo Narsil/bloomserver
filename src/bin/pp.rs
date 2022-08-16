@@ -61,7 +61,7 @@ async fn generate(
         let mut all_ids = input_ids.copy();
         let max_new_tokens = payload.parameters.max_new_tokens;
 
-        let mut past_key_values = empty_past(&state.config, 1);
+        let mut past_key_values = empty_past(&state.config, 1, 1);
         for i in 0..max_new_tokens {
             // let start_loop = Instant::now();
             if SAVE {

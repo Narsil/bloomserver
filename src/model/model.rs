@@ -15,8 +15,8 @@ impl PastLayer {
     }
 }
 
-pub fn empty_past(config: &Config, batch_size: i64) -> Past {
-    non_empty_past(config, batch_size, 0, 0.0, 0.0)
+pub fn empty_past(config: &Config, batch_size: i64, world_size: usize) -> Past {
+    non_empty_past(config, batch_size, 0, 0.0, 0., world_size)
 }
 
 pub fn non_empty_past(
@@ -25,10 +25,10 @@ pub fn non_empty_past(
     length_past: i64,
     key: f64,
     value: f64,
+    world_size: usize,
 ) -> Past {
     let device = Device::Cuda(0);
-    // TODO divide by tp_world_size
-    let p = config.n_head/ 2;
+    let p = config.n_head / world_size as i64;
     let q = config.hidden_size / config.n_head;
     let past_key_template =
         Tensor::zeros(&[batch_size * p, q, length_past], (config.kind, device)) + key;
@@ -68,7 +68,8 @@ impl Config {
         Self {
             n_head: 112,
             hidden_size: 14336,
-            n_layer: 70,
+            // TODO
+            n_layer: 30,
             kind: Kind::BFloat16,
             slow_but_exact: false,
             pretraining_tp: 4,
@@ -218,8 +219,8 @@ pub fn prepare_attn_mask(
     // )
     let combined_attention_mask = if src_length > 1 {
         let causal_mask = make_causal_mask(input_size, device, past_key_values_length);
-        debug!("causal {:?}", causal_mask);
-        debug!("expanded {:?}", expanded_attn_mask);
+        // debug!("causal {:?}", causal_mask);
+        // debug!("expanded {:?}", expanded_attn_mask);
         expanded_attn_mask.f_logical_or(&causal_mask).unwrap()
     } else {
         expanded_attn_mask
@@ -441,7 +442,7 @@ impl BloomAttention {
         } else {
             unreachable!()
         };
-        debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
+        // debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
             batch_size,
             q_length,
@@ -474,8 +475,8 @@ impl BloomAttention {
 
         // TODO @thomasw21: Figure out why we need to cast to device here.
         let device = query_layer.device();
-        debug!("Previous past {:?}", layer_past.key);
-        debug!("new key {:?}", key_layer);
+        // debug!("Previous past {:?}", layer_past.key);
+        // debug!("new key {:?}", key_layer);
         let key_layer = Tensor::f_cat(&[&layer_past.key.to_device(device), &key_layer], 2).unwrap();
         let value_layer =
             Tensor::f_cat(&[&layer_past.value.to_device(device), &value_layer], 1).unwrap();
@@ -497,9 +498,9 @@ impl BloomAttention {
             &format!("rust_baddbmm_value_layer_{}.npy", self.layer_number,),
         );
 
-        debug!("alibi {alibi:?}");
-        debug!("query {query_layer:?}");
-        debug!("key {key_layer:?}");
+        // debug!("alibi {alibi:?}");
+        // debug!("query {query_layer:?}");
+        // debug!("key {key_layer:?}");
 
         let mut attention_scores = alibi
             .f_baddbmm_s(&query_layer, &key_layer, 1.0, self.norm_factor)
@@ -558,7 +559,7 @@ impl BloomAttention {
                 self.num_attention_heads * self.head_dim,
             ))
             .unwrap();
-        debug!("Before dense");
+        // debug!("Before dense");
         let mut output = self.dense.forward(&context);
         save_layer_to_disk(
             &output,
@@ -1015,7 +1016,7 @@ pub mod tests {
         let model = bloom_350m();
         let config = Config::new350m();
         let device = Device::Cuda(0);
-        let mut past_key_values = empty_past(&config, 2);
+        let mut past_key_values = empty_past(&config, 2, 1);
         let input_ids = Tensor::of_slice(&[2, 2, 34, 54, 132, 225, 532, 342])
             .view((2, 4))
             .to_device(Device::Cuda(0));

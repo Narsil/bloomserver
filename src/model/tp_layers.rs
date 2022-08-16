@@ -67,9 +67,9 @@ impl TensorParallelRowLinear {
             .unwrap()
             .f_view(out_size.as_slice())
             .unwrap();
-        debug!("Before all reduce {:?}", out);
+        debug!("Before all reduce {:?} - {:?}", out, self.group.rank());
         let out = self.group.all_reduce(out).unwrap();
-        debug!("After all reduce {:?}", out);
+        debug!("After all reduce {:?} - {:?}", out, self.group.rank());
         out
     }
 }

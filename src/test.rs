@@ -36,7 +36,7 @@ fn test_generate(
             .to_kind(kind::Kind::Int64)
             .to_device(Device::Cuda(0))
             .view((1, -1));
-        let past = empty_past(&config, 1);
+        let past = empty_past(&config, 1, 1);
 
         // Not necessary, but want to reuse the real code
         let item = (input_ids, past);
@@ -44,7 +44,7 @@ fn test_generate(
     }
 
     let (mut input_ids, mut attention_mask, mut alibi, mut past_key_values) =
-        padding(&config, all_items);
+        padding(&config, all_items, 1);
 
     let mut all_ids = input_ids.copy();
 
@@ -137,9 +137,9 @@ fn test_logits_testing() {
         .view((1, -1))
         .to_kind(kind::Kind::Int64)
         .to_device(device);
-    let past = empty_past(&config, 1);
+    let past = empty_past(&config, 1, 1);
     let (input_ids, attention_mask, alibi, mut past_key_values) =
-        padding(&config, vec![(tensor_ids, past)]);
+        padding(&config, vec![(tensor_ids, past)], 1);
 
     let logits = model.forward(&input_ids, &attention_mask, &alibi, &mut past_key_values);
     let splits = logits.split(125440, -1);
@@ -177,9 +177,9 @@ fn test_embeddings_testing() {
         .view((1, -1))
         .to_kind(kind::Kind::Int64)
         .to_device(device);
-    let past = empty_past(&config, 1);
+    let past = empty_past(&config, 1, 1);
     let (input_ids, _attention_mask, _alibi, _past_key_values) =
-        padding(&config, vec![(tensor_ids, past)]);
+        padding(&config, vec![(tensor_ids, past)], 1);
 
     let embeddings = model.transformer.word_embeddings.forward(&input_ids);
 
