@@ -332,6 +332,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "static_typing_tch",
  "tch",
  "thiserror",
  "tokenizers",
@@ -2142,6 +2143,15 @@ dependencies = [
  "nom",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "static_typing_tch"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "quote",
+ "syn",
 ]
 
 [[package]]

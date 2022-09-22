@@ -1,6 +1,7 @@
 use crate::model::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
 use log::debug;
+use static_typing_tch::tensor_check;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 #[derive(Debug)]
@@ -279,14 +280,16 @@ fn finfo_min(kind: Kind) -> f64 {
     }
 }
 
+tensor_check! {
+
 pub struct LayerNorm {
-    pub(super) weight: Tensor,
-    pub(super) bias: Tensor,
-    pub(super) hidden_size: i64,
+    weight: Tensor<(B, H)>,
+    bias: Tensor<(H, )>,
+    hidden_size: i64,
 }
 
 impl LayerNorm {
-    pub fn new(weight: Tensor, bias: Tensor, hidden_size: i64) -> Self {
+    pub fn new(weight: Tensor<(B, H)>, bias: Tensor<(H, )>, hidden_size: i64) -> Self {
         Self {
             hidden_size,
             weight,
@@ -294,15 +297,14 @@ impl LayerNorm {
         }
     }
 
-    pub fn forward(&self, xs: &Tensor) -> Tensor {
-        xs.f_layer_norm(
+    pub fn forward(&self, xs: &Tensor<(B, H)>) -> Tensor<(B, H)> {
+        xs.layer_norm(
             &[self.hidden_size],
             Some(&self.weight),
             Some(&self.bias),
             EPS,
             true,
         )
-        .unwrap()
     }
 }
 
@@ -310,31 +312,24 @@ impl LayerNorm {
 /// weight: [in_features, out_features]
 /// bias: [out_features]
 pub struct Linear {
-    pub(super) weight: Tensor,
-    pub(super) bias: Tensor,
+    weight: Tensor<(I, O)>,
+    bias: Tensor<(O,)>,
 }
 
 impl Linear {
-    pub fn new(weight: Tensor, bias: Tensor) -> Self {
+    pub fn new(weight: Tensor<(I, O)>, bias: Tensor<(O, )>) -> Self {
         Self { weight, bias }
     }
 
-    pub fn forward(&self, xs: &Tensor) -> Tensor {
-        let in_features = self.weight.size()[0];
-        let out_features = self.weight.size()[1];
-        let mut out_size = xs.size();
-        if let Some(last) = out_size.last_mut() {
-            *last = out_features;
-        }
-
-        let flatten_xs = xs.view((-1, in_features));
-
-        self.bias
-            .f_addmm(&flatten_xs, &self.weight)
-            .unwrap()
-            .f_view(out_size.as_slice())
-            .unwrap()
+    pub fn forward(&self, xs: &Tensor<(B, S, I)>) -> Tensor<(B, S, O)> {
+        let xsize = xs.size();
+        let flatten_xs = xs.view((-1, xsize[2]));
+        let out = self.bias
+            .addmm(&flatten_xs, &self.weight);
+        let out_s = self.weight.size();
+        out.view((xsize[0], xsize[1], out_s[1]))
     }
+}
 }
 
 /// Different from usual FakeTpLinear in order to remove transpose operation:

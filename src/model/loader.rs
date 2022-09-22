@@ -65,7 +65,7 @@ impl Linear {
             device,
         );
 
-        Self { weight, bias }
+        Self::new(weight, bias)
     }
 }
 
