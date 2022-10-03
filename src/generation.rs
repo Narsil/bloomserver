@@ -1,5 +1,6 @@
 use crate::model::{build_alibi_tensor, Config, Past};
 use crate::non_empty_past;
+use log::info;
 use serde::{Deserialize, Serialize};
 use tch::{kind, IndexOp, Tensor};
 
@@ -141,10 +142,9 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
     match &params.generation_mode {
         GenerationMode::Greedy => {
             let seq_length = logits.size()[1];
-            let new_ids = logits
+            logits
                 .i((0..1, seq_length - 1..seq_length))
-                .argmax(-1, false);
-            new_ids
+                .argmax(-1, false)
         }
         GenerationMode::Sampling(params) => {
             let seq_length = logits.size()[1];
@@ -171,8 +171,7 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
             }
 
             let probs = scored_logits.f_softmax(-1, kind::Kind::Float).unwrap();
-            let new_ids = probs.f_multinomial(1, false).unwrap();
-            new_ids
+            probs.f_multinomial(1, false).unwrap()
         }
         _ => todo!(),
         // Parameters::BeamSearch(params) => {
@@ -197,15 +196,9 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
         //         // input_ids is of shape [num_beams, seq_length]
         //         // So transposing to we can concatenate the indices within input_ids
         //         let new_ids = new_ids.transpose(1, 0);
-        //         println!("Input ids {:?}", input_ids);
-        //         println!("New ids {:?}", new_ids);
         //         self.input_ids = Tensor::f_cat(&[input_ids.copy(), new_ids.copy()], 1).unwrap();
         //         // Save the current scores in logits form.
         //         self.beam_scores = Some(values);
-        //         println!(
-        //             "After beam search first step we have input_ids {:?}",
-        //             self.input_ids
-        //         );
         //     } else {
         //         // Now the tricky part.
         //         let size = logits.size();
@@ -220,7 +213,7 @@ pub fn next_ids(params: &Parameters, logits: &Tensor) -> Tensor {
     }
 }
 
-pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, Tensor, Past) {
+pub fn padding(config: &Config, items: Vec<(Tensor, Past)>, world_size: usize) -> (Tensor, Tensor, Tensor, Past) {
     let (max_length_input_ids, max_length_past) = items
         .iter()
         .map(|(ids, past)| (ids.size()[1], past[0].seq_length()))
@@ -241,7 +234,7 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let all_input_ids =
         Tensor::zeros(&[batch_size, max_length_input_ids], kind2) + config.padding_idx;
 
-    let mut all_past_key_values = non_empty_past(&config, batch_size, max_length_past, 0.0, 0.0);
+    let mut all_past_key_values = non_empty_past(config, batch_size, max_length_past, 0.0, 0.0, world_size);
 
     let attention_mask = Tensor::zeros(&[batch_size, max_length], kind2);
 
@@ -279,12 +272,9 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                     layer_past.key = layer_past.key.to_device(device);
                     layer_past.value = layer_past.value.to_device(device);
                 }
-                // println!("layer past key {:?}", layer_past.key.size());
-                // println!("max past {:?}", max_length_past);
-                // println!("past_seq_length {:?}", past_seq_length);
-                // println!("key {:?}", past_key_values[i].key.size());
                 let start_batch_size_times_num_heads = current_batch * config.n_head;
-                let end_batch_size_times_num_heads = start_batch_size_times_num_heads + mini_batch_size * config.n_head;
+                let end_batch_size_times_num_heads =
+                    start_batch_size_times_num_heads + mini_batch_size * config.n_head;
                 layer_past
                     .key
                     .i((
@@ -295,10 +285,6 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
                     .f_copy_(&past_key_values[i].key)
                     .unwrap();
 
-                // println!("layer past value {:?}", layer_past.value.size());
-                // println!("max past {:?}", max_length_past);
-                // println!("past_seq_length {:?}", past_seq_length);
-                // println!("value {:?}", past_key_values[i].value.size());
                 layer_past
                     .value
                     .i((
@@ -323,7 +309,7 @@ pub fn padding(config: &Config, items: Vec<(Tensor, Past)>) -> (Tensor, Tensor, 
     let alibi = build_alibi_tensor(&attention_mask, config.n_head, config.kind, device);
 
     let total = std::cmp::max(1, batch_size as usize * max_length as usize);
-    println!(
+    info!(
         "Running on batch of size, seq_length[{:?}, {:?}] - Fillrate {:?}%",
         batch_size,
         max_length,
@@ -418,12 +404,12 @@ mod tests {
             .view((1, 6))
             .to_kind(kind::Kind::Int64)
             .to_device(device);
-        let past = empty_past(&config, 1);
-        let past2 = empty_past(&config, 1);
+        let past = empty_past(&config, 1, 1);
+        let past2 = empty_past(&config, 1, 1);
 
         let items = vec![(input_ids, past), (input_ids2, past2)];
 
-        let (all_input_ids, _, _, _) = padding(&config, items);
+        let (all_input_ids, _, _, _) = padding(&config, items, 1);
 
         assert_eq!(all_input_ids.size(), vec![2, 6]);
         assert_eq!(
@@ -446,26 +432,22 @@ mod tests {
             .to_device(device);
 
         // Batch_size=1, seq_length=4
-        let past = non_empty_past(&config, 1, 4, 3.0, 4.0);
-        let past2 = non_empty_past(&config, 1, 6, 5.0, 6.0);
+        let past = non_empty_past(&config, 1, 4, 3.0, 4.0, 1);
+        let past2 = non_empty_past(&config, 1, 6, 5.0, 6.0, 1);
 
         let items = vec![(input_ids, past), (input_ids2, past2)];
 
-        let (all_input_ids, attention_mask, alibi, past_key_values) = padding(&config, items);
+        let (all_input_ids, attention_mask, alibi, past_key_values) = padding(&config, items,1);
 
         assert_eq!(all_input_ids.size(), vec![2, 1]);
         assert_eq!(attention_mask.size(), vec![2, 7]);
         assert_eq!(alibi.size(), vec![16 * 2, 1, 7]);
         assert_eq!(past_key_values.len(), 24);
         for i in 0..24 {
-            assert_eq!(
-                past_key_values[i].key.size(),
-                vec![2, 16, 64, 6],
-                "Layer {i}"
-            );
+            assert_eq!(past_key_values[i].key.size(), vec![32, 64, 6], "Layer {i}");
             assert_eq!(
                 past_key_values[i].value.size(),
-                vec![2, 16, 6, 64],
+                vec![32, 6, 64],
                 "Layer {i}"
             );
         }
@@ -480,19 +462,19 @@ mod tests {
             vec![1, 1, 1, 1, 1, 1, 1]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].key.i((0, ..1, ..1, ..))),
+            Vec::<f64>::from(past_key_values[0].key.i((0..1, ..1, ..))),
             vec![0.0, 0.0, 3.0, 3.0, 3.0, 3.0]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].value.i((0, ..1, .., ..1))),
+            Vec::<f64>::from(past_key_values[0].value.i((0..1, .., ..1))),
             vec![0.0, 0.0, 4.0, 4.0, 4.0, 4.0]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].key.i((1, ..1, ..1, ..))),
+            Vec::<f64>::from(past_key_values[0].key.i((16..17, ..1, ..))),
             vec![5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
         );
         assert_eq!(
-            Vec::<f64>::from(past_key_values[0].value.i((1, ..1, .., ..1))),
+            Vec::<f64>::from(past_key_values[0].value.i((16..17, .., ..1))),
             vec![6.0, 6.0, 6.0, 6.0, 6.0, 6.0]
         );
     }

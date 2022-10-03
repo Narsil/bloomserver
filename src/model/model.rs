@@ -1,6 +1,6 @@
-use crate::convert;
+use crate::model::tp_layers::{TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::utils::{debug, save_layer_to_disk};
-use safetensors::SafeTensors;
+use log::debug;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 #[derive(Debug)]
@@ -11,12 +11,12 @@ pub struct PastLayer {
 
 impl PastLayer {
     pub fn seq_length(&self) -> i64 {
-        return self.key.size()[2];
+        self.key.size()[2]
     }
 }
 
-pub fn empty_past(config: &Config, batch_size: i64) -> Past {
-    non_empty_past(config, batch_size, 0, 0.0, 0.0)
+pub fn empty_past(config: &Config, batch_size: i64, world_size: usize) -> Past {
+    non_empty_past(config, batch_size, 0, 0.0, 0., world_size)
 }
 
 pub fn non_empty_past(
@@ -25,21 +25,21 @@ pub fn non_empty_past(
     length_past: i64,
     key: f64,
     value: f64,
+    world_size: usize,
 ) -> Past {
     let device = Device::Cuda(0);
-    let p = config.n_head;
+    let p = config.n_head / world_size as i64;
     let q = config.hidden_size / config.n_head;
     let past_key_template =
         Tensor::zeros(&[batch_size * p, q, length_past], (config.kind, device)) + key;
     let past_value_template =
         Tensor::zeros(&[batch_size * p, length_past, q], (config.kind, device)) + value;
-    let all_past_key_values = (0..config.n_layer as usize)
+    (0..config.n_layer as usize)
         .map(|_| PastLayer {
             key: past_key_template.copy(),
             value: past_value_template.copy(),
         })
-        .collect::<Vec<_>>();
-    all_past_key_values
+        .collect::<Vec<_>>()
 }
 pub type Past = Vec<PastLayer>;
 
@@ -68,7 +68,8 @@ impl Config {
         Self {
             n_head: 112,
             hidden_size: 14336,
-            n_layer: 70,
+            // TODO
+            n_layer: 30,
             kind: Kind::BFloat16,
             slow_but_exact: false,
             pretraining_tp: 4,
@@ -156,8 +157,7 @@ fn make_causal_mask(
         .unsqueeze(1)
         .f_lt_tensor(&seq_ids.unsqueeze(0))
         .unwrap();
-    _ = mask
-        .i((.., past_key_values_length..))
+    mask.i((.., past_key_values_length..))
         .f_copy_(&causal_mask)
         .unwrap();
 
@@ -168,8 +168,7 @@ fn make_causal_mask(
     }
 
     // expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
-    let expanded_mask = mask
-        .unsqueeze(0)
+    mask.unsqueeze(0)
         .f_expand(
             &[
                 batch_size,
@@ -178,9 +177,7 @@ fn make_causal_mask(
             ],
             true,
         )
-        .unwrap();
-    // return expanded_mask
-    expanded_mask
+        .unwrap()
 }
 
 /// Expands attention_mask from `[batch_size, src_length]` to `[batch_size, tgt_length, src_length]`.
@@ -222,17 +219,17 @@ pub fn prepare_attn_mask(
     // )
     let combined_attention_mask = if src_length > 1 {
         let causal_mask = make_causal_mask(input_size, device, past_key_values_length);
+        // debug!("causal {:?}", causal_mask);
+        // debug!("expanded {:?}", expanded_attn_mask);
         expanded_attn_mask.f_logical_or(&causal_mask).unwrap()
     } else {
         expanded_attn_mask
     };
 
     // [batch_size, seq_length] -> [batch_size * num_attention_heads, tgt_length, src_length]
-    let result = combined_attention_mask
+    combined_attention_mask
         .f_repeat_interleave_self_int(num_attention_heads, 0, batch_size * num_attention_heads)
-        .unwrap();
-
-    result
+        .unwrap()
 }
 
 pub fn build_alibi_tensor(
@@ -285,27 +282,13 @@ fn finfo_min(kind: Kind) -> f64 {
 }
 
 pub struct LayerNorm {
-    weight: Tensor,
-    bias: Tensor,
-    hidden_size: i64,
+    pub(super) weight: Tensor,
+    pub(super) bias: Tensor,
+    pub(super) hidden_size: i64,
 }
 
 impl LayerNorm {
-    pub fn new(hidden_size: i64, name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight_name = format!("{name}.weight");
-        let weight = convert(
-            model
-                .tensor(&weight_name)
-                .unwrap_or_else(|_| panic!("Failed to load {weight_name} with name {name}")),
-            device,
-        );
-        let bias_name = format!("{name}.bias");
-        let bias = convert(
-            model
-                .tensor(&bias_name)
-                .unwrap_or_else(|_| panic!("Failed to load {bias_name}")),
-            device,
-        );
+    pub fn new(weight: Tensor, bias: Tensor, hidden_size: i64) -> Self {
         Self {
             hidden_size,
             weight,
@@ -329,28 +312,12 @@ impl LayerNorm {
 /// weight: [in_features, out_features]
 /// bias: [out_features]
 pub struct Linear {
-    weight: Tensor,
-    bias: Tensor,
+    pub(super) weight: Tensor,
+    pub(super) bias: Tensor,
 }
 
 impl Linear {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let tname = format!("{name}.weight");
-        let weight = convert(
-            model
-                .tensor(&tname)
-                .unwrap_or_else(|_| panic!("Could not find {tname}")),
-            device,
-        ).f_transpose_copy(1,0).unwrap();
-
-        let bias_name = format!("{name}.bias");
-        let bias = convert(
-            model
-                .tensor(&bias_name)
-                .unwrap_or_else(|_| panic!("Could not find {bias_name}")),
-            device,
-        );
-
+    pub fn new(weight: Tensor, bias: Tensor) -> Self {
         Self { weight, bias }
     }
 
@@ -372,32 +339,83 @@ impl Linear {
     }
 }
 
+/// Different from usual FakeTpLinear in order to remove transpose operation:
+/// weight: [in_features, out_features]
+/// bias: [out_features]
+pub struct FakeTpLinear {
+    pub(super) linear: Linear,
+    pub(super) pretraining_tp: usize,
+}
+
+impl FakeTpLinear {
+    pub fn new(linear: Linear, pretraining_tp: usize) -> Self {
+        Self {
+            linear,
+            pretraining_tp,
+        }
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> Tensor {
+        let pretraining_tp = self.pretraining_tp as i64;
+        let slices = xs.size().last().unwrap() / pretraining_tp;
+        let mut output_tensor = Tensor::zeros_like(&xs);
+        for i in 0..pretraining_tp {
+            let context_tp = xs.i((.., .., i * slices..(i + 1) * slices));
+            let dense_tp = self.linear.weight.i(i * slices..(i + 1) * slices);
+
+            let in_features = self.linear.weight.size()[0] / pretraining_tp;
+            let out_features = self.linear.weight.size()[1];
+            let mut out_size = context_tp.size();
+            if let Some(last) = out_size.last_mut() {
+                *last = out_features;
+            }
+
+            let flatten_xs = context_tp.f_reshape(&[-1, in_features]).unwrap();
+            let out = flatten_xs.f_mm(&dense_tp).unwrap();
+            output_tensor += out.f_view(out_size.as_slice()).unwrap();
+        }
+        output_tensor += &self.linear.bias;
+        output_tensor
+    }
+}
+
+pub enum ParallelLinear {
+    Linear(Linear),
+    FakeTp(FakeTpLinear),
+    TensorParallelColumnLinear(TensorParallelColumnLinear),
+    TensorParallelRowLinear(TensorParallelRowLinear),
+}
+
+impl ParallelLinear {
+    pub fn forward(&self, xs: &Tensor) -> Tensor {
+        match self {
+            ParallelLinear::Linear(layer) => layer.forward(xs),
+            ParallelLinear::FakeTp(layer) => layer.forward(xs),
+            ParallelLinear::TensorParallelColumnLinear(layer) => layer.forward(xs),
+            ParallelLinear::TensorParallelRowLinear(layer) => layer.forward(xs),
+        }
+    }
+}
+
 pub struct BloomAttention {
-    dense: Linear,
-    query_key_value: Linear,
-    num_attention_heads: i64,
-    head_dim: i64,
-    layer_number: usize,
-    real_layer_number: usize,
-    norm_factor: f64,
-    pretraining_tp: i64,
-    slow_but_exact: bool,
+    pub(super) dense: ParallelLinear,
+    pub(super) query_key_value: ParallelLinear,
+    pub(super) num_attention_heads: i64,
+    pub(super) head_dim: i64,
+    pub(super) layer_number: usize,
+    pub(super) norm_factor: f64,
 }
 
 impl BloomAttention {
     pub fn new(
+        query_key_value: ParallelLinear,
+        dense: ParallelLinear,
         config: &Config,
-        name: &str,
-        model: &SafeTensors<'_>,
         layer_number: usize,
-        device: Device,
     ) -> Self {
-        let dense = Linear::new(&format!("{name}.dense"), model, device);
-        let query_key_value = Linear::new(&format!("{name}.query_key_value"), model, device);
         let head_dim = (config.hidden_size / config.n_head) as i64;
         let num_attention_heads = config.n_head as i64;
-        let real_layer_number = layer_number;
-        let layer_number = std::cmp::max(1, layer_number);
+        let layer_number = layer_number;
         let norm_factor = 1.0 / (head_dim as f64).sqrt();
         Self {
             dense,
@@ -405,10 +423,7 @@ impl BloomAttention {
             num_attention_heads,
             head_dim,
             layer_number,
-            real_layer_number,
             norm_factor,
-            slow_but_exact: config.slow_but_exact,
-            pretraining_tp: config.pretraining_tp as i64,
         }
     }
 
@@ -422,8 +437,12 @@ impl BloomAttention {
     ) -> Tensor {
         let layer_number = self.layer_number;
         let mixed_x_layer = self.query_key_value.forward(hidden_states);
-        let (batch_size, q_length) = if let [batch_size, q_length,] = mixed_x_layer.size()[..2] { (batch_size, q_length) } else { todo!() };
-        debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
+        let (batch_size, q_length) = if let [batch_size, q_length] = mixed_x_layer.size()[..2] {
+            (batch_size, q_length)
+        } else {
+            unreachable!()
+        };
+        // debug(&format!("Mixed_x_layer {layer_number}"), &mixed_x_layer);
         let new_tensor_shape = [
             batch_size,
             q_length,
@@ -438,45 +457,50 @@ impl BloomAttention {
             _ => unreachable!(),
         };
 
-        let query_layer = query
-            .transpose(1, 2)
-            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
-        let key_layer = key
-            .permute(&[0, 2, 3, 1])
-            .reshape(&[batch_size * self.num_attention_heads, self.head_dim, q_length]);
-        let value_layer = value
-            .transpose(1, 2)
-            .reshape(&[batch_size * self.num_attention_heads, q_length, self.head_dim]);
+        let query_layer = query.transpose(1, 2).reshape(&[
+            batch_size * self.num_attention_heads,
+            q_length,
+            self.head_dim,
+        ]);
+        let key_layer = key.permute(&[0, 2, 3, 1]).reshape(&[
+            batch_size * self.num_attention_heads,
+            self.head_dim,
+            q_length,
+        ]);
+        let value_layer = value.transpose(1, 2).reshape(&[
+            batch_size * self.num_attention_heads,
+            q_length,
+            self.head_dim,
+        ]);
 
         // TODO @thomasw21: Figure out why we need to cast to device here.
         let device = query_layer.device();
-        let key_layer = Tensor::f_cat(
-            &[&layer_past.key.to_device(device), &key_layer],
-            2,
-        )
-        .unwrap();
-        let value_layer = Tensor::f_cat(
-            &[&layer_past.value.to_device(device), &value_layer],
-            1,
-        )
-        .unwrap();
+        // debug!("Previous past {:?}", layer_past.key);
+        // debug!("new key {:?}", key_layer);
+        let key_layer = Tensor::f_cat(&[&layer_past.key.to_device(device), &key_layer], 2).unwrap();
+        let value_layer =
+            Tensor::f_cat(&[&layer_past.value.to_device(device), &value_layer], 1).unwrap();
 
         save_layer_to_disk(
-            &alibi,
-            &format!("rust_baddbmm_sliced_alibi_{}.npy", self.real_layer_number,),
+            alibi,
+            &format!("rust_baddbmm_sliced_alibi_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             &key_layer,
-            &format!("rust_baddbmm_key_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_key_layer_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             &query_layer,
-            &format!("rust_baddbmm_query_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_query_layer_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             &value_layer,
-            &format!("rust_baddbmm_value_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_value_layer_{}.npy", self.layer_number,),
         );
+
+        // debug!("alibi {alibi:?}");
+        // debug!("query {query_layer:?}");
+        // debug!("key {key_layer:?}");
 
         let mut attention_scores = alibi
             .f_baddbmm_s(&query_layer, &key_layer, 1.0, self.norm_factor)
@@ -484,7 +508,7 @@ impl BloomAttention {
 
         save_layer_to_disk(
             &attention_scores,
-            &format!("rust_baddbmm_matmul_result_{}.npy", self.real_layer_number,),
+            &format!("rust_baddbmm_matmul_result_{}.npy", self.layer_number,),
         );
 
         // cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
@@ -496,16 +520,13 @@ impl BloomAttention {
 
         save_layer_to_disk(
             &attention_scores,
-            &format!(
-                "rust_softmax_attention_scores_{}.npy",
-                self.real_layer_number,
-            ),
+            &format!("rust_softmax_attention_scores_{}.npy", self.layer_number,),
         );
         let attn_weights =
-            attention_scores.masked_fill_(&attention_mask, finfo_min(attention_scores.kind()));
+            attention_scores.f_masked_fill_(attention_mask, finfo_min(attention_scores.kind())).unwrap();
         save_layer_to_disk(
             &attn_weights,
-            &format!("rust_softmax_attn_weights_{}.npy", self.real_layer_number,),
+            &format!("rust_softmax_attn_weights_{}.npy", self.layer_number,),
         );
         let attention_probs = attn_weights
             .f_softmax(-1, Kind::Float)
@@ -513,49 +534,45 @@ impl BloomAttention {
             .to_kind(input_dtype);
         save_layer_to_disk(
             &attention_probs,
-            &format!(
-                "rust_softmax_attention_probs_{}.npy",
-                self.real_layer_number,
-            ),
+            &format!("rust_softmax_attention_probs_{}.npy", self.layer_number,),
         );
 
         save_layer_to_disk(
             &value_layer,
-            &format!("rust_bmm_value_layer_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_value_layer_{}.npy", self.layer_number,),
         );
         let context_layer = Tensor::f_bmm(&attention_probs, &value_layer).unwrap();
 
         let context_layer_r = context_layer
-            .f_view((batch_size, self.num_attention_heads, q_length, self.head_dim))
+            .f_view((
+                batch_size,
+                self.num_attention_heads,
+                q_length,
+                self.head_dim,
+            ))
             .unwrap();
         let context_layer_p = context_layer_r.permute(&[0, 2, 1, 3]).contiguous();
         let context = context_layer_p
-            .f_view((batch_size, q_length, self.num_attention_heads * self.head_dim))
+            .f_view((
+                batch_size,
+                q_length,
+                self.num_attention_heads * self.head_dim,
+            ))
             .unwrap();
-        let mut output = if self.slow_but_exact {
-            let slices = context.size().last().unwrap() / self.pretraining_tp;
-            let mut output_tensor = Tensor::zeros_like(&context);
-            for i in 0..self.pretraining_tp {
-                let context_tp = context.i((.., .., i * slices..(i + 1) * slices));
-                let dense_tp = self.dense.weight.i((.., i * slices..(i + 1) * slices));
-                output_tensor += context_tp.linear::<Tensor>(&dense_tp, None);
-            }
-            output_tensor
-        } else {
-            self.dense.forward(&context)
-        };
+        // debug!("Before dense");
+        let mut output = self.dense.forward(&context);
         save_layer_to_disk(
             &output,
-            &format!("rust_bmm_dense_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_dense_{}.npy", self.layer_number,),
         );
         save_layer_to_disk(
             residual,
-            &format!("rust_bmm_residual_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_residual_{}.npy", self.layer_number,),
         );
         output += residual;
         save_layer_to_disk(
             &output,
-            &format!("rust_bmm_dropout_{}.npy", self.real_layer_number,),
+            &format!("rust_bmm_dropout_{}.npy", self.layer_number,),
         );
 
         // update layer_past
@@ -569,11 +586,11 @@ impl BloomAttention {
 }
 
 pub struct BloomMlp {
-    dense_h_to_4h: Linear,
-    dense_4h_to_h: Linear,
-    real_layer_number: usize,
-    slow_but_exact: bool,
-    pretraining_tp: i64,
+    pub(super) dense_h_to_4h: Linear,
+    pub(super) dense_4h_to_h: Linear,
+    pub(super) layer_number: usize,
+    pub(super) slow_but_exact: bool,
+    pub(super) pretraining_tp: i64,
 }
 
 // TODO @thomasw21: Figure out how to compile this into a single operation.
@@ -584,18 +601,15 @@ fn bloom_gelu(x: &Tensor) -> Tensor {
 
 impl BloomMlp {
     pub fn new(
+        dense_h_to_4h: Linear,
+        dense_4h_to_h: Linear,
         config: &Config,
-        name: &str,
-        model: &SafeTensors<'_>,
-        device: Device,
-        real_layer_number: usize,
+        layer_number: usize,
     ) -> Self {
-        let dense_h_to_4h = Linear::new(&format!("{name}.dense_h_to_4h"), model, device);
-        let dense_4h_to_h = Linear::new(&format!("{name}.dense_4h_to_h"), model, device);
         Self {
             dense_h_to_4h,
             dense_4h_to_h,
-            real_layer_number,
+            layer_number,
             slow_but_exact: config.slow_but_exact,
             pretraining_tp: config.pretraining_tp as i64,
         }
@@ -604,7 +618,7 @@ impl BloomMlp {
     pub fn forward(&self, hidden_states: &Tensor, residual: &Tensor) -> Tensor {
         save_layer_to_disk(
             hidden_states,
-            &format!("rust_mlp_init_{}.npy", self.real_layer_number,),
+            &format!("rust_mlp_init_{}.npy", self.layer_number,),
         );
         debug("hidden_states", hidden_states);
         debug("INCOMING residual", residual);
@@ -613,20 +627,24 @@ impl BloomMlp {
         let hidden_states = bloom_gelu(&hidden_states);
         save_layer_to_disk(
             &hidden_states,
-            &format!("rust_mlp_gelu_{}.npy", self.real_layer_number,),
+            &format!("rust_mlp_gelu_{}.npy", self.layer_number,),
         );
         debug("hidden_states gelu", &hidden_states);
         let mut hidden_states = if self.slow_but_exact {
             let mut intermediate_output = Tensor::zeros_like(residual);
-            let slices = self.dense_4h_to_h.weight.size().last().unwrap() / self.pretraining_tp;
-            for i in 0..self.pretraining_tp {
-                let i = i as i64;
-                let tp = hidden_states.i((.., .., i * slices..(i + 1) * slices));
-                let dense_tp = self
-                    .dense_4h_to_h
-                    .weight
+            let total = self.dense_4h_to_h.weight.size()[0];
+            let slices = total / self.pretraining_tp;
+            for i in 0..self.pretraining_tp as i64 {
+                let tp = hidden_states
+                    .view((-1, total))
                     .i((.., i * slices..(i + 1) * slices));
-                intermediate_output += tp.linear::<Tensor>(&dense_tp, None);
+                let dense_tp = self.dense_4h_to_h.weight.i(i * slices..(i + 1) * slices);
+
+                intermediate_output += tp
+                    .f_mm(&dense_tp)
+                    .unwrap()
+                    .f_view(intermediate_output.size().as_slice())
+                    .unwrap();
             }
             intermediate_output
         } else {
@@ -637,55 +655,28 @@ impl BloomMlp {
         debug("hidden_states residual", &hidden_states);
         save_layer_to_disk(
             &hidden_states,
-            &format!("rust_mlp_output_{}.npy", self.real_layer_number,),
+            &format!("rust_mlp_output_{}.npy", self.layer_number,),
         );
         hidden_states
     }
 }
 
 pub struct BloomBlock {
-    input_layernorm: LayerNorm,
-    self_attention: BloomAttention,
-    post_attention_layernorm: LayerNorm,
-    mlp: BloomMlp,
-    layer_number: usize,
+    pub(super) input_layernorm: LayerNorm,
+    pub(super) self_attention: BloomAttention,
+    pub(super) post_attention_layernorm: LayerNorm,
+    pub(super) mlp: BloomMlp,
+    pub(super) layer_number: usize,
 }
 
 impl BloomBlock {
     pub fn new(
-        config: &Config,
-        prefix: &str,
-        model: &SafeTensors<'_>,
+        input_layernorm: LayerNorm,
+        self_attention: BloomAttention,
+        post_attention_layernorm: LayerNorm,
+        mlp: BloomMlp,
         layer_number: usize,
-        device: Device,
     ) -> Self {
-        // attention
-        let input_layernorm = LayerNorm::new(
-            config.hidden_size,
-            &format!("{prefix}.input_layernorm"),
-            model,
-            device,
-        );
-        let post_attention_layernorm = LayerNorm::new(
-            config.hidden_size,
-            &format!("{prefix}.post_attention_layernorm"),
-            model,
-            device,
-        );
-        let self_attention = BloomAttention::new(
-            config,
-            &format!("{prefix}.self_attention"),
-            model,
-            layer_number,
-            device,
-        );
-        let mlp = BloomMlp::new(
-            config,
-            &format!("{prefix}.mlp"),
-            model,
-            device,
-            layer_number,
-        );
         Self {
             input_layernorm,
             self_attention,
@@ -747,8 +738,7 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+    pub fn new(weight: Tensor) -> Self {
         Self { weight }
     }
 
@@ -765,29 +755,23 @@ pub struct BloomModel {
     pub word_embeddings_layernorm: LayerNorm,
     pub h: Vec<BloomBlock>,
     pub ln_f: LayerNorm,
-    num_heads: i64
+    num_heads: i64,
 }
 
 impl BloomModel {
-    pub fn new(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
-        let word_embeddings = Embedding::new("word_embeddings", model, device);
-        let word_embeddings_layernorm = LayerNorm::new(
-            config.hidden_size,
-            "word_embeddings_layernorm",
-            model,
-            device,
-        );
-        let ln_f = LayerNorm::new(config.hidden_size, "ln_f", model, device);
-        let h = (0..config.n_layer)
-            .map(|i| BloomBlock::new(config, &format!("h.{i}"), model, i as usize, device))
-            .collect();
-        let num_heads = config.n_head;
+    pub fn new(
+        word_embeddings: Embedding,
+        word_embeddings_layernorm: LayerNorm,
+        h: Vec<BloomBlock>,
+        ln_f: LayerNorm,
+        config: &Config,
+    ) -> Self {
         Self {
             word_embeddings,
             word_embeddings_layernorm,
             h,
             ln_f,
-            num_heads
+            num_heads: config.n_head,
         }
     }
 
@@ -810,11 +794,13 @@ impl BloomModel {
 
         debug("Alibi", alibi);
 
-
         let input_size = input_ids.size();
         let past_key_values_length = past_key_values[0].seq_length();
         let causal_mask = prepare_attn_mask(
-            &attention_mask, input_size, past_key_values_length, self.num_heads
+            attention_mask,
+            input_size,
+            past_key_values_length,
+            self.num_heads,
         );
 
         for (i, (block, layer_past)) in self.h.iter().zip(past_key_values.iter_mut()).enumerate() {
@@ -832,8 +818,7 @@ pub struct InvertedEmbedding {
 }
 
 impl InvertedEmbedding {
-    pub fn new(name: &str, model: &SafeTensors<'_>, device: Device) -> Self {
-        let weight = convert(model.tensor(&format!("{name}.weight")).unwrap(), device);
+    pub fn new(weight: Tensor) -> Self {
         Self { weight }
     }
 
@@ -855,9 +840,7 @@ pub struct BloomForCausalLM {
 }
 
 impl BloomForCausalLM {
-    pub fn new(config: &Config, model: &SafeTensors<'_>, device: Device) -> Self {
-        let transformer = BloomModel::new(config, model, device);
-        let lm_head = InvertedEmbedding::new("word_embeddings", model, device);
+    pub fn new(transformer: BloomModel, lm_head: InvertedEmbedding) -> Self {
         Self {
             transformer,
             lm_head,
@@ -884,15 +867,9 @@ pub mod tests {
     use crate::empty_past;
     use crate::test::assert_all_close;
     use memmap::MmapOptions;
-    use once_cell::sync::Lazy;
-    use std::sync::{Arc, Mutex};
+    use safetensors::SafeTensors;
 
-    pub static BLOOM_350M: Lazy<Arc<Mutex<BloomForCausalLM>>> =
-        Lazy::new(|| Arc::new(Mutex::new(bloom_350m())));
-    pub static BLOOM_TESTING: Lazy<Arc<Mutex<BloomForCausalLM>>> =
-        Lazy::new(|| Arc::new(Mutex::new(bloom_testing())));
-
-    fn bloom_350m() -> BloomForCausalLM {
+    pub(crate) fn bloom_350m() -> BloomForCausalLM {
         let config = Config::new350m();
         let file = std::fs::File::open("./weights/bloom-350m.bin").unwrap();
         // SAFETY: This is actually unsafe.
@@ -901,11 +878,11 @@ pub mod tests {
 
         let device = Device::Cuda(0);
 
-        let model = BloomForCausalLM::new(&config, &model_file, device);
+        let model = BloomForCausalLM::load(&config, &model_file, device);
         model
     }
 
-    fn bloom_testing() -> BloomForCausalLM {
+    pub(crate) fn bloom_testing() -> BloomForCausalLM {
         let config = Config::new_testing();
         let file = std::fs::File::open("./weights/bloom-testing.bin").unwrap();
         // SAFETY: This is actually unsafe.
@@ -914,7 +891,7 @@ pub mod tests {
 
         let device = Device::Cuda(0);
 
-        let model = BloomForCausalLM::new(&config, &model_file, device);
+        let model = BloomForCausalLM::load(&config, &model_file, device);
         model
     }
     #[test]
@@ -1032,13 +1009,14 @@ pub mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_bloom_350m() {
         // Batched input (2, 4)
         // First input is not full
-        let model = BLOOM_350M.lock().unwrap();
+        let model = bloom_350m();
         let config = Config::new350m();
         let device = Device::Cuda(0);
-        let mut past_key_values = empty_past(&config, 2);
+        let mut past_key_values = empty_past(&config, 2, 1);
         let input_ids = Tensor::of_slice(&[2, 2, 34, 54, 132, 225, 532, 342])
             .view((2, 4))
             .to_device(Device::Cuda(0));
@@ -1052,11 +1030,12 @@ pub mod tests {
 
         assert_eq!(logits.size(), vec![2, 4, 250880]);
         let expected = Tensor::of_slice(&[
-            640.5, 668.5, 671.0, 102.375, 670.5, 676.5, 680.5, 676.0, 671.0, 670.0,
+            145.5000, 152.2500, 164.1250, 97.8125, 162.6250, 163.6250, 164.6250, 162.6250,
+            160.3750, 164.0000,
         ])
         .to_kind(config.kind)
         .to_device(device);
-        assert_all_close(&expected, &logits.i((0, 0, 0..10)));
+        assert_all_close(&expected, &logits.i((0, 0, 0..10))).unwrap();
         let ids = logits.argmax(-1, false);
         assert_eq!(ids.size(), vec![2, 4]);
         assert_eq!(
@@ -1064,7 +1043,8 @@ pub mod tests {
             // Original implem output in comment
             // Most likely linked to odd `baddbmm` kernel for alpha + beta fusion
             // Which leads to small drifts.
-            vec![4141, 4141, 2, 17, 64530, 15, 15, 100] // vec![235149, 235149, 2, 17, 64530, 15, 15, 100]
+            // After lots of code the outputs really changed.
+            vec![54, 54, 2, 17, 228, 132, 15, 100] // vec![4141, 4141, 2, 17, 64530, 15, 15, 100] // vec![235149, 235149, 2, 17, 64530, 15, 15, 100]
         );
     }
 }

@@ -1,0 +1,61 @@
+name: Rust tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Install Rust Stable
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          override: true
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install
+        run: |
+          pip install -U pip
+          pip install setuptools_rust
+          pip install -r requirements.txt
+          python -c "import convert_weights; convert_weights.convert_testing(); convert_weights.convert_350m()"
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          env: TORCH_CUDA_VERSION=cu116
+          args: --all-targets --verbose 
+
+      - name: Lint with RustFmt
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --manifest-path -- --check
+
+      - name: Lint with Clippy
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --manifest-path --all-targets --all-features -- -D warnings
+
+      - name: Run lib Tests
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --verbose --all-features --all-targets 

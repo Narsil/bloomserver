@@ -4,9 +4,10 @@ use crate::model::{
 };
 use crate::utils::debug;
 use crossbeam_channel::{Receiver, Select, Sender};
+use log::{info, debug};
 use memmap::MmapOptions;
 use safetensors::SafeTensors;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tch::{kind::Kind, Device, IndexOp, Tensor};
 
 /// Size of batch and response channel
@@ -94,7 +95,92 @@ pub fn padding_with_ack(
         tensors.push((item.0, item.1));
         acks.push(item.2);
     }
-    (padding(config, tensors), acks)
+    (padding(config, tensors, 1), acks)
+}
+
+pub fn receive(
+    rx: &RChan1,
+    prio_rx: &RChan1,
+    config: &Config,
+) -> ((Tensor, Tensor, Tensor, Tensor, Past), Vec<Ack>) {
+    debug!("Receiving on thread1");
+    let mut sel = Select::new();
+    let oper1 = sel.recv(rx);
+    let oper2 = sel.recv(prio_rx);
+    let oper = sel.select();
+    let (mut all_items, past) = match oper.index() {
+        i if i == oper1 => (vec![oper.recv(rx).unwrap()], false),
+        i if i == oper2 => (vec![oper.recv(prio_rx).unwrap()], true),
+        _ => unreachable!(),
+    };
+
+    if past {
+        let max_batch_size = 4;
+        while let Ok(item) = prio_rx.recv_timeout(Duration::from_millis(10)) {
+            all_items.push(item);
+            if all_items.len() >= max_batch_size {
+                break;
+            }
+        }
+    }
+
+    let ((input_ids, attention_mask, alibi, past_key_values), acks) =
+        padding_with_ack(config, all_items);
+    let input_size = input_ids.size();
+    let past_key_values_length = past_key_values[0].seq_length();
+    let causal_mask = prepare_attn_mask(
+        &attention_mask,
+        input_size,
+        past_key_values_length,
+        config.n_head,
+    );
+    (
+        (
+            input_ids,
+            causal_mask,
+            attention_mask,
+            alibi,
+            past_key_values,
+        ),
+        acks,
+    )
+}
+
+pub fn send(
+    lm_logits: Tensor,
+    past_key_values: &[PastLayer],
+    acks: &[Ack],
+    seq_lengths: &[i64],
+    causal_mask: Tensor,
+    config: &Config,
+) {
+    let mut current_batch = 0i64;
+    for (mini_batch_size, rq) in acks {
+        // XXX actually clean the padded values of past so that subsequent
+        // calls can get a chance to have a better padding (+ correct attention mask).
+        let seq_length = seq_lengths[current_batch as usize];
+        let total_seq_length = causal_mask.size()[2];
+        let start_batch_size_times_num_heads = current_batch * config.n_head;
+        let end_batch_size_times_num_heads =
+            start_batch_size_times_num_heads + mini_batch_size * config.n_head;
+        let past: Vec<_> = past_key_values
+            .iter()
+            .map(|layer_past| PastLayer {
+                key: layer_past.key.i((
+                    start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                    ..,
+                    total_seq_length - seq_length..,
+                )),
+                value: layer_past.value.i((
+                    start_batch_size_times_num_heads..end_batch_size_times_num_heads,
+                    total_seq_length - seq_length..,
+                )),
+            })
+            .collect();
+        let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
+        rq.send((simple_logits, past)).unwrap();
+        current_batch += mini_batch_size;
+    }
 }
 
 pub fn thread1(
@@ -105,7 +191,7 @@ pub fn thread1(
     config: Config,
     layout_config: LayoutConfig,
 ) {
-    println!("Starting thread {thread_number}");
+    info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -114,11 +200,8 @@ pub fn thread1(
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let embedding_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    // println!("Embedding {:?}", embedding_model.names());
-    // println!("Layer {:?}", model.names());
-
-    let word_embeddings = Embedding::new("word_embeddings", &embedding_model, device);
-    let word_embeddings_layernorm = LayerNorm::new(
+    let word_embeddings = Embedding::load("word_embeddings", &embedding_model, device);
+    let word_embeddings_layernorm = LayerNorm::load(
         config.hidden_size,
         "word_embeddings_layernorm",
         &embedding_model,
@@ -136,7 +219,7 @@ pub fn thread1(
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(
+            BloomBlock::load(
                 &config,
                 &if std::env::var("BLOOM").unwrap_or_else(|_| "".to_string()) == "bloom-dgx" {
                     "h.0".to_string()
@@ -149,63 +232,18 @@ pub fn thread1(
             )
         })
         .collect();
-    println!(
+    info!(
         "{:?} : Loaded thread {thread_number} in {:?}",
         std::time::Instant::now(),
         start.elapsed()
     );
 
-    let mut last_loop = Instant::now();
     loop {
-        let mut sel = Select::new();
-        let oper1 = sel.recv(&rx);
-        let oper2 = sel.recv(&prio_rx);
-        let oper = sel.select();
-        let (mut all_items, no_past) = match oper.index() {
-            i if i == oper1 => (vec![oper.recv(&rx).unwrap()], true),
-            i if i == oper2 => (vec![oper.recv(&prio_rx).unwrap()], false),
-            _ => unreachable!(),
-        };
-
-        if no_past {
-            let max_batch_size = 4;
-
-            let now = Instant::now();
-            let deadline = std::cmp::max(
-                last_loop + Duration::from_millis(20),
-                now + Duration::from_millis(1),
-            );
-
-            while let Ok(oper) = sel.select_deadline(deadline) {
-                match oper.index() {
-                    i if i == oper1 => {
-                        all_items.push(oper.recv(&rx).unwrap());
-                    }
-                    i if i == oper2 => {
-                        all_items.push(oper.recv(&prio_rx).unwrap());
-                    }
-                    _ => unreachable!(),
-                }
-                if all_items.len() >= max_batch_size {
-                    break;
-                }
-            }
-        }
         // let start = Instant::now();
-        let ((input_ids, attention_mask, alibi, mut past_key_values), acks) =
-            padding_with_ack(&config, all_items);
-        // println!("Padding took {:?}", start.elapsed());
+        let ((input_ids, causal_mask, attention_mask, alibi, mut past_key_values), acks) =
+            receive(&rx, &prio_rx, &config);
         let inputs_embeds = word_embeddings.forward(&input_ids);
         let mut hidden_states = word_embeddings_layernorm.forward(&inputs_embeds);
-
-        let input_size = input_ids.size();
-        let past_key_values_length = past_key_values[0].seq_length();
-        let causal_mask = prepare_attn_mask(
-            &attention_mask,
-            input_size,
-            past_key_values_length,
-            config.n_head,
-        );
 
         let seq_lengths = Vec::<i64>::from(
             attention_mask
@@ -216,7 +254,6 @@ pub fn thread1(
         for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut()) {
             hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
         }
-        // println!("Thread1 took {:?}", start.elapsed());
         s2.send((
             (
                 hidden_states,
@@ -228,7 +265,6 @@ pub fn thread1(
             acks,
         ))
         .unwrap();
-        last_loop = Instant::now();
     }
 }
 
@@ -239,7 +275,7 @@ pub fn thread2(
     config: Config,
     layout_config: LayoutConfig,
 ) {
-    println!("Starting thread {thread_number}");
+    info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -248,7 +284,7 @@ pub fn thread2(
     let layers: Vec<BloomBlock> = (0..layout_config.layers_per_thread)
         .map(|i| {
             let layer_number = i + offset;
-            println!("Loading layer {layer_number} on thread2 ({thread_number})");
+            info!("Loading layer {layer_number} on thread2 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
@@ -258,7 +294,7 @@ pub fn thread2(
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(
+            BloomBlock::load(
                 &config,
                 &if std::env::var("BLOOM").unwrap_or_else(|_| "".to_string()) == "bloom-dgx" {
                     "h.0".to_string()
@@ -271,20 +307,14 @@ pub fn thread2(
             )
         })
         .collect();
-    println!(
+    info!(
         "{:?} : Loaded thread {thread_number} in {:?}",
         std::time::Instant::now(),
         start.elapsed()
     );
     loop {
         // Receive 1 item
-        // println!("start loop  thread {thread_number}");
-        // let start = Instant::now();
         let mut all_items = vec![rx.recv().unwrap()];
-        // println!(
-        //     "Got stuck on RECEIVE thread {thread_number} for {:?}",
-        //     start.elapsed()
-        // );
 
         while let Ok(item) = rx.recv_timeout(Duration::from_millis(0)) {
             all_items.push(item);
@@ -309,11 +339,6 @@ pub fn thread2(
             for (layer, layer_past) in layers.iter().zip(past_key_values.iter_mut().skip(offset)) {
                 hidden_states = layer.forward(&hidden_states, &causal_mask, &alibi, layer_past);
             }
-            // println!(
-            //     "Thread2 {thread_number} took {:?} on batch size {:?}",
-            //     start.elapsed(),
-            //     hidden_states.size()[0]
-            // );
             s.send((
                 (
                     hidden_states,
@@ -330,7 +355,7 @@ pub fn thread2(
 }
 
 pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: LayoutConfig) {
-    println!("Starting thread {thread_number}");
+    info!("Starting thread {thread_number}");
     let start = std::time::Instant::now();
     let device = Device::Cuda(thread_number);
 
@@ -344,15 +369,15 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
     let final_model = SafeTensors::deserialize(&mmap).unwrap();
 
-    let ln_f = LayerNorm::new(config.hidden_size, "ln_f", &final_model, device);
-    let lm_head = InvertedEmbedding::new("word_embeddings", &embedding_model, device);
+    let ln_f = LayerNorm::load(config.hidden_size, "ln_f", &final_model, device);
+    let lm_head = InvertedEmbedding::load("word_embeddings", &embedding_model, device);
 
     let offset = layout_config.layers_first_thread
         + layout_config.layers_per_thread * layout_config.n_threads;
     let layers: Vec<BloomBlock> = (0..layout_config.layers_last_thread)
         .map(|i| {
             let layer_number = offset + i;
-            println!("Loading layer {layer_number} on thread3 ({thread_number})");
+            info!("Loading layer {layer_number} on thread3 ({thread_number})");
             let file = std::fs::File::open(
                 layout_config
                     .layer_template_filename
@@ -362,7 +387,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
             // SAFETY: This is actually unsafe.
             let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
             let model = SafeTensors::deserialize(&mmap).unwrap();
-            BloomBlock::new(
+            BloomBlock::load(
                 &config,
                 &if std::env::var("BLOOM").unwrap_or_else(|_| "".to_string()) == "bloom-dgx" {
                     "h.0".to_string()
@@ -376,7 +401,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         })
         .collect();
 
-    println!(
+    info!(
         "{:?} : Loaded thread {thread_number} in {:?}",
         std::time::Instant::now(),
         start.elapsed()
@@ -385,7 +410,7 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
     loop {
         let (
             (mut hidden_states, mut causal_mask, mut alibi, mut past_key_values, seq_lengths),
-            rqs,
+            acks,
         ) = rx
             .recv()
             .expect("You probably want to handle this case, but I'm too lazy");
@@ -402,33 +427,13 @@ pub fn thread3(rx: RChan, thread_number: usize, config: Config, layout_config: L
         hidden_states = ln_f.forward(&hidden_states);
         debug("After ln_f", &hidden_states);
         let lm_logits = lm_head.forward(&hidden_states);
-
-        let mut current_batch = 0 as i64;
-        for (mini_batch_size, rq) in rqs {
-            // XXX actually clean the padded values of past so that subsequent
-            // calls can get a chance to have a better padding (+ correct attention mask).
-            let seq_length = seq_lengths[current_batch as usize];
-            let total_seq_length = causal_mask.size()[2];
-            let start_batch_size_times_num_heads = current_batch * config.n_head;
-            let end_batch_size_times_num_heads =
-                start_batch_size_times_num_heads + mini_batch_size * config.n_head;
-            let past: Vec<_> = past_key_values
-                .iter()
-                .map(|layer_past| PastLayer {
-                    key: layer_past.key.i((
-                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
-                        ..,
-                        total_seq_length - seq_length..,
-                    )),
-                    value: layer_past.value.i((
-                        start_batch_size_times_num_heads..end_batch_size_times_num_heads,
-                        total_seq_length - seq_length..,
-                    )),
-                })
-                .collect();
-            let simple_logits = lm_logits.i(current_batch..current_batch + mini_batch_size);
-            rq.send((simple_logits, past)).unwrap();
-            current_batch += mini_batch_size;
-        }
+        send(
+            lm_logits,
+            &past_key_values,
+            &acks,
+            &seq_lengths,
+            causal_mask,
+            &config,
+        );
     }
 }
